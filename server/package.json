@@ -1,0 +1,19 @@
+{
+  "name": "smartshop",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n web,api,ctrl -c cyan,magenta,yellow \"pnpm --filter @smartshop/web dev\" \"pnpm --filter @smartshop/web-server dev\" \"pnpm --filter @smartshop/controller-server dev\"",
+    "build": "pnpm -r run build",
+    "dev:web": "pnpm --filter @smartshop/web dev",
+    "dev:web-server": "pnpm --filter @smartshop/web-server dev",
+    "dev:controller": "pnpm --filter @smartshop/controller-server dev"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.18.0"
+}
