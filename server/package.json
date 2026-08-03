@@ -2,11 +2,11 @@
   "name": "smartshop",
   "private": true,
   "scripts": {
-    "dev": "concurrently -n web,api,ctrl -c cyan,magenta,yellow \"pnpm --filter @smartshop/web dev\" \"pnpm --filter @smartshop/web-server dev\" \"pnpm --filter @smartshop/controller-server dev\"",
+    "dev": "concurrently -n web,api,ctrl -c cyan,magenta,yellow \"pnpm --filter @smartshop/web dev\" \"pnpm --filter @smartshop/web-server dev\" \"pnpm run dev:controller\"",
     "build": "pnpm -r run build",
     "dev:web": "pnpm --filter @smartshop/web dev",
     "dev:web-server": "pnpm --filter @smartshop/web-server dev",
-    "dev:controller": "pnpm --filter @smartshop/controller-server dev"
+    "dev:controller": "cd apps/controller-server && (test -x .venv/bin/python || (python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)) && .venv/bin/python run.py"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

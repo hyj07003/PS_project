@@ -1,7 +1,7 @@
 # SmartShop
 
 무인 장보기 마트 **1차 데모** 프로젝트입니다.  
-고객/관리자 통합 웹(UI) · Web Application Server(BFF) · Controller Server(관제·SQLite)를 TypeScript로 구성했으며, Robot/AI는 이후 연동을 위한 Mock 어댑터만 준비되어 있습니다.
+고객/관리자 통합 웹(UI)·Web Application Server(BFF)는 TypeScript, Controller Server(관제·SQLite)는 Flask로 구성했으며, Robot/AI는 이후 연동을 위한 Mock 어댑터만 준비되어 있습니다.
 
 > 실운영용이 아닙니다. 로컬 PC(동일 공유기 LAN 포함)에서 시나리오 데모를 돌리는 것을 목표로 합니다.
 
@@ -20,6 +20,7 @@
 9. [데모 계정·시드 데이터](#9-데모-계정시드-데이터)
 10. [주문·미션 상태 흐름](#10-주문미션-상태-흐름)
 11. [향후 확장](#11-향후-확장)
+12. [변경 내역](#12-변경-내역)
 
 ---
 
@@ -35,7 +36,7 @@ flowchart TB
   subgraph localPc [Local PC]
     Web["apps/web<br/>Next.js :3000"]
     WebSrv["apps/web-server<br/>NestJS BFF :4000"]
-    Ctrl["apps/controller-server<br/>NestJS + SQLite :4100"]
+    Ctrl["apps/controller-server<br/>Flask + SQLite :4100"]
     DB[("smartshop.db")]
     Uploads["uploads/"]
     Mock["Mock Adapters<br/>Cart / Station / AI"]
@@ -66,7 +67,7 @@ flowchart TB
 |----------|--------|------|------|
 | `apps/web` | `0.0.0.0` | **3000** | 고객 쇼핑 UI + `/admin` |
 | `apps/web-server` | `0.0.0.0` | **4000** | JWT 인증, BFF, 파일 업로드 |
-| `apps/controller-server` | `127.0.0.1` | **4100** | SQLite, 상품/주문/미션, Mock |
+| `apps/controller-server` | `127.0.0.1` | **4100** | Flask 관제, SQLite, 상품/주문/미션, Mock |
 
 ---
 
@@ -77,12 +78,16 @@ smartshop/
 ├── apps/
 │   ├── web/                  # Next.js App Router (UI)
 │   ├── web-server/           # NestJS BFF
-│   └── controller-server/    # NestJS Control Center + SQLite
+│   └── controller-server/    # Flask Control Center + SQLite
+│       ├── run.py
+│       ├── requirements.txt
+│       ├── .venv/            # 로컬 venv (gitignore)
+│       └── app/              # config, db, seed, routes, services, adapters
 ├── packages/
-│   └── shared/               # 공용 타입, 카테고리 시드, 유틸
+│   └── shared/               # 공용 타입, 카테고리 시드, 유틸 (TS)
 ├── .env / .env.example
-├── pnpm-workspace.yaml
-└── package.json              # pnpm dev (concurrently)
+├── pnpm-workspace.yaml       # web, web-server, packages/* 만 포함
+└── package.json              # pnpm dev (concurrently + Flask controller)
 ```
 
 | 경로 | 설명 |
@@ -91,8 +96,9 @@ smartshop/
 | `apps/web/src/components` | 히어로 슬라이드, 검색, 상품 그리드, 헤더 |
 | `apps/web/src/lib` | API 클라이언트, 게스트 카트, 인증 컨텍스트 |
 | `apps/web-server/src` | 공개 API · JWT 가드 · 업로드 · Controller 프록시 |
-| `apps/controller-server/src/db` | 스키마·시드·매퍼 |
-| `apps/controller-server/src/adapters` | Cart / Station / AI Port + Mock |
+| `apps/controller-server/app` | Flask 앱 · 스키마·시드·서비스·라우트 |
+| `apps/controller-server/app/adapters.py` | Cart / Station / AI Mock |
+| `apps/controller-server/requirements.txt` | Flask 의존성 |
 | `packages/shared` | `Product`, `OrderStatus`, `CATEGORY_SEEDS` 등 |
 
 ---
@@ -101,13 +107,14 @@ smartshop/
 
 | 영역 | 선택 |
 |------|------|
-| 언어 | TypeScript (Flask 미사용, 풀스택 통일) |
+| 언어 | TypeScript (web / BFF) + Python (Controller) |
 | 프론트 | Next.js 15 (App Router), React 19, Framer Motion |
 | 스타일 | Cloud Dancer 톤 (`#F0EEE9`), Syne / Manrope |
-| BFF / 관제 | NestJS 11 |
-| DB | Node 내장 `node:sqlite` (experimental) — Windows native 빌드 불필요 |
-| 인증 | JWT (`@nestjs/jwt`) + bcryptjs |
-| 패키지 | pnpm workspace |
+| BFF | NestJS 11 |
+| 관제 | Flask + SQLite (`sqlite3`) |
+| DB | Controller SQLite (`DATABASE_PATH`) |
+| 인증 | JWT (`@nestjs/jwt`, BFF) + bcrypt (Controller) |
+| 패키지 | pnpm workspace (web·web-server) + pip (controller) |
 
 ---
 
@@ -281,11 +288,13 @@ erDiagram
 - 이미지 URL 입력 또는 파일 업로드
 - 저장 즉시 고객 홈 히어로·그리드·검색에 반영
 
-### 관제 (Controller)
+### 관제 (Controller, Flask)
 
-- 주문 생성 시 미션 생성 + Mock으로 상태 자동 진행  
+- NestJS 관제를 **Flask**로 교체 (HTTP·JSON·SQLite 계약은 BFF와 동일하게 유지)
+- 주문 생성 시 미션 생성 + Mock 백그라운드 스레드로 상태 자동 진행  
   `CREATED → ASSIGNED → PICKING → CHECKOUT → PACKING → COMPLETED`
-- `CartPort` / `StationPort` / `AiPort` 인터페이스 + Mock 구현 (`ADAPTER_MODE=mock`)
+- Mock: `app/adapters.py` (`MockCartAdapter` / `MockStationAdapter` / `MockAiAdapter`)
+- 의존성: `apps/controller-server/requirements.txt` + `.venv`
 
 ---
 
@@ -309,45 +318,142 @@ erDiagram
 | CRUD | `/admin/products` | 관리자 상품 (Admin 가드) |
 | POST | `/admin/upload` | 이미지 업로드 → `{ url: "/uploads/..." }` |
 
-### Controller (내부, `:4100`)
+### Controller (내부, Flask `:4100`)
 
-Web Server만 호출합니다. 예: `/users/*`, `/products`, `/carts/:userId`, `/orders`, `/devices`, `/categories`.
+Web Server만 호출합니다. 인증/JWT는 없고, BFF가 프록시합니다.
+
+| Method | Path | 설명 |
+|--------|------|------|
+| GET | `/health` | 헬스체크 |
+| POST | `/users/register` · `/users/login` | 회원 (bcrypt) |
+| GET | `/users/:id` | 없으면 `null` |
+| GET | `/categories` · `/products` · `/products/:id` | 카탈로그 |
+| POST/PUT/PATCH/DELETE | `/products...` | 상품 CRUD |
+| GET/POST/PATCH/DELETE | `/carts/:userId...` | 장바구니 · merge |
+| POST | `/orders` · GET `/orders/:id` | 주문 (생성 후 Mock 파이프라인) |
+| GET | `/devices` | 디바이스 목록 (snake_case raw) |
 
 ---
 
 ## 7. 실행 방법
 
+Linux(Ubuntu/Debian 계열 기준)와 Windows 모두에서 동일하게 `pnpm` / Python venv로 기동합니다.
+
 ### 요구 사항
 
-- Node.js **20+** (권장 22/24, `node:sqlite` 사용)
-- pnpm 11
+| 도구 | 버전 | 용도 |
+|------|------|------|
+| Node.js | **20+** (권장 22/24) | web · web-server |
+| pnpm | **11** (`packageManager`과 맞춤) | 모노레포 설치·기동 |
+| Python | **3.10+** | controller-server (Flask) |
+| python3-venv | (Linux) | Controller 가상환경 |
 
-### 설치·기동
+### 7.1 사전 설치 (Linux)
+
+**Node.js** (NodeSource 예시, 또는 [nodejs.org](https://nodejs.org) / nvm):
 
 ```bash
+# 예: Node 22 (Ubuntu/Debian)
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+node -v   # v20+ 확인
+```
+
+nvm을 쓰는 경우:
+
+```bash
+nvm install 22
+nvm use 22
+```
+
+**pnpm** (corepack 권장 — Node 16.13+에 포함):
+
+```bash
+sudo corepack enable
+corepack prepare pnpm@11.18.0 --activate
+pnpm -v
+```
+
+corepack이 없거나 실패하면:
+
+```bash
+npm install -g pnpm@11
+# 또는
+curl -fsSL https://get.pnpm.io/install.sh | sh -
+```
+
+**Python + venv**:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip
+python3 --version   # 3.10+ 확인
+```
+
+### 7.2 사전 설치 (Windows 요약)
+
+- [Node.js LTS](https://nodejs.org) 설치 후 PowerShell에서 `corepack enable` → `corepack prepare pnpm@11.18.0 --activate`
+- Python 3.10+ 설치 시 **“Add python.exe to PATH”** 체크, 이후 `python -m venv` 사용 가능
+
+### 7.3 설치·기동
+
+저장소의 `server/` 디렉터리에서:
+
+```bash
+cd /path/to/PS_project/server
+
+# 환경 변수
+cp .env.example .env
+
+# Node 패키지
 pnpm install
 pnpm --filter @smartshop/shared build
+
+# Flask Controller venv
+cd apps/controller-server
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cd ../..
+
+# 전체 기동 (web :3000 · BFF :4000 · Flask :4100)
 pnpm dev
 ```
+
+브라우저: [http://127.0.0.1:3000](http://127.0.0.1:3000)
 
 개별 기동:
 
 ```bash
-pnpm dev:controller   # :4100
-pnpm dev:web-server   # :4000
-pnpm dev:web          # :3000
+pnpm dev:controller   # Flask :4100 (venv 없으면 자동 생성·설치)
+pnpm dev:web-server   # NestJS BFF :4000
+pnpm dev:web          # Next.js :3000
 ```
 
-환경 변수: 루트 [`.env.example`](.env.example) → `.env` 복사 후 사용.
+`pnpm dev:controller`는 `apps/controller-server/.venv`가 없으면 venv 생성과 `pip install`을 한 뒤 `run.py`를 실행합니다.
+
+### 7.4 환경 변수
+
+루트 [`.env.example`](.env.example) → `.env` 복사 후 사용.
 
 | 변수 | 의미 |
 |------|------|
 | `WEB_SERVER_HOST` | 기본 `0.0.0.0` (LAN 공개) |
 | `CONTROLLER_URL` | BFF → 관제 (`http://127.0.0.1:4100`) |
-| `DATABASE_PATH` | SQLite 파일 경로 |
+| `CONTROLLER_PORT` | 관제 포트 (기본 `4100`) |
+| `DATABASE_PATH` | SQLite 경로 (Controller cwd 기준, 기본 `./data/smartshop.db`) |
 | `JWT_SECRET` | JWT 서명 키 |
 | `UPLOAD_DIR` | 업로드 디렉터리 |
 | `NEXT_PUBLIC_API_PORT` | 브라우저 API 포트 (기본 4000) |
+
+### 7.5 문제 해결 (Linux)
+
+| 증상 | 확인 |
+|------|------|
+| `externally-managed-environment` / pip 거부 | 시스템 pip 대신 **venv** 사용 (위 절차) |
+| `pnpm: command not found` | `corepack enable` 또는 `npm i -g pnpm@11` |
+| `EACCES` / 글로벌 설치 권한 | nvm·corepack 사용, `sudo npm -g`는 지양 |
+| 포트 사용 중 (`Address already in use`) | `ss -tlnp \| grep -E '3000\|4000\|4100'` 후 해당 프로세스 종료 |
+| DB 초기화 | `rm -f apps/controller-server/data/smartshop.db*` 후 Controller 재시작 |
 
 ---
 
@@ -355,9 +461,22 @@ pnpm dev:web          # :3000
 
 같은 공유기 Wi‑Fi의 휴대폰에서:
 
-1. PC IPv4 확인 (`ipconfig`) — 예: `192.168.45.152`
+1. PC IPv4 확인  
+   - **Linux**: `ip -4 addr show` 또는 `hostname -I`  
+   - **Windows**: `ipconfig`  
+   예: `192.168.45.152`
 2. 폰 브라우저: `http://192.168.45.152:3000`
-3. Windows 방화벽 **인바운드 TCP 3000, 4000** 허용 (관리자 PowerShell 예시):
+3. 방화벽에서 **TCP 3000, 4000** 허용
+
+**Linux (ufw 예시):**
+
+```bash
+sudo ufw allow 3000/tcp
+sudo ufw allow 4000/tcp
+sudo ufw status
+```
+
+**Windows** (관리자 PowerShell):
 
 ```powershell
 netsh advfirewall firewall add rule name="SmartShop Web 3000" dir=in action=allow protocol=TCP localport=3000
@@ -427,12 +546,30 @@ stateDiagram-v2
 어댑터 경계:
 
 ```text
-Controller
+Controller (Flask)
   ├─ Order / Mission 상태머신
-  ├─ CartPort / StationPort / AiPort
-  └─ adapters/mock  ← 지금
-       (이후 robot-http, ai-http 로 교체)
+  ├─ Cart / Station / AI Mock (app/adapters.py)
+  └─ 이후 robot-http, ai-http 로 교체
 ```
+
+---
+
+## 12. 변경 내역
+
+### Controller NestJS → Flask
+
+| 항목 | 이전 | 이후 |
+|------|------|------|
+| 관제 런타임 | NestJS (TypeScript) `:4100` | **Flask (Python)** `:4100` |
+| 패키지 관리 | pnpm workspace (`@smartshop/controller-server`) | `requirements.txt` + `.venv` |
+| 워크스페이스 | `apps/*` 전부 | `apps/web`, `apps/web-server`, `packages/*` |
+| DB | Node `node:sqlite` | Python 표준 `sqlite3` |
+| 비밀번호 해시 | bcryptjs | bcrypt (cost 10, 호환) |
+| 주문 Mock 파이프라인 | async `void` | 백그라운드 스레드 |
+| BFF (`web-server`) | — | **변경 없음** (`CONTROLLER_URL` 동일 계약) |
+
+기동: `pnpm dev:controller` → `apps/controller-server/.venv/bin/python run.py`  
+(venv가 없으면 스크립트가 생성·의존성 설치 후 기동합니다.)
 
 ---
 
