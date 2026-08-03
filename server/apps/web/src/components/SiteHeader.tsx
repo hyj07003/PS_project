@@ -54,7 +54,7 @@ export function SiteHeader() {
             {cartCount > 0 ? <span>{cartCount}</span> : null}
           </Link>
           {user?.role === "admin" ? (
-            <Link href="/admin">상품 관리</Link>
+            <Link href="/admin">매장 관리</Link>
           ) : null}
           {user ? (
             <>

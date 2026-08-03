@@ -148,3 +148,59 @@ def get_order(order_id: int):
 @bp.get("/devices")
 def devices():
     return jsonify(_orders().list_devices())
+
+
+def _robot():
+    return current_app.extensions["services"]["robot"]
+
+
+@bp.get("/missions")
+def list_missions():
+    return jsonify(
+        _robot().list_missions(
+            status=request.args.get("status"),
+            device_code=request.args.get("deviceCode"),
+        )
+    )
+
+
+@bp.get("/missions/<int:mission_id>")
+def get_mission(mission_id: int):
+    return jsonify(_robot().get_mission(mission_id))
+
+
+@bp.patch("/missions/<int:mission_id>")
+def patch_mission(mission_id: int):
+    body = request.get_json(silent=True) or {}
+    status = body.get("status")
+    if not status:
+        raise ApiError(400, "status is required")
+    return jsonify(_robot().patch_mission(mission_id, status, body.get("note")))
+
+
+@bp.patch("/devices/<code>")
+def patch_device(code: str):
+    body = request.get_json(silent=True) or {}
+    status = body.get("status")
+    if not status:
+        raise ApiError(400, "status is required")
+    return jsonify(_robot().patch_device(code, status))
+
+
+@bp.post("/robot/telemetry")
+def post_telemetry():
+    body = request.get_json(silent=True) or {}
+    return jsonify(_robot().save_telemetry(body))
+
+
+@bp.get("/robot/telemetry")
+def list_telemetry():
+    return jsonify(_robot().list_telemetry())
+
+
+@bp.get("/robot/telemetry/<code>")
+def get_telemetry(code: str):
+    data = _robot().get_telemetry(code)
+    if data is None:
+        raise ApiError(404, "telemetry not found")
+    return jsonify(data)

@@ -1,342 +1,437 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import type { Category, CreateProductInput, Product } from "@smartshop/shared";
-import { formatPriceKrw } from "@smartshop/shared";
-import { api, getApiUrl, getToken } from "@/lib/api";
-import { useAuth } from "@/lib/auth-context";
+import { useCallback, useEffect, useState } from "react";
+import { api } from "@/lib/api";
+import { LidarMap } from "@/components/LidarMap";
 
-const emptyForm: CreateProductInput = {
-  categoryId: 1,
-  name: "",
-  description: "",
-  price: 0,
-  stock: 10,
-  imageFullUrl: "",
-  imageZoomUrl: "",
-  isFeatured: false,
-  isActive: true,
+type RobotHealth = {
+  ok?: boolean;
+  service?: string;
+  backend?: string;
+  deviceCode?: string;
+  online?: boolean;
+  sensorPublisher?: boolean;
 };
 
-export default function AdminPage() {
-  const { user, loading } = useAuth();
-  const router = useRouter();
-  const [products, setProducts] = useState<Product[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  const [form, setForm] = useState<CreateProductInput>(emptyForm);
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
+type Battery = {
+  percent?: number | null;
+  voltage?: number | null;
+  source?: string;
+};
 
-  const load = async () => {
-    const [p, c] = await Promise.all([
-      api<Product[]>("/admin/products"),
-      api<Category[]>("/categories", { auth: false }),
-    ]);
-    setProducts(p);
-    setCategories(c);
-    if (c[0] && !editingId) {
-      setForm((f) => ({ ...f, categoryId: c[0].id }));
-    }
+type Lidar = {
+  rangesCount?: number;
+  rangesSample?: number[];
+  range_min?: number;
+  range_max?: number;
+  rangeMin?: number;
+  rangeMax?: number;
+  frame_id?: string;
+  frameId?: string;
+  stamp?: number | null;
+  points?: { x: number; y: number; r?: number }[];
+  angleMin?: number;
+  angleIncrement?: number;
+};
+
+type Imu = {
+  orientation?: { x: number; y: number; z: number; w: number };
+  angularVelocity?: { x: number; y: number; z: number };
+  linearAcceleration?: { x: number; y: number; z: number };
+  frameId?: string;
+  stamp?: number | null;
+};
+
+type Ultrasonic = {
+  rangeM?: number | null;
+  minRange?: number;
+  maxRange?: number;
+  irRaw?: number[];
+  frameId?: string;
+};
+
+type Snapshot = {
+  deviceCode?: string;
+  backend?: string;
+  online?: boolean;
+  battery?: Battery;
+  lidar?: Lidar;
+  imu?: Imu;
+  ultrasonic?: Ultrasonic;
+  hasData?: {
+    battery?: boolean;
+    lidar?: boolean;
+    imu?: boolean;
+    ultrasonic?: boolean;
   };
+  warnings?: string[];
+};
 
-  useEffect(() => {
-    if (loading) return;
-    if (!user) {
-      router.replace("/login");
-      return;
-    }
-    if (user.role !== "admin") {
-      router.replace("/");
-      return;
-    }
-    void load().catch((e: Error) => setError(e.message));
-  }, [user, loading, router]);
+type Device = {
+  id: number;
+  code: string;
+  type: string;
+  status: string;
+};
 
-  const upload = async (file: File, field: "imageFullUrl" | "imageZoomUrl") => {
-    const body = new FormData();
-    body.append("file", file);
-    const res = await fetch(`${getApiUrl()}/admin/upload`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${getToken()}`,
-      },
-      body,
-    });
-    const data = (await res.json()) as { url?: string; message?: string };
-    if (!res.ok) throw new Error(data.message || "upload failed");
-    const url = data.url || "";
-    setForm((f) => {
-      if (field === "imageFullUrl") {
-        // 전체 이미지 등록 시 확대 이미지도 동일 소스 사용
-        return { ...f, imageFullUrl: url, imageZoomUrl: url };
-      }
-      return {
-        ...f,
-        imageZoomUrl: url,
-        imageFullUrl: f.imageFullUrl || url,
-      };
-    });
-  };
+type RobotMonitor = {
+  id: string;
+  label: string;
+  url: string;
+  online: boolean;
+  health: RobotHealth | null;
+  sensors: Snapshot | null;
+  error: string | null;
+};
 
-  const onSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setMessage(null);
-    const full = (form.imageFullUrl || "").trim();
-    const zoom = (form.imageZoomUrl || "").trim();
-    const payload: CreateProductInput = {
-      ...form,
-      imageFullUrl: full || zoom || "",
-      // 확대 미지정·플레이스홀더 잔존 시 전체 이미지 사용
-      imageZoomUrl:
-        !zoom || /placehold\.co/i.test(zoom) || (full.startsWith("/uploads/") && zoom.startsWith("http"))
-          ? full || zoom
-          : zoom,
-    };
-    if (!payload.imageFullUrl && payload.imageZoomUrl) {
-      payload.imageFullUrl = payload.imageZoomUrl;
-    }
-    try {
-      if (editingId) {
-        await api(`/admin/products/${editingId}`, {
-          method: "PUT",
-          body: JSON.stringify(payload),
-        });
-        setMessage("상품이 수정되었습니다.");
-      } else {
-        await api("/admin/products", {
-          method: "POST",
-          body: JSON.stringify(payload),
-        });
-        setMessage("상품이 등록되었습니다.");
-      }
-      setEditingId(null);
-      setForm({
-        ...emptyForm,
-        categoryId: categories[0]?.id || 1,
-      });
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "저장 실패");
-    }
-  };
+type RobotsResponse = {
+  robots: RobotMonitor[];
+  count: number;
+};
 
-  const edit = (p: Product) => {
-    setEditingId(p.id);
-    setForm({
-      categoryId: p.categoryId,
-      name: p.name,
-      slug: p.slug,
-      description: p.description || "",
-      price: p.price,
-      stock: p.stock,
-      imageFullUrl: p.imageFullUrl || "",
-      imageZoomUrl: p.imageZoomUrl || "",
-      isFeatured: p.isFeatured,
-      isActive: p.isActive,
-    });
-  };
+function fmt(n: number | null | undefined, digits = 2): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  return n.toFixed(digits);
+}
 
-  const remove = async (id: number) => {
-    if (!confirm("삭제할까요?")) return;
-    await api(`/admin/products/${id}`, { method: "DELETE" });
-    await load();
-  };
-
-  if (loading || !user || user.role !== "admin") {
-    return <div className="container page muted">확인 중…</div>;
-  }
+function RobotBlock({ robot }: { robot: RobotMonitor }) {
+  const health = robot.health;
+  const snap = robot.sensors;
+  const hd = snap?.hasData;
+  const allMissing =
+    hd && !hd.battery && !hd.imu && !hd.ultrasonic && !hd.lidar;
+  const partial =
+    hd &&
+    (hd.battery || hd.imu || hd.ultrasonic || hd.lidar) &&
+    (snap?.warnings?.length ?? 0) > 0;
 
   return (
-    <div className="container page">
-      <h1 className="hero-title" style={{ fontSize: "2.4rem" }}>
-        상품 관리
-      </h1>
-      <p className="muted">관리자만 접근 가능한 상품 등록/수정 화면입니다.</p>
-      {error ? <p className="error">{error}</p> : null}
-      {message ? <p>{message}</p> : null}
+    <section className="robot-block">
+      <header className="robot-block-head">
+        <div>
+          <h2 className="robot-block-title">{robot.label}</h2>
+          <p className="muted robot-block-url">{robot.url}</p>
+        </div>
+        <div className="robot-block-status">
+          <span
+            className={`status-dot ${robot.online && (health?.online ?? true) ? "on" : "off"}`}
+          />
+          {robot.online
+            ? health?.online === false
+              ? "Offline"
+              : "Online"
+            : "연결 실패"}
+        </div>
+      </header>
 
-      <form className="form" style={{ maxWidth: 640 }} onSubmit={onSubmit}>
-        <label>
-          상품명
-          <input
-            value={form.name}
-            onChange={(e) => setForm({ ...form, name: e.target.value })}
-            required
-          />
-        </label>
-        <label>
-          카테고리
-          <select
-            value={form.categoryId}
-            onChange={(e) =>
-              setForm({ ...form, categoryId: Number(e.target.value) })
-            }
-          >
-            {categories.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
+      {robot.error ? (
+        <p className="error" style={{ marginBottom: "0.75rem" }}>
+          {robot.error}
+        </p>
+      ) : null}
+
+      {allMissing ? (
+        <div className="error" style={{ marginBottom: "0.75rem" }}>
+          <strong>센서 데이터가 없습니다</strong>
+          <p className="muted" style={{ margin: "0.5rem 0 0" }}>
+            로봇 `run.py`(PINKY_BACKEND=ros2)와 해당 URL을 확인하세요.
+          </p>
+        </div>
+      ) : null}
+
+      {partial ? (
+        <div
+          className="muted"
+          style={{
+            marginBottom: "0.75rem",
+            padding: "0.75rem 1rem",
+            border: "1px solid var(--line)",
+            background: "rgba(255,255,255,0.4)",
+          }}
+        >
+          <strong style={{ color: "var(--ink)" }}>일부 센서만 수신</strong>
+          <ul style={{ margin: "0.4rem 0 0", paddingLeft: "1.2rem" }}>
+            {(snap?.warnings || []).map((w) => (
+              <li key={w}>{w}</li>
             ))}
-          </select>
-        </label>
-        <label>
-          가격(원)
-          <input
-            type="number"
-            value={form.price}
-            onChange={(e) =>
-              setForm({ ...form, price: Number(e.target.value) || 0 })
-            }
-            required
-          />
-        </label>
-        <label>
-          재고
-          <input
-            type="number"
-            value={form.stock ?? 0}
-            onChange={(e) =>
-              setForm({ ...form, stock: Number(e.target.value) || 0 })
-            }
-          />
-        </label>
-        <label>
-          설명
-          <textarea
-            rows={3}
-            value={form.description || ""}
-            onChange={(e) => setForm({ ...form, description: e.target.value })}
-          />
-        </label>
-        <label>
-          전체 이미지 URL
-          <input
-            value={form.imageFullUrl || ""}
-            onChange={(e) => {
-              const imageFullUrl = e.target.value;
-              setForm((f) => ({
-                ...f,
-                imageFullUrl,
-                // 전체 이미지 URL 입력 시 확대도 같이 맞춤
-                imageZoomUrl: imageFullUrl,
-              }));
-            }}
-          />
-        </label>
-        <label>
-          전체 이미지 업로드
-          <input
-            type="file"
-            accept="image/*"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) void upload(file, "imageFullUrl").catch((err: Error) =>
-                setError(err.message),
-              );
-            }}
-          />
-          <span className="muted" style={{ fontSize: "0.85rem" }}>
-            이미지가 하나면 확대 이미지로도 자동 사용됩니다.
-          </span>
-        </label>
-        <label>
-          확대 이미지 URL (비우면 전체 이미지 사용)
-          <input
-            value={form.imageZoomUrl || ""}
-            onChange={(e) => setForm({ ...form, imageZoomUrl: e.target.value })}
-            placeholder="비워두면 전체 이미지를 확대해 사용"
-          />
-        </label>
-        <label>
-          확대 이미지 업로드
-          <input
-            type="file"
-            accept="image/*"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) void upload(file, "imageZoomUrl").catch((err: Error) =>
-                setError(err.message),
-              );
-            }}
-          />
-        </label>
-        <label style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
-          <input
-            type="checkbox"
-            checked={!!form.isFeatured}
-            onChange={(e) => setForm({ ...form, isFeatured: e.target.checked })}
-          />
-          히어로 슬라이드 노출
-        </label>
-        <label style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
-          <input
-            type="checkbox"
-            checked={form.isActive !== false}
-            onChange={(e) => setForm({ ...form, isActive: e.target.checked })}
-          />
-          판매 중
-        </label>
-        <div style={{ display: "flex", gap: "0.75rem" }}>
-          <button className="btn" type="submit">
-            {editingId ? "수정 저장" : "상품 등록"}
-          </button>
-          {editingId ? (
-            <button
-              type="button"
-              className="btn secondary"
-              onClick={() => {
-                setEditingId(null);
-                setForm({
-                  ...emptyForm,
-                  categoryId: categories[0]?.id || 1,
-                });
+          </ul>
+        </div>
+      ) : null}
+
+      <div className="monitor-grid">
+        <div className="monitor-card">
+          <h3>연결</h3>
+          <dl className="monitor-dl">
+            <div>
+              <dt>상태</dt>
+              <dd>
+                <span
+                  className={`status-dot ${robot.online && (health?.online ?? true) ? "on" : "off"}`}
+                />
+                {robot.online
+                  ? health?.online === false
+                    ? "Offline"
+                    : "Online"
+                  : "연결 실패"}
+              </dd>
+            </div>
+            <div>
+              <dt>Backend</dt>
+              <dd>{health?.backend || snap?.backend || "—"}</dd>
+            </div>
+            <div>
+              <dt>Device</dt>
+              <dd>{health?.deviceCode || snap?.deviceCode || robot.id}</dd>
+            </div>
+            <div>
+              <dt>Publisher</dt>
+              <dd>
+                {health?.sensorPublisher == null
+                  ? "—"
+                  : health.sensorPublisher
+                    ? "ON"
+                    : "OFF"}
+              </dd>
+            </div>
+          </dl>
+        </div>
+
+        <div className="monitor-card">
+          <h3>배터리</h3>
+          <p className="monitor-metric">
+            {fmt(snap?.battery?.percent, 1)}
+            <small>%</small>
+          </p>
+          <dl className="monitor-dl">
+            <div>
+              <dt>전압</dt>
+              <dd>{fmt(snap?.battery?.voltage, 3)} V</dd>
+            </div>
+            <div>
+              <dt>소스</dt>
+              <dd>{snap?.battery?.source || "—"}</dd>
+            </div>
+          </dl>
+          <div className="battery-bar">
+            <i
+              style={{
+                width: `${Math.min(100, Math.max(0, snap?.battery?.percent ?? 0))}%`,
               }}
-            >
-              취소
-            </button>
+            />
+          </div>
+          {!snap?.hasData?.battery ? (
+            <p className="muted" style={{ marginTop: "0.75rem", marginBottom: 0 }}>
+              측정값 없음
+            </p>
           ) : null}
         </div>
-      </form>
 
-      <h2 style={{ marginTop: "2.5rem" }}>등록 상품</h2>
-      <table className="table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>이름</th>
-            <th>가격</th>
-            <th>히어로</th>
-            <th>활성</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {products.map((p) => (
-            <tr key={p.id}>
-              <td>{p.id}</td>
-              <td>{p.name}</td>
-              <td>{formatPriceKrw(p.price)}</td>
-              <td>{p.isFeatured ? "Y" : "-"}</td>
-              <td>{p.isActive ? "Y" : "N"}</td>
-              <td style={{ display: "flex", gap: "0.5rem" }}>
-                <button type="button" className="btn ghost" onClick={() => edit(p)}>
-                  수정
-                </button>
-                <button
-                  type="button"
-                  className="btn secondary"
-                  onClick={() => void remove(p.id)}
-                >
-                  삭제
-                </button>
-              </td>
+        <div className="monitor-card">
+          <h3>초음파 / IR</h3>
+          <p className="monitor-metric">
+            {fmt(snap?.ultrasonic?.rangeM, 3)}
+            <small>m</small>
+          </p>
+          <dl className="monitor-dl">
+            <div>
+              <dt>범위</dt>
+              <dd>
+                {fmt(snap?.ultrasonic?.minRange, 2)} –{" "}
+                {fmt(snap?.ultrasonic?.maxRange, 2)} m
+              </dd>
+            </div>
+            <div>
+              <dt>IR raw</dt>
+              <dd>{(snap?.ultrasonic?.irRaw || []).join(", ") || "—"}</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div className="monitor-card monitor-card-wide">
+          <h3>IMU</h3>
+          <div className="imu-grid">
+            <div>
+              <h4>Orientation</h4>
+              <pre>
+                {JSON.stringify(snap?.imu?.orientation || {}, null, 2)}
+              </pre>
+            </div>
+            <div>
+              <h4>Angular velocity</h4>
+              <pre>
+                {JSON.stringify(snap?.imu?.angularVelocity || {}, null, 2)}
+              </pre>
+            </div>
+            <div>
+              <h4>Linear acceleration</h4>
+              <pre>
+                {JSON.stringify(snap?.imu?.linearAcceleration || {}, null, 2)}
+              </pre>
+            </div>
+          </div>
+        </div>
+
+        <div className="monitor-card monitor-card-wide">
+          <h3>라이다 맵</h3>
+          <dl className="monitor-dl">
+            <div>
+              <dt>포인트</dt>
+              <dd>
+                {snap?.lidar?.points?.length ?? 0} /{" "}
+                {snap?.lidar?.rangesCount ?? "—"}
+              </dd>
+            </div>
+            <div>
+              <dt>거리 범위</dt>
+              <dd>
+                {fmt(snap?.lidar?.rangeMin ?? snap?.lidar?.range_min, 2)} –{" "}
+                {fmt(snap?.lidar?.rangeMax ?? snap?.lidar?.range_max, 2)} m
+              </dd>
+            </div>
+            <div>
+              <dt>Frame</dt>
+              <dd>
+                {snap?.lidar?.frameId || snap?.lidar?.frame_id || "—"}
+              </dd>
+            </div>
+          </dl>
+          {snap?.lidar?.points?.length ? (
+            <LidarMap
+              points={snap.lidar.points}
+              rangeMax={snap.lidar.rangeMax ?? snap.lidar.range_max ?? 8}
+            />
+          ) : (
+            <p className="muted">
+              라이다 포인트 없음 — `/dev/ttyAMA0` RPLidar 또는 sllidar를 확인하세요.
+            </p>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export default function AdminRobotPage() {
+  const [robots, setRobots] = useState<RobotMonitor[]>([]);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
+  const [auto, setAuto] = useState(true);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [res, d] = await Promise.all([
+        api<RobotsResponse>("/admin/robots"),
+        api<Device[]>("/admin/robot/devices").catch(() => [] as Device[]),
+      ]);
+      setRobots(res.robots || []);
+      setDevices(d);
+      setError(null);
+      setUpdatedAt(new Date().toLocaleTimeString("ko-KR"));
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "로봇 모니터링 API에 연결할 수 없습니다",
+      );
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!auto) return;
+    const id = window.setInterval(() => void refresh(), 2000);
+    return () => window.clearInterval(id);
+  }, [auto, refresh]);
+
+  return (
+    <div className="admin-panel">
+      <div className="admin-panel-head">
+        <div>
+          <h1 className="hero-title" style={{ fontSize: "2.2rem" }}>
+            로봇 모니터링
+          </h1>
+          <p className="muted">
+            주행로봇별 영역 — 연결 · 배터리 · 초음파 · IMU · 라이다맵
+            {robots.length ? ` (${robots.length}대)` : ""}
+          </p>
+        </div>
+        <div className="admin-panel-actions">
+          <label className="admin-check">
+            <input
+              type="checkbox"
+              checked={auto}
+              onChange={(e) => setAuto(e.target.checked)}
+            />
+            자동 갱신
+          </label>
+          <button
+            type="button"
+            className="btn secondary"
+            onClick={() => void refresh()}
+          >
+            새로고침
+          </button>
+        </div>
+      </div>
+
+      {error ? (
+        <p className="error">
+          {error}
+          <span className="muted">
+            {" "}
+            — BFF의 `PINKY_ROBOTS` 또는 `PINKY_URL` / `PINKY_URL_2`를 확인하세요.
+          </span>
+        </p>
+      ) : null}
+      {updatedAt ? (
+        <p className="muted" style={{ marginTop: 0 }}>
+          마지막 갱신 {updatedAt}
+        </p>
+      ) : null}
+
+      <div className="robot-stack">
+        {robots.map((r) => (
+          <RobotBlock key={r.id} robot={r} />
+        ))}
+        {!robots.length && !error ? (
+          <p className="muted">등록된 로봇이 없습니다.</p>
+        ) : null}
+      </div>
+
+      <section className="robot-block robot-block-devices">
+        <header className="robot-block-head">
+          <h2 className="robot-block-title">디바이스 (Controller)</h2>
+        </header>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>코드</th>
+              <th>타입</th>
+              <th>상태</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {devices.map((d) => (
+              <tr key={d.id}>
+                <td>{d.code}</td>
+                <td>{d.type}</td>
+                <td>{d.status}</td>
+              </tr>
+            ))}
+            {!devices.length ? (
+              <tr>
+                <td colSpan={3} className="muted">
+                  디바이스 없음
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </section>
     </div>
   );
 }

@@ -30,6 +30,11 @@ import * as path from "path";
 import { diskStorage } from "multer";
 import { AdminGuard, AuthGuard, CurrentUser, type AuthPayload } from "./auth";
 import { controllerJson } from "./controller-client";
+import {
+  listPinkyRobots,
+  pinkyJson,
+  resolvePinkyUrl,
+} from "./pinky-client";
 
 function wrapError(err: unknown): never {
   const e = err as Error & { status?: number };
@@ -305,5 +310,104 @@ export class AppController {
     if (!file) throw new HttpException("file required", 400);
     // Relative path — clients resolve with current host (LAN / phone safe)
     return { url: `/uploads/${file.filename}` };
+  }
+
+  /** 등록된 주행로봇 목록 + 각 대 센서 스냅샷 (세로 패널용) */
+  @Get("admin/robots")
+  @UseGuards(AdminGuard)
+  async robotsMonitor() {
+    const targets = listPinkyRobots();
+    const robots = await Promise.all(
+      targets.map(async (t) => {
+        try {
+          const [health, sensors] = await Promise.all([
+            pinkyJson("/health", undefined, t.url),
+            pinkyJson("/sensors", undefined, t.url),
+          ]);
+          return {
+            id: t.id,
+            label: t.label,
+            url: t.url,
+            online: true,
+            health,
+            sensors,
+            error: null as string | null,
+          };
+        } catch (err) {
+          const e = err as Error;
+          return {
+            id: t.id,
+            label: t.label,
+            url: t.url,
+            online: false,
+            health: null,
+            sensors: null,
+            error: e.message || "unreachable",
+          };
+        }
+      }),
+    );
+    return { robots, count: robots.length };
+  }
+
+  @Get("admin/robot/health")
+  @UseGuards(AdminGuard)
+  async robotHealth(@Query("robot") robot?: string) {
+    try {
+      return await pinkyJson("/health", undefined, resolvePinkyUrl(robot));
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Get("admin/robot/sensors")
+  @UseGuards(AdminGuard)
+  async robotSensors(@Query("robot") robot?: string) {
+    try {
+      return await pinkyJson("/sensors", undefined, resolvePinkyUrl(robot));
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Get("admin/robot/sensors/:kind")
+  @UseGuards(AdminGuard)
+  async robotSensorKind(
+    @Param("kind") kind: string,
+    @Query("robot") robot?: string,
+  ) {
+    const allowed = new Set(["battery", "lidar", "imu", "ultrasonic"]);
+    if (!allowed.has(kind)) {
+      throw new HttpException("unknown sensor kind", 400);
+    }
+    try {
+      return await pinkyJson(
+        `/sensors/${kind}`,
+        undefined,
+        resolvePinkyUrl(robot),
+      );
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Get("admin/robot/devices")
+  @UseGuards(AdminGuard)
+  async robotDevices() {
+    try {
+      return await controllerJson("/devices");
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Get("admin/robot/telemetry")
+  @UseGuards(AdminGuard)
+  async robotTelemetry() {
+    try {
+      return await controllerJson("/robot/telemetry");
+    } catch (err) {
+      wrapError(err);
+    }
   }
 }

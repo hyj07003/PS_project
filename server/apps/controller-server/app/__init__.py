@@ -11,6 +11,7 @@ from .seed import seed_if_empty
 from .services.carts import CartsService
 from .services.orders import OrdersService
 from .services.products import ProductsService
+from .services.robot import RobotService
 from .services.users import UsersService
 
 
@@ -27,6 +28,7 @@ def create_app() -> Flask:
     users = UsersService(conn)
     carts = CartsService(conn, products)
     orders = OrdersService(conn, carts)
+    robot = RobotService(conn)
 
     app.extensions["db"] = conn
     app.extensions["services"] = {
@@ -34,6 +36,7 @@ def create_app() -> Flask:
         "products": products,
         "carts": carts,
         "orders": orders,
+        "robot": robot,
     }
 
     @app.errorhandler(ApiError)

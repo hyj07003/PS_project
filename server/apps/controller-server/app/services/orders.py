@@ -1,20 +1,30 @@
 from __future__ import annotations
 
-import sqlite3
+import os
 import threading
 from typing import Any
 
-from ..adapters import ORDER_FLOW, MockAiAdapter, MockCartAdapter, MockStationAdapter
+from ..adapters import (
+    ORDER_FLOW,
+    MockAiAdapter,
+    MockCartAdapter,
+    MockStationAdapter,
+    PinkyHttpCartAdapter,
+)
 from ..db import now_iso
 from ..errors import ApiError
 from .carts import CartsService
 
 
 class OrdersService:
-    def __init__(self, conn: sqlite3.Connection, carts: CartsService):
+    def __init__(self, conn, carts: CartsService):
         self.conn = conn
         self.carts = carts
-        self.cart_port = MockCartAdapter()
+        pinky_url = os.environ.get("PINKY_URL", "").strip()
+        if pinky_url:
+            self.cart_port = PinkyHttpCartAdapter(pinky_url)
+        else:
+            self.cart_port = MockCartAdapter()
         self.station_port = MockStationAdapter()
         self.ai_port = MockAiAdapter()
 
