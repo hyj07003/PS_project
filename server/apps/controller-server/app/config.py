@@ -33,7 +33,8 @@ def get_database_path() -> Path:
 
 
 def get_host() -> str:
-    return "127.0.0.1"
+    # 같은 공유기(Wi‑Fi)의 로봇에서 접속하려면 0.0.0.0
+    return os.environ.get("CONTROLLER_HOST", "0.0.0.0")
 
 
 def get_port() -> int:

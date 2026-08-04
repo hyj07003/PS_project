@@ -4,17 +4,49 @@ import os
 from pathlib import Path
 
 
-def load_env() -> None:
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """python-dotenv 없이도 KEY=VALUE 파일을 읽는다."""
+    try:
+        from dotenv import dotenv_values
+
+        out: dict[str, str] = {}
+        for key, value in dotenv_values(path).items():
+            if key and value is not None:
+                out[key] = value
+        return out
+    except ImportError:
+        pass
+
+    out = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        trimmed = line.strip()
+        if not trimmed or trimmed.startswith("#"):
+            continue
+        if trimmed.startswith("export "):
+            trimmed = trimmed[7:].strip()
+        idx = trimmed.index("=") if "=" in trimmed else -1
+        if idx < 0:
+            continue
+        key = trimmed[:idx].strip()
+        value = trimmed[idx + 1 :].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            out[key] = value
+    return out
+
+
+def load_env() -> list[str]:
     """
     환경 파일 로드.
     로봇 전송 시 `.env`(숨김)는 업로드가 막히는 경우가 많아
     일반 파일명 `pinky.env`도 지원한다. 먼저 찾은 키는 덮어쓰지 않음.
+    로드한 파일 경로 목록을 반환한다.
     """
-    try:
-        from dotenv import dotenv_values
-    except ImportError:
-        return
-
     root = Path(__file__).resolve().parents[1]
     candidates = [
         # 업로드·배포용 (숨김 파일 아님)
@@ -26,6 +58,7 @@ def load_env() -> None:
         Path(__file__).resolve().parents[2] / "server" / ".env",
     ]
     seen: set[Path] = set()
+    loaded: list[str] = []
     for path in candidates:
         try:
             resolved = path.resolve()
@@ -34,9 +67,17 @@ def load_env() -> None:
         if resolved in seen or not path.is_file():
             continue
         seen.add(resolved)
-        for key, value in dotenv_values(path).items():
-            if key and value is not None and key not in os.environ:
+        values = _parse_env_file(path)
+        if not values:
+            continue
+        applied = False
+        for key, value in values.items():
+            if key and key not in os.environ:
                 os.environ[key] = value
+                applied = True
+        if applied or values:
+            loaded.append(str(resolved))
+    return loaded
 
 
 def get_host() -> str:

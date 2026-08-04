@@ -76,7 +76,7 @@ flowchart TB
 | ------------------------ | ----------- | -------- | -------------------------------- |
 | `apps/web`               | `0.0.0.0`   | **3000** | 고객 쇼핑 UI + `/admin`              |
 | `apps/web-server`        | `0.0.0.0`   | **4000** | JWT 인증, BFF, 파일 업로드              |
-| `apps/controller-server` | `127.0.0.1` | **4100** | Flask 관제, SQLite, 상품/주문/미션, Mock |
+| `apps/controller-server` | `0.0.0.0` | **4100** | Flask 관제, SQLite, 상품/주문/미션 (공유기망 로봇 접속) |
 
 
 ---
@@ -506,6 +506,7 @@ pnpm dev:web          # Next.js :3000
 | ---------------------- | ------------------------------------------------------- |
 | `WEB_SERVER_HOST`      | 기본 `0.0.0.0` (LAN 공개)                                   |
 | `CONTROLLER_URL`       | BFF → 관제 (`http://127.0.0.1:4100`)                      |
+| `CONTROLLER_HOST`      | 관제 bind (기본 `0.0.0.0`, 로봇 Wi‑Fi 접속용)                 |
 | `CONTROLLER_PORT`      | 관제 포트 (기본 `4100`)                                       |
 | `PINKY_URL`            | BFF → 1번 Pinky (`http://127.0.0.1:4200`)                  |
 | `PINKY_URL_2`          | (선택) 2번 Pinky URL                                       |

@@ -130,6 +130,33 @@ function RobotBlock({ robot }: { robot: RobotMonitor }) {
         </p>
       ) : null}
 
+      {(health?.backend || snap?.backend) === "mock" ? (
+        <div className="error" style={{ marginBottom: "0.75rem" }}>
+          <strong>더미(mock) 백엔드입니다</strong>
+          <p className="muted" style={{ margin: "0.5rem 0 0" }}>
+            BFF는 로봇(<code>{robot.url}</code>)에 정상 연결되었지만, 로봇의{" "}
+            <code>run.py</code>가 <code>PINKY_BACKEND=mock</code> 으로 떠 있습니다.
+            라즈베리에서 <code>pinky.env</code>에 <code>PINKY_BACKEND=ros2</code> 확인 후
+            기존 프로세스를 종료하고 재시작하세요.
+          </p>
+          <pre
+            className="muted"
+            style={{
+              margin: "0.6rem 0 0",
+              whiteSpace: "pre-wrap",
+              fontSize: "0.85rem",
+            }}
+          >
+            {`# 로봇(SSH)에서
+curl -sS http://127.0.0.1:4200/health   # backend 확인
+pkill -f 'python.*run.py' || true
+cd ~/pinky && source /opt/ros/jazzy/setup.bash
+.venv/bin/python run.py
+# 로그에 backend=ros2 가 보여야 함`}
+          </pre>
+        </div>
+      ) : null}
+
       {allMissing ? (
         <div className="error" style={{ marginBottom: "0.75rem" }}>
           <strong>센서 데이터가 없습니다</strong>
