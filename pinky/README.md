@@ -112,6 +112,12 @@ export CONTROLLER_URL=http://<PC_IP>:4100
 | POST   | `/cmd/drive`              | `{linearX, angularZ}`     |
 | POST   | `/cmd/assign`             | Controller → 할당           |
 | POST   | `/cmd/navigate`           | Controller → 웨이포인트        |
+| GET    | `/map/meta`               | Occupancy 맵 메타 (yaml)      |
+| GET    | `/map/image`              | 맵 PNG (`PINKY_MAP`)        |
+| GET    | `/nav/state`              | pose · navigating · mapId |
+| POST   | `/nav/initialpose`        | `{x,y,yaw}` map 좌표 → AMCL |
+| POST   | `/nav/goal`               | `{x,y,yaw?}` → Nav2 goal  |
+| POST   | `/nav/stop`               | 주행 취소                     |
 
 
 
@@ -141,7 +147,38 @@ Controller에서 Pinky로 명령을내려면 `.env`에 `PINKY_URL=http://127.0.0
 
 ---
 
+## 맵 · Nav2 네비게이션
 
+### `run.py` 한 번으로 (권장)
+
+`PINKY_BACKEND=ros2` + `PINKY_AUTO_LAUNCH=auto`(기본) 이면 `run.py`가 서브프로세스로:
+
+1. `ros2 launch pinky_bringup bringup_robot.launch.xml` — 모터·오돔·**sllidar**·battery  
+2. `ros2 launch pinky_navigation bringup_launch.xml map:=<PINKY_MAP.yaml>` — AMCL·Nav2  
+
+를 띄웁니다. 종료(`Ctrl+C` / atexit) 시 자식 launch도 종료합니다.
+
+**겹치는 센서는 pinky 쪽에서 끔** (pinky_pro 유지):
+
+| 센서 | 담당 |
+|------|------|
+| 라이다 `/scan` | pinky_pro sllidar (`PINKY_DEFER_LIDAR`) |
+| 배터리 | pinky_pro `battery_publisher` (`PINKY_DEFER_BATTERY`) |
+| IMU·초음파 | pinky `sensor_publisher` (계속 발행) |
+
+사전: ROS2 + pinky_pro 워크스페이스 source, `ros2` CLI 사용 가능.
+
+끄려면: `PINKY_AUTO_LAUNCH=0` (수동으로 위 launch 실행).
+
+### HTTP 네비 API
+
+`run.py`는 Nav2 **클라이언트 브리지**도 제공합니다 (`/nav/*`, `/map/*`).
+
+좌표는 **map 프레임 미터**. 관리자 UI: 좌드래그 pose · 우클릭 goal.
+
+맵 파일: `PINKY_MAP=map_test1` → `map_test1.yaml` + `.pgm`
+
+---
 
 ## 모듈 사용 예
 
@@ -153,6 +190,9 @@ robot.start()
 
 print(robot.battery.read().to_dict())
 print(robot.lidar.read().to_dict())
+print(robot.navigation.map_info())
+robot.navigation.set_initial_pose(0.0, 0.0, 0.0)
+robot.navigation.go_to(1.0, 0.5, 0.0)
 robot.led.fill(255, 0, 0)
 robot.lcd.set_emotion("happy")
 robot.stop()

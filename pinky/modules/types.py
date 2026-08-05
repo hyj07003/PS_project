@@ -153,6 +153,8 @@ class RobotSnapshot:
     ultrasonic: UltrasonicData
     backend: str
     online: bool = True
+    pose: dict[str, float] | None = None
+    navigating: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         battery = self.battery.to_dict()
@@ -180,6 +182,8 @@ class RobotSnapshot:
             "lidar": lidar,
             "imu": imu,
             "ultrasonic": ultrasonic,
+            "pose": self.pose,
+            "navigating": self.navigating,
             "hasData": {
                 "battery": has_battery,
                 "lidar": has_lidar,

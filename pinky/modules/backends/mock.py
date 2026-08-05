@@ -32,6 +32,10 @@ class MockBackend(RobotBackend):
         self._brightness = 128
         self._emotion = "basic"
         self._cmd_vel = {"linearX": 0.0, "angularZ": 0.0}
+        self._nav_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+        self._nav_goal: dict[str, float] | None = None
+        self._is_navigating = False
+        self._nav_goal_t0 = 0.0
 
     def start(self) -> None:
         self._started = True
@@ -130,6 +134,57 @@ class MockBackend(RobotBackend):
     def drive(self, linear_x: float, angular_z: float) -> dict[str, Any]:
         self._cmd_vel = {"linearX": float(linear_x), "angularZ": float(angular_z)}
         return {"success": True, "message": "mock cmd_vel ok", "cmdVel": self._cmd_vel}
+
+    def get_nav_pose(self) -> dict[str, float] | None:
+        self._tick_nav()
+        return dict(self._nav_pose)
+
+    def is_navigating(self) -> bool:
+        self._tick_nav()
+        return self._is_navigating
+
+    def set_initial_pose(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
+        self._nav_pose = {"x": float(x), "y": float(y), "yaw": float(yaw)}
+        self._is_navigating = False
+        self._nav_goal = None
+        return {
+            "success": True,
+            "message": "mock initialpose set",
+            "pose": dict(self._nav_pose),
+        }
+
+    def navigate_to(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
+        self._nav_goal = {"x": float(x), "y": float(y), "yaw": float(yaw)}
+        self._nav_goal_t0 = time.time()
+        self._is_navigating = True
+        return {
+            "success": True,
+            "message": "mock goal accepted",
+            "goal": dict(self._nav_goal),
+        }
+
+    def cancel_navigation(self) -> dict[str, Any]:
+        self._is_navigating = False
+        self._nav_goal = None
+        return {"success": True, "message": "mock cancel ok"}
+
+    def _tick_nav(self) -> None:
+        if not self._is_navigating or not self._nav_goal:
+            return
+        # ~2s lerp to goal
+        t = min(1.0, (time.time() - self._nav_goal_t0) / 2.0)
+        g = self._nav_goal
+        sx, sy, syaw = self._nav_pose["x"], self._nav_pose["y"], self._nav_pose["yaw"]
+        # blend from start stored at goal time — approximate from current
+        self._nav_pose = {
+            "x": sx + (g["x"] - sx) * min(1.0, t + 0.15),
+            "y": sy + (g["y"] - sy) * min(1.0, t + 0.15),
+            "yaw": syaw + (g["yaw"] - syaw) * min(1.0, t + 0.15),
+        }
+        if t >= 1.0:
+            self._nav_pose = dict(g)
+            self._is_navigating = False
+            self._nav_goal = None
 
     def get_actuator_state(self) -> dict[str, Any]:
         return {

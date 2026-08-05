@@ -5,6 +5,7 @@ from .imu import ImuModule
 from .lcd import LcdModule
 from .led import LedModule
 from .lidar import LidarModule
+from .navigation import NavigationModule
 from .robot import PinkyRobot
 from .ultrasonic import UltrasonicModule
 
@@ -16,4 +17,5 @@ __all__ = [
     "UltrasonicModule",
     "LedModule",
     "LcdModule",
+    "NavigationModule",
 ]

@@ -716,6 +716,25 @@ img {
   padding: 0.5rem;
 }
 
+.occupancy-nav-map {
+  margin-top: 0.85rem;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.35);
+  padding: 0.65rem;
+}
+
+.occupancy-nav-toolbar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.occupancy-nav-coords {
+  margin: 0 0 0.65rem;
+}
+
 .lidar-map canvas {
   display: block;
   max-width: 100%;

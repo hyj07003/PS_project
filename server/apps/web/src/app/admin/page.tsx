@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { LidarMap } from "@/components/LidarMap";
+import { OccupancyNavMap } from "@/components/OccupancyNavMap";
 
 type RobotHealth = {
   ok?: boolean;
@@ -58,6 +58,8 @@ type Snapshot = {
   lidar?: Lidar;
   imu?: Imu;
   ultrasonic?: Ultrasonic;
+  pose?: { x: number; y: number; yaw: number } | null;
+  navigating?: boolean;
   hasData?: {
     battery?: boolean;
     lidar?: boolean;
@@ -65,6 +67,12 @@ type Snapshot = {
     ultrasonic?: boolean;
   };
   warnings?: string[];
+};
+
+type NavState = {
+  pose?: { x: number; y: number; yaw: number } | null;
+  navigating?: boolean;
+  mapId?: string | null;
 };
 
 type Device = {
@@ -81,6 +89,7 @@ type RobotMonitor = {
   online: boolean;
   health: RobotHealth | null;
   sensors: Snapshot | null;
+  nav?: NavState | null;
   error: string | null;
 };
 
@@ -299,39 +308,48 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
         </div>
 
         <div className="monitor-card monitor-card-wide">
-          <h3>라이다 맵</h3>
+          <h3>맵 · 네비게이션</h3>
+          <p className="muted" style={{ marginTop: 0, fontSize: "0.85rem" }}>
+            좌드래그: 현재 pose · 우드래그: 목표 위치+최종 yaw (Nav2 goal)
+          </p>
           <dl className="monitor-dl">
             <div>
-              <dt>포인트</dt>
+              <dt>라이다</dt>
               <dd>
-                {snap?.lidar?.points?.length ?? 0} /{" "}
-                {snap?.lidar?.rangesCount ?? "—"}
+                {snap?.lidar?.points?.length ?? 0} pts
+                {robot.nav?.mapId ? ` · map ${robot.nav.mapId}` : ""}
               </dd>
             </div>
             <div>
-              <dt>거리 범위</dt>
+              <dt>주행</dt>
               <dd>
-                {fmt(snap?.lidar?.rangeMin ?? snap?.lidar?.range_min, 2)} –{" "}
-                {fmt(snap?.lidar?.rangeMax ?? snap?.lidar?.range_max, 2)} m
+                {robot.nav?.navigating || snap?.navigating
+                  ? "navigating"
+                  : "idle"}
               </dd>
             </div>
             <div>
-              <dt>Frame</dt>
+              <dt>현재 좌표</dt>
               <dd>
-                {snap?.lidar?.frameId || snap?.lidar?.frame_id || "—"}
+                {(() => {
+                  const p = robot.nav?.pose || snap?.pose;
+                  return p
+                    ? `x=${p.x.toFixed(3)}, y=${p.y.toFixed(3)}, yaw=${p.yaw.toFixed(3)}`
+                    : "—";
+                })()}
               </dd>
             </div>
           </dl>
-          {snap?.lidar?.points?.length ? (
-            <LidarMap
-              points={snap.lidar.points}
-              rangeMax={snap.lidar.rangeMax ?? snap.lidar.range_max ?? 8}
-            />
-          ) : (
-            <p className="muted">
-              라이다 포인트 없음 — `/dev/ttyAMA0` RPLidar 또는 sllidar를 확인하세요.
-            </p>
-          )}
+          <OccupancyNavMap
+            robotId={robot.id}
+            lidarPoints={snap?.lidar?.points || []}
+            pose={
+              robot.nav?.pose ||
+              snap?.pose ||
+              null
+            }
+            navigating={Boolean(robot.nav?.navigating || snap?.navigating)}
+          />
         </div>
       </div>
     </section>
@@ -382,7 +400,7 @@ export default function AdminRobotPage() {
             로봇 모니터링
           </h1>
           <p className="muted">
-            주행로봇별 영역 — 연결 · 배터리 · 초음파 · IMU · 라이다맵
+            주행로봇별 영역 — 연결 · 배터리 · 초음파 · IMU · Occupancy 맵/네비
             {robots.length ? ` (${robots.length}대)` : ""}
           </p>
         </div>
