@@ -1,3 +1,7 @@
+##실행하실 때 python3 /home/pinky/nav2_client.py 0.5 0.5 0 이거 치시면 이동합니다
+##python3 /home/pinky/nav2_client.py x좌표 y좌표 핑키가바라보는방향
+##아직 문제가 많아 해결해야 할 부분이 많습니다
+
 
 #!/usr/bin/env python3
 
