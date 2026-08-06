@@ -82,6 +82,9 @@ export CONTROLLER_URL=http://<PC_IP>:4100
 2. Flask + `Ros2Backend` — 위 토픽 구독 후 HTTP로 제공
 
 라이다는 `controllers/lidar.py`가 **rplidarc1**로 `/dev/ttyAMA0`을 읽고,
+`PINKY_DEFER_LIDAR` 시 pinky_pro `sllidar`의 `/scan`을 구독합니다.
+`/scan`이 비어 있으면 기동 시 `lidar_recovery`가 sllidar를 정리하고 LidarReader로 폴백합니다.
+로그: `~/pinky_logs/pinky_pro_bringup.log`
 `output_queue` 원시 샘플을 **1회전 단위로 모아** 고밀도 포인트를 만듭니다.
 (실패 시 pyserial → `sllidar_ros2` launch 순으로 폴백. 기존 sllidar와 동시 사용 시 포트 충돌 주의.)
 
@@ -116,8 +119,9 @@ export CONTROLLER_URL=http://<PC_IP>:4100
 | GET    | `/map/image`              | 맵 PNG (`PINKY_MAP`)        |
 | GET    | `/nav/state`              | pose · navigating · mapId |
 | POST   | `/nav/initialpose`        | `{x,y,yaw}` map 좌표 → AMCL |
-| POST   | `/nav/goal`               | `{x,y,yaw?}` → Nav2 goal  |
-| POST   | `/nav/stop`               | 주행 취소                     |
+| POST   | `/nav/goal`               | `{x,y,yaw?}` → Nav2 goal (비동기) |
+| POST   | `/nav/goal_wait`          | 동일 + 도착/실패/타임아웃까지 대기     |
+| POST   | `/nav/stop`               | 주행 취소                       |
 
 
 

@@ -40,6 +40,17 @@ class NavigationModule:
     def go_to(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
         return self._backend.navigate_to(float(x), float(y), float(yaw))
 
+    def go_to_wait(
+        self,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 180.0,
+    ) -> dict[str, Any]:
+        return self._backend.navigate_to_wait(
+            float(x), float(y), float(yaw), float(timeout_sec)
+        )
+
     def cancel(self) -> dict[str, Any]:
         return self._backend.cancel_navigation()
 

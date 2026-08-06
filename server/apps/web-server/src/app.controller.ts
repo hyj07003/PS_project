@@ -320,8 +320,29 @@ export class AppController {
   @UseGuards(AdminGuard)
   async robotsMonitor() {
     const targets = listPinkyRobots();
+    let queueLength = 0;
+    try {
+      const q = await controllerJson<{ queueLength?: number }>(
+        "/missions/queue",
+      );
+      queueLength = q.queueLength ?? 0;
+    } catch {
+      queueLength = 0;
+    }
+
     const robots = await Promise.all(
       targets.map(async (t) => {
+        let assignment: unknown = null;
+        try {
+          const missions = await controllerJson<unknown[]>(
+            `/missions?deviceCode=${encodeURIComponent(t.id)}&active=1&includeOrder=1`,
+          );
+          assignment =
+            Array.isArray(missions) && missions.length > 0 ? missions[0] : null;
+        } catch {
+          assignment = null;
+        }
+
         try {
           const [health, sensors, nav] = await Promise.all([
             pinkyJson("/health", undefined, t.url),
@@ -336,6 +357,7 @@ export class AppController {
             health,
             sensors,
             nav,
+            assignment,
             error: null as string | null,
           };
         } catch (err) {
@@ -348,12 +370,31 @@ export class AppController {
             health: null,
             sensors: null,
             nav: null,
+            assignment,
             error: e.message || "unreachable",
           };
         }
       }),
     );
-    return { robots, count: robots.length };
+    return { robots, count: robots.length, queueLength };
+  }
+
+  @Get("admin/robot/missions")
+  @UseGuards(AdminGuard)
+  async robotMissions(
+    @Query("robot") robot?: string,
+    @Query("active") active?: string,
+  ) {
+    try {
+      const qs = new URLSearchParams();
+      if (robot) qs.set("deviceCode", robot);
+      if (active) qs.set("active", active);
+      qs.set("includeOrder", "1");
+      const q = qs.toString();
+      return await controllerJson(`/missions${q ? `?${q}` : ""}`);
+    } catch (err) {
+      wrapError(err);
+    }
   }
 
   @Get("admin/robot/map/meta")

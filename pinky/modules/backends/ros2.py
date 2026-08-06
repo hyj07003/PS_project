@@ -190,10 +190,15 @@ class Ros2Backend(RobotBackend):
         return math.atan2(siny_cosp, cosy_cosp)
 
     def _on_nav_status(self, msg) -> None:
+        # Include CANCELING so brief status gaps / recoveries don't clear the flag.
         active = (
             self._GoalStatus.STATUS_ACCEPTED,
             self._GoalStatus.STATUS_EXECUTING,
+            self._GoalStatus.STATUS_CANCELING,
         )
+        # Empty status_list is common between updates — keep previous navigating state.
+        if not msg.status_list:
+            return
         navigating = any(s.status in active for s in msg.status_list)
         with self._lock:
             self._is_navigating = navigating
@@ -271,6 +276,93 @@ class Ros2Backend(RobotBackend):
         return {
             "success": True,
             "message": "goal sent",
+            "goal": {"x": x, "y": y, "yaw": yaw},
+        }
+
+    def navigate_to_wait(
+        self,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 180.0,
+    ) -> dict[str, Any]:
+        if not self._nav_enabled or self._nav_client is None:
+            return {"success": False, "status": "UNAVAILABLE", "message": "navigation not enabled"}
+        from action_msgs.msg import GoalStatus
+        from nav2_msgs.action import NavigateToPose
+
+        if not self._nav_client.wait_for_server(timeout_sec=2.0):
+            return {
+                "success": False,
+                "status": "UNAVAILABLE",
+                "message": "navigate_to_pose Action Server not available (Nav2 기동 확인)",
+            }
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = "map"
+        goal.pose.header.stamp = self._node.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(x)
+        goal.pose.pose.position.y = float(y)
+        goal.pose.pose.orientation.z = math.sin(float(yaw) / 2.0)
+        goal.pose.pose.orientation.w = math.cos(float(yaw) / 2.0)
+
+        send_future = self._nav_client.send_goal_async(goal)
+        with self._lock:
+            self._is_navigating = True
+
+        deadline = time.time() + max(1.0, float(timeout_sec))
+        while not send_future.done():
+            if time.time() > deadline:
+                with self._lock:
+                    self._is_navigating = False
+                return {
+                    "success": False,
+                    "status": "TIMEOUT",
+                    "message": "goal accept timeout",
+                }
+            time.sleep(0.05)
+
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            with self._lock:
+                self._is_navigating = False
+            return {
+                "success": False,
+                "status": "REJECTED",
+                "message": "goal rejected",
+            }
+
+        result_future = goal_handle.get_result_async()
+        while not result_future.done():
+            if time.time() > deadline:
+                try:
+                    self.cancel_navigation()
+                except Exception:
+                    pass
+                with self._lock:
+                    self._is_navigating = False
+                return {
+                    "success": False,
+                    "status": "TIMEOUT",
+                    "message": "nav result timeout",
+                }
+            time.sleep(0.05)
+
+        wrapped = result_future.result()
+        with self._lock:
+            self._is_navigating = False
+        if wrapped is None:
+            return {
+                "success": False,
+                "status": "FAILED",
+                "message": "no result",
+            }
+        status = int(wrapped.status)
+        ok = status == GoalStatus.STATUS_SUCCEEDED
+        return {
+            "success": ok,
+            "status": "SUCCEEDED" if ok else f"STATUS_{status}",
+            "message": "arrived" if ok else f"nav ended with status {status}",
             "goal": {"x": x, "y": y, "yaw": yaw},
         }
 

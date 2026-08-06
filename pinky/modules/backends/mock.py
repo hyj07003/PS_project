@@ -163,6 +163,35 @@ class MockBackend(RobotBackend):
             "goal": dict(self._nav_goal),
         }
 
+    def navigate_to_wait(
+        self,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 180.0,
+    ) -> dict[str, Any]:
+        self.navigate_to(x, y, yaw)
+        deadline = time.time() + max(0.5, float(timeout_sec))
+        while time.time() < deadline:
+            self._tick_nav()
+            if not self._is_navigating:
+                pose = self.get_nav_pose() or {}
+                return {
+                    "success": True,
+                    "status": "SUCCEEDED",
+                    "message": "mock arrived",
+                    "pose": pose,
+                    "goal": {"x": x, "y": y, "yaw": yaw},
+                }
+            time.sleep(0.05)
+        self._is_navigating = False
+        self._nav_goal = None
+        return {
+            "success": False,
+            "status": "TIMEOUT",
+            "message": "mock nav timeout",
+        }
+
     def cancel_navigation(self) -> dict[str, Any]:
         self._is_navigating = False
         self._nav_goal = None

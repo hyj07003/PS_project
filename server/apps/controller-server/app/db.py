@@ -272,7 +272,9 @@ def migrate(conn: LockedConnection) -> None:
       order_id INTEGER NOT NULL REFERENCES orders(id),
       device_id INTEGER REFERENCES devices(id),
       status TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      current_waypoint TEXT,
+      current_waypoint_label TEXT
     );
 
     CREATE TABLE IF NOT EXISTS mission_events (
@@ -295,3 +297,15 @@ def migrate(conn: LockedConnection) -> None:
     """
     )
     conn.commit()
+    _ensure_column(conn, "missions", "current_waypoint", "TEXT")
+    _ensure_column(conn, "missions", "current_waypoint_label", "TEXT")
+
+
+def _ensure_column(
+    conn: LockedConnection, table: str, column: str, col_type: str
+) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    names = {r["name"] if isinstance(r, sqlite3.Row) else r[1] for r in rows}
+    if column not in names:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        conn.commit()

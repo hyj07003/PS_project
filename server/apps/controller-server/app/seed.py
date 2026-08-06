@@ -17,109 +17,65 @@ CATEGORY_SEEDS = [
     {"code": "health", "name": "헬스/뷰티", "sortOrder": 8},
 ]
 
+# Demo catalog for map waypoints W1–W6
 PRODUCTS = [
     {
-        "code": "fresh",
-        "name": "유기농 사과 1kg",
-        "slug": "organic-apple-1kg",
-        "description": "아삭한 식감의 국내산 유기농 사과입니다.",
+        "code": "ready",
+        "name": "케이크",
+        "slug": "cake",
+        "description": "매장 데모 — 케이크 매대(W1).",
+        "price": 12000,
+        "featured": 1,
+    },
+    {
+        "code": "ready",
+        "name": "롤케이크",
+        "slug": "roll-cake",
+        "description": "매장 데모 — 롤케이크 매대(W2).",
         "price": 8900,
         "featured": 1,
     },
     {
-        "code": "fresh",
-        "name": "신선 시금치 묶음",
-        "slug": "fresh-spinach",
-        "description": "당일 수확 시금치, 나물·무침용.",
-        "price": 3200,
-        "featured": 0,
+        "code": "ready",
+        "name": "샌드위치",
+        "slug": "sandwich",
+        "description": "매장 데모 — 샌드위치 매대(W3).",
+        "price": 5500,
+        "featured": 1,
+    },
+    {
+        "code": "snack",
+        "name": "아이스크림",
+        "slug": "ice-cream",
+        "description": "매장 데모 — 아이스크림 매대(W4).",
+        "price": 3500,
+        "featured": 1,
     },
     {
         "code": "dairy",
-        "name": "저지방 우유 1L",
-        "slug": "lowfat-milk-1l",
-        "description": "고소한 저지방 우유.",
+        "name": "우유",
+        "slug": "milk",
+        "description": "매장 데모 — 우유 매대(W5).",
         "price": 2800,
         "featured": 1,
     },
     {
-        "code": "dairy",
-        "name": "그릭 요거트 400g",
-        "slug": "greek-yogurt-400g",
-        "description": "진한 그릭 요거트.",
-        "price": 4500,
-        "featured": 0,
-    },
-    {
         "code": "beverage",
-        "name": "스파클링 워터 500ml",
-        "slug": "sparkling-water-500",
-        "description": "청량한 탄산수.",
-        "price": 1500,
-        "featured": 0,
-    },
-    {
-        "code": "beverage",
-        "name": "콜드브루 커피 1L",
-        "slug": "coldbrew-1l",
-        "description": "부드러운 콜드브루.",
-        "price": 6900,
+        "name": "콜라",
+        "slug": "cola",
+        "description": "매장 데모 — 콜라 매대(W6).",
+        "price": 2000,
         "featured": 1,
-    },
-    {
-        "code": "snack",
-        "name": "허니버터칩",
-        "slug": "honey-butter-chips",
-        "description": "달콤짭짤한 감자칩.",
-        "price": 2200,
-        "featured": 0,
-    },
-    {
-        "code": "ready",
-        "name": "즉석 김치찌개",
-        "slug": "instant-kimchi-jjigae",
-        "description": "전자레인지 3분 완성.",
-        "price": 4900,
-        "featured": 0,
-    },
-    {
-        "code": "household",
-        "name": "키친타월 6롤",
-        "slug": "kitchen-towel-6",
-        "description": "두툼한 흡수력.",
-        "price": 7800,
-        "featured": 0,
-    },
-    {
-        "code": "kitchen",
-        "name": "친환경 주방세제",
-        "slug": "eco-dish-soap",
-        "description": "피부 자극 낮은 주방세제.",
-        "price": 3900,
-        "featured": 0,
-    },
-    {
-        "code": "health",
-        "name": "비타민C 100정",
-        "slug": "vitamin-c-100",
-        "description": "하루 한 알 비타민C.",
-        "price": 12900,
-        "featured": 1,
-    },
-    {
-        "code": "snack",
-        "name": "다크 초콜릿바",
-        "slug": "dark-chocolate-bar",
-        "description": "카카오 70% 다크 초콜릿.",
-        "price": 3500,
-        "featured": 0,
     },
 ]
+
+DEMO_SLUGS = {p["slug"] for p in PRODUCTS}
 
 
 def seed_if_empty(conn) -> None:
     row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
     if row["c"] > 0:
+        ensure_demo_catalog(conn)
         return
 
     ts = now_iso()
@@ -157,34 +113,101 @@ def seed_if_empty(conn) -> None:
             (cat["code"], cat["name"], cat["sortOrder"]),
         )
 
+    _insert_demo_products(conn, admin_id, ts)
+    _ensure_devices(conn)
+    conn.commit()
+
+
+def ensure_demo_catalog(conn) -> None:
+    """Upsert demo products and deactivate non-demo SKUs on existing DBs."""
+    ts = now_iso()
+    admin = conn.execute(
+        "SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1"
+    ).fetchone()
+    admin_id = admin["id"] if admin else None
+
+    for cat in CATEGORY_SEEDS:
+        conn.execute(
+            """
+            INSERT INTO categories (code, name, sort_order, is_active)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(code) DO UPDATE SET
+              name = excluded.name,
+              sort_order = excluded.sort_order,
+              is_active = 1
+            """,
+            (cat["code"], cat["name"], cat["sortOrder"]),
+        )
+
+    _insert_demo_products(conn, admin_id, ts)
+    # Hide legacy catalog SKUs so demo storefront is clear
+    placeholders = ",".join("?" for _ in DEMO_SLUGS)
+    conn.execute(
+        f"UPDATE products SET is_active = 0, updated_at = ? WHERE slug NOT IN ({placeholders})",
+        (ts, *DEMO_SLUGS),
+    )
+    _ensure_devices(conn)
+    conn.commit()
+
+
+def _insert_demo_products(conn, admin_id: int | None, ts: str) -> None:
     categories = conn.execute("SELECT id, code FROM categories").fetchall()
     by_code = {c["code"]: c["id"] for c in categories}
 
     for p in PRODUCTS:
-        conn.execute(
-            """
-            INSERT INTO products (
-              category_id, name, slug, description, price, stock,
-              image_full_url, image_zoom_url, is_featured, is_active,
-              created_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-            """,
-            (
-                by_code[p["code"]],
-                p["name"],
-                p["slug"],
-                p["description"],
-                p["price"],
-                50,
-                placeholder(p["name"], "full"),
-                placeholder(f"{p['name']}+", "zoom"),
-                p["featured"],
-                admin_id,
-                ts,
-                ts,
-            ),
-        )
+        existing = conn.execute(
+            "SELECT id FROM products WHERE slug = ?",
+            (p["slug"],),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE products SET
+                  category_id = ?, name = ?, description = ?, price = ?,
+                  stock = CASE WHEN stock < 50 THEN 50 ELSE stock END,
+                  image_full_url = ?, image_zoom_url = ?,
+                  is_featured = ?, is_active = 1, updated_at = ?
+                WHERE slug = ?
+                """,
+                (
+                    by_code[p["code"]],
+                    p["name"],
+                    p["description"],
+                    p["price"],
+                    placeholder(p["name"], "full"),
+                    placeholder(f"{p['name']}+", "zoom"),
+                    p["featured"],
+                    ts,
+                    p["slug"],
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO products (
+                  category_id, name, slug, description, price, stock,
+                  image_full_url, image_zoom_url, is_featured, is_active,
+                  created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    by_code[p["code"]],
+                    p["name"],
+                    p["slug"],
+                    p["description"],
+                    p["price"],
+                    50,
+                    placeholder(p["name"], "full"),
+                    placeholder(f"{p['name']}+", "zoom"),
+                    p["featured"],
+                    admin_id,
+                    ts,
+                    ts,
+                ),
+            )
 
+
+def _ensure_devices(conn) -> None:
     for code, dtype in (
         ("cart-1", "cart"),
         ("cart-2", "cart"),
@@ -192,8 +215,10 @@ def seed_if_empty(conn) -> None:
         ("station-2", "station"),
     ):
         conn.execute(
-            "INSERT INTO devices (code, type, status) VALUES (?, ?, 'idle')",
+            """
+            INSERT INTO devices (code, type, status)
+            VALUES (?, ?, 'idle')
+            ON CONFLICT(code) DO NOTHING
+            """,
             (code, dtype),
         )
-
-    conn.commit()

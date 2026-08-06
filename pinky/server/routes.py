@@ -41,6 +41,7 @@ def index():
                 "GET /nav/state",
                 "POST /nav/initialpose",
                 "POST /nav/goal",
+                "POST /nav/goal_wait",
                 "POST /nav/stop",
                 "POST /actuators/led",
                 "POST /actuators/lcd",
@@ -157,6 +158,22 @@ def nav_goal():
         return jsonify({"success": False, "message": "x,y required"}), 400
     yaw = float(body.get("yaw", 0.0))
     result = _robot().navigation.go_to(x, y, yaw)
+    status = 200 if result.get("success") else 502
+    return jsonify(result), status
+
+
+@bp.post("/nav/goal_wait")
+def nav_goal_wait():
+    """Send NavigateToPose and block until arrived / failed / timeout."""
+    body = request.get_json(silent=True) or {}
+    try:
+        x = float(body["x"])
+        y = float(body["y"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"success": False, "message": "x,y required"}), 400
+    yaw = float(body.get("yaw", 0.0))
+    timeout = float(body.get("timeoutSec", body.get("timeout_sec", 180.0)))
+    result = _robot().navigation.go_to_wait(x, y, yaw, timeout)
     status = 200 if result.get("success") else 502
     return jsonify(result), status
 

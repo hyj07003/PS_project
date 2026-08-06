@@ -110,33 +110,68 @@ class ProStackLauncher:
         os.environ["PINKY_LIDAR_SLLIDAR"] = "0"
 
         env = os.environ.copy()
-        cmds: list[list[str]] = [
-            [
-                "ros2",
-                "launch",
-                "pinky_bringup",
-                "bringup_robot.launch.xml",
-            ],
-            [
-                "ros2",
-                "launch",
-                "pinky_navigation",
-                "bringup_launch.xml",
-                f"map:={map_yaml}",
-            ],
+        # Source overlay if present so `ros2 launch pinky_bringup` resolves
+        pro = _pro_root()
+        setup = pro / "install" / "setup.bash"
+        log_dir = Path(
+            os.environ.get("PINKY_PRO_LOG_DIR", str(Path.home() / "pinky_logs"))
+        )
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            log_dir = Path("/tmp")
+
+        cmds: list[tuple[str, list[str]]] = [
+            (
+                "bringup",
+                [
+                    "ros2",
+                    "launch",
+                    "pinky_bringup",
+                    "bringup_robot.launch.xml",
+                ],
+            ),
+            (
+                "nav",
+                [
+                    "ros2",
+                    "launch",
+                    "pinky_navigation",
+                    "bringup_launch.xml",
+                    f"map:={map_yaml}",
+                ],
+            ),
         ]
 
-        for cmd in cmds:
+        for name, cmd in cmds:
             logger.info("spawn: %s", " ".join(cmd))
+            log_path = log_dir / f"pinky_pro_{name}.log"
+            try:
+                log_f = open(log_path, "ab", buffering=0)
+            except Exception:
+                log_f = subprocess.DEVNULL
+
+            # Prefer bash -lc with sourced workspace when install/ exists
+            if setup.is_file():
+                shell_cmd = (
+                    f"set -e; source /opt/ros/${{ROS_DISTRO:-jazzy}}/setup.bash "
+                    f"2>/dev/null || true; source '{setup}'; "
+                    + " ".join(f"'{c}'" for c in cmd)
+                )
+                popen_cmd: list[str] = ["bash", "-lc", shell_cmd]
+            else:
+                popen_cmd = cmd
+
             try:
                 proc = subprocess.Popen(
-                    cmd,
+                    popen_cmd,
                     env=env,
-                    stdout=subprocess.DEVNULL,
+                    stdout=log_f if log_f is not subprocess.DEVNULL else subprocess.DEVNULL,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
                 self._procs.append(proc)
+                logger.info("spawned %s pid=%s log=%s", name, proc.pid, log_path)
             except FileNotFoundError:
                 logger.error(
                     "ros2 not found — source ROS2 / workspace before run.py"
@@ -148,9 +183,19 @@ class ProStackLauncher:
                 self.stop()
                 return
 
-        # TF / scan / odom 준비 대기
-        wait_s = float(os.environ.get("PINKY_PRO_LAUNCH_WAIT", "3.0"))
+        # TF / scan / odom 준비 대기 (라이다 스핀업에 여유)
+        wait_s = float(os.environ.get("PINKY_PRO_LAUNCH_WAIT", "8.0"))
         time.sleep(max(0.5, wait_s))
+
+        for i, proc in enumerate(list(self._procs)):
+            code = proc.poll()
+            if code is not None:
+                logger.error(
+                    "pinky_pro launch exited early index=%s code=%s — see ~/pinky_logs/",
+                    i,
+                    code,
+                )
+
         self._started = True
         logger.info(
             "pinky_pro launches started (%d procs, wait=%.1fs)",

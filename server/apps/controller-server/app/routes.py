@@ -150,17 +150,50 @@ def devices():
     return jsonify(_orders().list_devices())
 
 
+@bp.post("/devices/reclaim")
+def reclaim_devices():
+    """Stuck busy/error carts → idle, then dispatch queued missions."""
+    fixed = _orders().reclaim_stale_carts()
+    _orders().try_dispatch()
+    return jsonify(
+        {
+            "ok": True,
+            "reclaimed": fixed,
+            "devices": _orders().list_devices(),
+            "queueLength": _orders().queue_length(),
+        }
+    )
+
+
 def _robot():
     return current_app.extensions["services"]["robot"]
 
 
 @bp.get("/missions")
 def list_missions():
+    active = request.args.get("active", "").lower() in ("1", "true", "yes")
+    include_order = request.args.get("includeOrder", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ) or active
     return jsonify(
         _robot().list_missions(
             status=request.args.get("status"),
             device_code=request.args.get("deviceCode"),
+            active=active,
+            include_order=include_order,
         )
+    )
+
+
+@bp.get("/missions/queue")
+def mission_queue():
+    return jsonify(
+        {
+            "queueLength": _robot().queue_length(),
+            "waiting": _robot().list_missions(status="CREATED"),
+        }
     )
 
 

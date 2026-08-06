@@ -64,5 +64,15 @@ class RobotBackend(ABC):
     def navigate_to(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
         return {"success": False, "message": "navigation not supported"}
 
+    def navigate_to_wait(
+        self,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 180.0,
+    ) -> dict[str, Any]:
+        del timeout_sec
+        return self.navigate_to(x, y, yaw)
+
     def cancel_navigation(self) -> dict[str, Any]:
         return {"success": False, "message": "navigation not supported"}

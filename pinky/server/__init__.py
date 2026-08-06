@@ -62,6 +62,15 @@ def create_app() -> Flask:
     robot = PinkyRobot(backend=backend, device_code=device_code)
     robot.start()
 
+    # sllidar 가 /scan 만 만들고 데이터를 안 줄 때 LidarReader 로 복구
+    if backend == "ros2":
+        try:
+            from controllers.lidar_recovery import ensure_lidar
+
+            ensure_lidar(robot)
+        except Exception as exc:
+            logger.exception("lidar recovery error: %s", exc)
+
     app.extensions["robot"] = robot
     app.extensions["device_code"] = device_code
     app.extensions["controller"] = ControllerClient(get_controller_url())
