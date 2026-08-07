@@ -67,17 +67,42 @@ export default function CartPage() {
   );
 
   const changeQty = async (productId: number, quantity: number) => {
-    if (user) {
-      await api(`/cart/items/${productId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ quantity }),
-      });
-      await refreshCartCount();
-    } else {
-      updateGuestItem(productId, quantity);
-      await refreshCartCount();
+    setError(null);
+    try {
+      if (user) {
+        if (quantity <= 0) {
+          await api(`/cart/items/${productId}`, { method: "DELETE" });
+        } else {
+          await api(`/cart/items/${productId}`, {
+            method: "PATCH",
+            body: JSON.stringify({ quantity }),
+          });
+        }
+        await refreshCartCount();
+      } else {
+        updateGuestItem(productId, quantity);
+        await refreshCartCount();
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "수량 변경 실패");
     }
-    await load();
+  };
+
+  const removeItem = async (productId: number) => {
+    setError(null);
+    try {
+      if (user) {
+        await api(`/cart/items/${productId}`, { method: "DELETE" });
+        await refreshCartCount();
+      } else {
+        updateGuestItem(productId, 0);
+        await refreshCartCount();
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "상품 삭제 실패");
+    }
   };
 
   const checkout = async () => {
@@ -123,6 +148,7 @@ export default function CartPage() {
                 <th>가격</th>
                 <th>수량</th>
                 <th>합계</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -135,12 +161,12 @@ export default function CartPage() {
                   <td>
                     <input
                       type="number"
-                      min={0}
+                      min={1}
                       value={line.quantity}
                       onChange={(e) =>
                         void changeQty(
                           line.productId,
-                          Number(e.target.value) || 0,
+                          Math.max(1, Number(e.target.value) || 1),
                         )
                       }
                       style={{ width: 72, padding: "0.35rem" }}
@@ -150,6 +176,16 @@ export default function CartPage() {
                     {line.product
                       ? formatPriceKrw(line.product.price * line.quantity)
                       : "-"}
+                  </td>
+                  <td>
+                    <button
+                      type="button"
+                      className="btn secondary"
+                      onClick={() => void removeItem(line.productId)}
+                      aria-label={`${line.product?.name || line.productId} 삭제`}
+                    >
+                      삭제
+                    </button>
                   </td>
                 </tr>
               ))}

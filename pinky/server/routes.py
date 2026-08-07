@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, current_app, jsonify, request, Response
 
 bp = Blueprint("api", __name__)
 
@@ -36,6 +36,13 @@ def index():
                 "GET /sensors/lidar",
                 "GET /sensors/imu",
                 "GET /sensors/ultrasonic",
+                "GET /map/meta",
+                "GET /map/image",
+                "GET /nav/state",
+                "POST /nav/initialpose",
+                "POST /nav/goal",
+                "POST /nav/goal_wait",
+                "POST /nav/stop",
                 "POST /actuators/led",
                 "POST /actuators/lcd",
             ],
@@ -60,6 +67,7 @@ def publisher_status():
 def health():
     robot = _robot()
     pub = current_app.extensions.get("sensor_publisher")
+    nav = robot.navigation.state()
     return jsonify(
         {
             "ok": True,
@@ -68,6 +76,8 @@ def health():
             "deviceCode": _device_code(),
             "online": robot.snapshot().online,
             "sensorPublisher": bool(pub),
+            "mapId": nav.get("mapId"),
+            "navigating": nav.get("navigating"),
         }
     )
 
@@ -95,6 +105,84 @@ def sensors_imu():
 @bp.get("/sensors/ultrasonic")
 def sensors_ultrasonic():
     return jsonify(_robot().ultrasonic.read().to_dict())
+
+
+# ----- Map + Navigation -----
+
+
+@bp.get("/map/meta")
+def map_meta():
+    info = _robot().navigation.map_info()
+    if not info:
+        return jsonify({"error": "map not found (PINKY_MAP / map_test1.yaml)"}), 404
+    return jsonify(info)
+
+
+@bp.get("/map/image")
+def map_image():
+    try:
+        png = _robot().navigation.map_png()
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+    return Response(png, mimetype="image/png")
+
+
+@bp.get("/nav/state")
+def nav_state():
+    return jsonify(_robot().navigation.state())
+
+
+@bp.post("/nav/initialpose")
+def nav_initialpose():
+    body = request.get_json(silent=True) or {}
+    try:
+        x = float(body["x"])
+        y = float(body["y"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"success": False, "message": "x,y required"}), 400
+    yaw = float(body.get("yaw", 0.0))
+    result = _robot().navigation.set_initial_pose(x, y, yaw)
+    status = 200 if result.get("success") else 502
+    return jsonify(result), status
+
+
+@bp.post("/nav/goal")
+def nav_goal():
+    body = request.get_json(silent=True) or {}
+    try:
+        x = float(body["x"])
+        y = float(body["y"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"success": False, "message": "x,y required"}), 400
+    yaw = float(body.get("yaw", 0.0))
+    result = _robot().navigation.go_to(x, y, yaw)
+    status = 200 if result.get("success") else 502
+    return jsonify(result), status
+
+
+@bp.post("/nav/goal_wait")
+def nav_goal_wait():
+    """Send NavigateToPose and block until arrived / failed / timeout."""
+    body = request.get_json(silent=True) or {}
+    try:
+        x = float(body["x"])
+        y = float(body["y"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"success": False, "message": "x,y required"}), 400
+    yaw = float(body.get("yaw", 0.0))
+    timeout = float(body.get("timeoutSec", body.get("timeout_sec", 180.0)))
+    result = _robot().navigation.go_to_wait(x, y, yaw, timeout)
+    status = 200 if result.get("success") else 502
+    return jsonify(result), status
+
+
+@bp.post("/nav/stop")
+def nav_stop():
+    result = _robot().navigation.cancel()
+    status = 200 if result.get("success") else 502
+    return jsonify(result), status
 
 
 @bp.post("/actuators/led")

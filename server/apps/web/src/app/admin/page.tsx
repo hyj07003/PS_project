@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { LidarMap } from "@/components/LidarMap";
+import { OccupancyNavMap } from "@/components/OccupancyNavMap";
 
 type RobotHealth = {
   ok?: boolean;
@@ -58,6 +58,8 @@ type Snapshot = {
   lidar?: Lidar;
   imu?: Imu;
   ultrasonic?: Ultrasonic;
+  pose?: { x: number; y: number; yaw: number } | null;
+  navigating?: boolean;
   hasData?: {
     battery?: boolean;
     lidar?: boolean;
@@ -67,11 +69,36 @@ type Snapshot = {
   warnings?: string[];
 };
 
+type NavState = {
+  pose?: { x: number; y: number; yaw: number } | null;
+  navigating?: boolean;
+  mapId?: string | null;
+};
+
 type Device = {
   id: number;
   code: string;
   type: string;
   status: string;
+};
+
+type OrderAssignment = {
+  id: number;
+  orderId: number;
+  deviceCode?: string | null;
+  status: string;
+  currentWaypoint?: string | null;
+  currentWaypointLabel?: string | null;
+  order?: {
+    id: number;
+    status: string;
+    totalPrice: number;
+    items: {
+      productName: string;
+      unitPrice: number;
+      quantity: number;
+    }[];
+  } | null;
 };
 
 type RobotMonitor = {
@@ -81,17 +108,35 @@ type RobotMonitor = {
   online: boolean;
   health: RobotHealth | null;
   sensors: Snapshot | null;
+  nav?: NavState | null;
+  assignment?: OrderAssignment | null;
   error: string | null;
 };
 
 type RobotsResponse = {
   robots: RobotMonitor[];
   count: number;
+  queueLength?: number;
 };
 
 function fmt(n: number | null | undefined, digits = 2): string {
   if (n == null || Number.isNaN(n)) return "—";
   return n.toFixed(digits);
+}
+
+const MISSION_STATUS_LABEL: Record<string, string> = {
+  CREATED: "대기열",
+  ASSIGNED: "할당됨",
+  PICKING: "피킹 중",
+  CHECKOUT: "계산대",
+  PACKING: "운송대기",
+  RETURNING: "대기장소 복귀 중",
+  COMPLETED: "완료 (대기장소 도착)",
+  FAILED: "실패",
+};
+
+function missionStatusLabel(status: string): string {
+  return MISSION_STATUS_LABEL[status] || status;
 }
 
 function RobotBlock({ robot }: { robot: RobotMonitor }) {
@@ -186,6 +231,59 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
       ) : null}
 
       <div className="monitor-grid">
+        <div className="monitor-card monitor-card-wide">
+          <h3>할당 주문</h3>
+          {robot.assignment?.order ? (
+            <>
+              <dl className="monitor-dl">
+                <div>
+                  <dt>주문</dt>
+                  <dd>#{robot.assignment.order.id}</dd>
+                </div>
+                <div>
+                  <dt>상태</dt>
+                  <dd>{missionStatusLabel(robot.assignment.status)}</dd>
+                </div>
+                <div>
+                  <dt>경유지</dt>
+                  <dd>
+                    {robot.assignment.currentWaypoint
+                      ? `${robot.assignment.currentWaypoint}${
+                          robot.assignment.currentWaypointLabel
+                            ? ` · ${robot.assignment.currentWaypointLabel}`
+                            : ""
+                        }`
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>합계</dt>
+                  <dd>
+                    {robot.assignment.order.totalPrice.toLocaleString("ko-KR")}원
+                  </dd>
+                </div>
+              </dl>
+              <ul
+                style={{
+                  margin: "0.5rem 0 0",
+                  paddingLeft: "1.2rem",
+                  fontSize: "0.9rem",
+                }}
+              >
+                {robot.assignment.order.items.map((it, idx) => (
+                  <li key={`${it.productName}-${idx}`}>
+                    {it.productName} × {it.quantity}
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p className="muted" style={{ margin: 0 }}>
+              대기 중 (idle) — 할당된 주문이 없습니다.
+            </p>
+          )}
+        </div>
+
         <div className="monitor-card">
           <h3>연결</h3>
           <dl className="monitor-dl">
@@ -236,7 +334,13 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
             </div>
             <div>
               <dt>소스</dt>
-              <dd>{snap?.battery?.source || "—"}</dd>
+              <dd>
+                {snap?.battery?.source || "—"}
+                {(snap?.battery?.source === "mock" ||
+                  (health?.backend || snap?.backend) === "mock") && (
+                  <span className="error"> (더미)</span>
+                )}
+              </dd>
             </div>
           </dl>
           <div className="battery-bar">
@@ -299,39 +403,48 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
         </div>
 
         <div className="monitor-card monitor-card-wide">
-          <h3>라이다 맵</h3>
+          <h3>맵 · 네비게이션</h3>
+          <p className="muted" style={{ marginTop: 0, fontSize: "0.85rem" }}>
+            좌드래그: 현재 pose · 우드래그: 목표 위치+최종 yaw (Nav2 goal)
+          </p>
           <dl className="monitor-dl">
             <div>
-              <dt>포인트</dt>
+              <dt>라이다</dt>
               <dd>
-                {snap?.lidar?.points?.length ?? 0} /{" "}
-                {snap?.lidar?.rangesCount ?? "—"}
+                {snap?.lidar?.points?.length ?? 0} pts
+                {robot.nav?.mapId ? ` · map ${robot.nav.mapId}` : ""}
               </dd>
             </div>
             <div>
-              <dt>거리 범위</dt>
+              <dt>주행</dt>
               <dd>
-                {fmt(snap?.lidar?.rangeMin ?? snap?.lidar?.range_min, 2)} –{" "}
-                {fmt(snap?.lidar?.rangeMax ?? snap?.lidar?.range_max, 2)} m
+                {robot.nav?.navigating || snap?.navigating
+                  ? "navigating"
+                  : "idle"}
               </dd>
             </div>
             <div>
-              <dt>Frame</dt>
+              <dt>현재 좌표</dt>
               <dd>
-                {snap?.lidar?.frameId || snap?.lidar?.frame_id || "—"}
+                {(() => {
+                  const p = robot.nav?.pose || snap?.pose;
+                  return p
+                    ? `x=${p.x.toFixed(3)}, y=${p.y.toFixed(3)}, yaw=${p.yaw.toFixed(3)}`
+                    : "—";
+                })()}
               </dd>
             </div>
           </dl>
-          {snap?.lidar?.points?.length ? (
-            <LidarMap
-              points={snap.lidar.points}
-              rangeMax={snap.lidar.rangeMax ?? snap.lidar.range_max ?? 8}
-            />
-          ) : (
-            <p className="muted">
-              라이다 포인트 없음 — `/dev/ttyAMA0` RPLidar 또는 sllidar를 확인하세요.
-            </p>
-          )}
+          <OccupancyNavMap
+            robotId={robot.id}
+            lidarPoints={snap?.lidar?.points || []}
+            pose={
+              robot.nav?.pose ||
+              snap?.pose ||
+              null
+            }
+            navigating={Boolean(robot.nav?.navigating || snap?.navigating)}
+          />
         </div>
       </div>
     </section>
@@ -341,6 +454,7 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
 export default function AdminRobotPage() {
   const [robots, setRobots] = useState<RobotMonitor[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
+  const [queueLength, setQueueLength] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
   const [auto, setAuto] = useState(true);
@@ -352,6 +466,7 @@ export default function AdminRobotPage() {
         api<Device[]>("/admin/robot/devices").catch(() => [] as Device[]),
       ]);
       setRobots(res.robots || []);
+      setQueueLength(res.queueLength ?? 0);
       setDevices(d);
       setError(null);
       setUpdatedAt(new Date().toLocaleTimeString("ko-KR"));
@@ -382,8 +497,9 @@ export default function AdminRobotPage() {
             로봇 모니터링
           </h1>
           <p className="muted">
-            주행로봇별 영역 — 연결 · 배터리 · 초음파 · IMU · 라이다맵
+            주행로봇별 영역 — 연결 · 할당 주문 · 배터리 · Occupancy 맵/네비
             {robots.length ? ` (${robots.length}대)` : ""}
+            {queueLength > 0 ? ` · 대기 큐 ${queueLength}건` : ""}
           </p>
         </div>
         <div className="admin-panel-actions">

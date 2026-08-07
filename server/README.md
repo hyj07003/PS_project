@@ -327,7 +327,7 @@ erDiagram
 ### 관리자 (`/admin` · 매장 관리)
 
 - 상단 **매장 관리** → `/admin` (우측 사이드바로 하위 메뉴 이동)
-- **로봇 모니터링** (`/admin`): 주행로봇별 패널(연결·배터리·초음파·IMU·라이다맵)을 세로로 표시. BFF `PINKY_ROBOTS` 또는 `PINKY_URL`(+`PINKY_URL_2`)
+- **로봇 모니터링** (`/admin`): 주행로봇별 패널(할당 주문·경유지·연결·배터리·초음파·IMU·Occupancy 맵). BFF `PINKY_ROBOTS` 또는 `PINKY_URL`(+`PINKY_URL_2`). 대기 큐 길이 표시.
 - **상품 관리** (`/admin/products`): 상품 CRUD, 이미지 업로드, 히어로 노출
 - 저장 즉시 고객 홈 히어로·그리드·검색에 반영
 
@@ -336,9 +336,10 @@ erDiagram
 ### 관제 (Controller, Flask)
 
 - NestJS 관제를 **Flask**로 교체 (HTTP·JSON·SQLite 계약은 BFF와 동일하게 유지)
-- 주문 생성 시 미션 생성 + Mock 백그라운드 스레드로 상태 자동 진행  
-`CREATED → ASSIGNED → PICKING → CHECKOUT → PACKING → COMPLETED`
-- Mock: `app/adapters.py` (`MockCartAdapter` / `MockStationAdapter` / `MockAiAdapter`)
+- 주문 생성 시 미션을 **FIFO 큐(`CREATED`)** 에 넣고, **idle 카트**에만 할당
+- 할당 후 맵 웨이포인트 피킹 순회: 매대(W*) 가까운 순 → 계산대(C) → 운송대기(P) → 홈(S1/S2), 각 지점 **dwell 3초** (`PICK_DWELL_SEC`)
+- Pinky: `POST /nav/goal_wait` (Nav2 도착 대기). URL은 `PINKY_ROBOTS` / `PINKY_URL`+`PINKY_URL_2`
+- 데모 상품: 케이크·롤케이크·샌드위치·아이스크림·우유·콜라 (`slug` → W1–W6)
 - 의존성: `apps/controller-server/requirements.txt` + `.venv`
 
 ---
@@ -508,9 +509,11 @@ pnpm dev:web          # Next.js :3000
 | `CONTROLLER_URL`       | BFF → 관제 (`http://127.0.0.1:4100`)                      |
 | `CONTROLLER_HOST`      | 관제 bind (기본 `0.0.0.0`, 로봇 Wi‑Fi 접속용)                 |
 | `CONTROLLER_PORT`      | 관제 포트 (기본 `4100`)                                       |
-| `PINKY_URL`            | BFF → 1번 Pinky (`http://127.0.0.1:4200`)                  |
-| `PINKY_URL_2`          | (선택) 2번 Pinky URL                                       |
-| `PINKY_ROBOTS`         | (선택) `cart-1=url1,cart-2=url2` — 다대 등록 시 우선       |
+| `PINKY_URL`            | BFF/Controller → 1번 Pinky (`cart-1`)                         |
+| `PINKY_URL_2`          | (선택) 2번 Pinky (`cart-2`)                                    |
+| `PINKY_ROBOTS`         | (선택) `cart-1=url1,cart-2=url2` — 다대 등록 시 우선              |
+| `PICK_DWELL_SEC`       | 매대/계산대/운송대기 도착 후 대기 초 (기본 `3`)                      |
+| `PICK_NAV_TIMEOUT_SEC` | Nav2 goal_wait 타임아웃 초 (기본 `180`)                          |
 | `DATABASE_PATH`        | SQLite 경로 (Controller cwd 기준, 기본 `./data/smartshop.db`) |
 | `JWT_SECRET`           | JWT 서명 키                                                |
 | `UPLOAD_DIR`           | 업로드 디렉터리                                                |
@@ -609,22 +612,31 @@ DB 파일이 이미 있으면 시드는 다시 넣지 않습니다. 초기화하
 
 ```mermaid
 stateDiagram-v2
-  [*] --> CREATED: POST /orders
-  CREATED --> ASSIGNED: Mock cart assign
-  ASSIGNED --> PICKING: Mock pick
-  PICKING --> CHECKOUT: Mock checkout
-  CHECKOUT --> PACKING: Mock pack
-  PACKING --> COMPLETED
+  [*] --> CREATED: POST /orders queue
+  CREATED --> ASSIGNED: idle cart dispatch
+  ASSIGNED --> PICKING: NN visit shelves W
+  PICKING --> CHECKOUT: waypoint C
+  CHECKOUT --> PACKING: waypoint P
+  PACKING --> RETURNING: go home S1/S2
+  RETURNING --> COMPLETED: arrived wait spot
   CREATED --> FAILED: error
-  ASSIGNED --> FAILED: error
-  PICKING --> FAILED: error
+  ASSIGNED --> FAILED: nav error
+  PICKING --> FAILED: nav error
+  RETURNING --> FAILED: after home attempt
   COMPLETED --> [*]
   FAILED --> [*]
 ```
 
+- 대기 큐: `missions.status=CREATED` and `device_id IS NULL` (FIFO)
+- idle `cart-*`만 할당. 두 대 busy면 큐에 대기
+- 웨이포인트: `app/waypoints.py` (S1/S2 홈, W1–W6 매대, C 계산대, P 운송대기)
+- 각 경유지 dwell 기본 3초 (`PICK_DWELL_SEC`)
+- 작업 종료 시점: **대기장소(S1/S2) 도착 완료** 후 `COMPLETED` (모니터링 할당 해제). 복귀 중은 `RETURNING`
+- 중도 실패 시에도 대기장소 복귀 시도 후 `FAILED`
+- 각 전이는 `mission_events`에 기록. 모니터링은 `current_waypoint` 표시
 
-
-각 전이는 `mission_events`에 기록됩니다.
+DB에 이미 시드가 있어도 기동 시 데모 상품 6종을 upsert하고 기타 SKU는 `is_active=0`으로 숨깁니다.
+완전 초기화는 SQLite 파일 삭제 후 Controller 재시작.
 
 ---
 

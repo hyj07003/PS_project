@@ -9,6 +9,7 @@ from .imu import ImuModule
 from .lcd import LcdModule
 from .led import LedModule
 from .lidar import LidarModule
+from .navigation import NavigationModule
 from .types import RobotSnapshot
 from .ultrasonic import UltrasonicModule
 
@@ -32,6 +33,7 @@ class PinkyRobot:
         self.ultrasonic = UltrasonicModule(self._backend)
         self.led = LedModule(self._backend)
         self.lcd = LcdModule(self._backend)
+        self.navigation = NavigationModule(self._backend)
 
     @property
     def backend_name(self) -> str:
@@ -52,6 +54,8 @@ class PinkyRobot:
             ultrasonic=self.ultrasonic.read(),
             backend=self.backend_name,
             online=self._backend.is_online(),
+            pose=self.navigation.get_pose(),
+            navigating=self.navigation.is_navigating(),
         )
 
     def drive(self, linear_x: float, angular_z: float) -> dict[str, Any]:

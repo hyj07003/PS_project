@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import time
-from typing import Literal
+import urllib.error
+import urllib.request
+from typing import Any, Literal
 
 ORDER_FLOW = [
     "CREATED",
@@ -9,87 +13,356 @@ ORDER_FLOW = [
     "PICKING",
     "CHECKOUT",
     "PACKING",
+    "RETURNING",
     "COMPLETED",
 ]
 
 
+def parse_pinky_robot_urls() -> dict[str, str]:
+    """
+    cart-1 / cart-2 → base URL.
+    Prefers PINKY_ROBOTS=cart-1=url,cart-2=url then PINKY_URL / PINKY_URL_2.
+    """
+    raw = (os.environ.get("PINKY_ROBOTS") or "").strip()
+    out: dict[str, str] = {}
+    if raw:
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            eq = part.index("=") if "=" in part else -1
+            if eq > 0:
+                code = part[:eq].strip()
+                url = part[eq + 1 :].strip().rstrip("/")
+                if code and url:
+                    out[code] = url
+        if out:
+            return out
+
+    single = (os.environ.get("PINKY_URL") or "").strip().rstrip("/")
+    second = (os.environ.get("PINKY_URL_2") or "").strip().rstrip("/")
+    if single:
+        out["cart-1"] = single
+    if second:
+        out["cart-2"] = second
+    elif single and "cart-2" not in out:
+        # single-robot demo: both codes hit same pinky
+        out.setdefault("cart-1", single)
+    return out
+
+
 class MockCartAdapter:
-    def __init__(self) -> None:
-        self._next = 0
+    """Local demo without Pinky HTTP — simulate travel delay."""
 
-    def assign_cart(self, order_id: int = 0) -> dict[str, str] | None:
-        time.sleep(0.2)
-        self._next = (self._next % 2) + 1
-        return {"deviceCode": f"cart-{self._next}"}
+    def notify_assign(self, device_code: str, order_id: int = 0) -> dict[str, Any]:
+        time.sleep(0.1)
+        return {"ok": True, "deviceCode": device_code, "orderId": order_id}
 
-    def navigate(
-        self, device_code: str = "", waypoint: str = ""
+    def set_initial_pose(
+        self, device_code: str, x: float, y: float, yaw: float = 0.0
+    ) -> dict[str, Any]:
+        del device_code
+        return {
+            "success": True,
+            "message": "mock initialpose",
+            "pose": {"x": x, "y": y, "yaw": yaw},
+        }
+
+    def navigate_pose(
+        self,
+        device_code: str,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 120.0,
     ) -> Literal["ARRIVED", "FAILED"]:
-        time.sleep(0.8)
+        del device_code, x, y, yaw, timeout_sec
+        time.sleep(0.5)
         return "ARRIVED"
+
+    def get_pose(self, device_code: str) -> dict[str, float] | None:
+        del device_code
+        return None
+
+    def is_reachable(self, device_code: str) -> bool:
+        del device_code
+        return True
+
+    def stop_nav(self, device_code: str) -> dict[str, Any]:
+        del device_code
+        return {"success": True, "message": "mock stop"}
 
 
 class MockStationAdapter:
     def start_picking(self, order_id: int = 0) -> Literal["DONE", "FAILED"]:
-        time.sleep(0.6)
+        del order_id
         return "DONE"
 
     def checkout(self, order_id: int = 0) -> Literal["DONE", "FAILED"]:
-        time.sleep(0.4)
+        del order_id
         return "DONE"
 
     def pack(self, order_id: int = 0) -> Literal["DONE", "FAILED"]:
-        time.sleep(0.5)
+        del order_id
         return "DONE"
 
 
 class MockAiAdapter:
     def request_pick_plan(self, order_id: int = 0) -> dict[str, list[str]]:
-        time.sleep(0.15)
-        return {"waypoints": ["aisle-a", "aisle-b", "checkout"]}
+        del order_id
+        return {"waypoints": []}
 
 
 class PinkyHttpCartAdapter:
-    """PINKY_URL 이 설정된 경우 실제 pinky Flask 서버로 assign/navigate."""
+    """Per-robot Pinky Flask: assign + Nav2 goal_wait (or goal+poll fallback)."""
 
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
-        self._next = 0
+    def __init__(self, urls: dict[str, str] | None = None):
+        self.urls = urls if urls is not None else parse_pinky_robot_urls()
+        self.last_nav_error: str | None = None
+        # Older pinky builds lack /nav/goal_wait — fall back once discovered.
+        self._goal_wait_supported: dict[str, bool] = {}
 
-    def _post(self, path: str, body: dict) -> dict:
-        import json
-        import urllib.request
+    def _base(self, device_code: str) -> str | None:
+        # Do not silently send cart-2 goals to cart-1's URL.
+        if device_code in self.urls:
+            return self.urls[device_code]
+        if len(self.urls) == 1:
+            return next(iter(self.urls.values()))
+        return None
 
+    def _read_json_response(self, res: Any) -> dict:
+        return json.loads(res.read().decode("utf-8"))
+
+    def _post(
+        self,
+        device_code: str,
+        path: str,
+        body: dict,
+        timeout: float = 10.0,
+        *,
+        accept_http_error: bool = False,
+    ) -> dict:
+        base = self._base(device_code)
+        if not base:
+            raise RuntimeError(f"no pinky URL for {device_code}")
         req = urllib.request.Request(
-            f"{self.base_url}{path}",
+            f"{base}{path}",
             data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as res:
-            return json.loads(res.read().decode("utf-8"))
-
-    def assign_cart(self, order_id: int = 0) -> dict[str, str] | None:
-        self._next = (self._next % 2) + 1
-        code = f"cart-{self._next}"
         try:
-            self._post(
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                return self._read_json_response(res)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            if accept_http_error:
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    payload = {"success": False, "message": raw[:200] or str(exc)}
+                if isinstance(payload, dict):
+                    payload.setdefault("httpStatus", exc.code)
+                    return payload
+            raise
+
+    def _get(self, device_code: str, path: str, timeout: float = 5.0) -> dict:
+        base = self._base(device_code)
+        if not base:
+            raise RuntimeError(f"no pinky URL for {device_code}")
+        req = urllib.request.Request(f"{base}{path}", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            return self._read_json_response(res)
+
+    def notify_assign(self, device_code: str, order_id: int = 0) -> dict[str, Any]:
+        try:
+            return self._post(
+                device_code,
                 "/cmd/assign",
-                {"orderId": order_id, "deviceCode": code},
+                {"orderId": order_id, "deviceCode": device_code},
             )
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def set_initial_pose(
+        self, device_code: str, x: float, y: float, yaw: float = 0.0
+    ) -> dict[str, Any]:
+        try:
+            return self._post(
+                device_code,
+                "/nav/initialpose",
+                {"x": x, "y": y, "yaw": yaw},
+                timeout=5.0,
+            )
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}
+
+    def navigate_pose(
+        self,
+        device_code: str,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 180.0,
+    ) -> Literal["ARRIVED", "FAILED"]:
+        self.last_nav_error = None
+        use_wait = self._goal_wait_supported.get(device_code, True)
+        if use_wait:
+            try:
+                result = self._post(
+                    device_code,
+                    "/nav/goal_wait",
+                    {"x": x, "y": y, "yaw": yaw, "timeoutSec": timeout_sec},
+                    timeout=timeout_sec + 15.0,
+                    accept_http_error=True,
+                )
+                http_status = int(result.get("httpStatus") or 200)
+                if http_status == 404:
+                    self._goal_wait_supported[device_code] = False
+                    return self._navigate_goal_poll(
+                        device_code, x, y, yaw, timeout_sec
+                    )
+                if result.get("success") or result.get("status") == "SUCCEEDED":
+                    return "ARRIVED"
+                self.last_nav_error = str(
+                    result.get("message") or result.get("status") or "goal_wait failed"
+                )
+                return "FAILED"
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    self._goal_wait_supported[device_code] = False
+                    return self._navigate_goal_poll(
+                        device_code, x, y, yaw, timeout_sec
+                    )
+                self.last_nav_error = f"HTTP {exc.code}"
+                return "FAILED"
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                self.last_nav_error = str(exc)
+                return "FAILED"
+        return self._navigate_goal_poll(device_code, x, y, yaw, timeout_sec)
+
+    def _navigate_goal_poll(
+        self,
+        device_code: str,
+        x: float,
+        y: float,
+        yaw: float,
+        timeout_sec: float,
+        arrive_radius_m: float = 0.05, # 0.55
+    ) -> Literal["ARRIVED", "FAILED"]:
+        """Compat path for pinky without /nav/goal_wait: POST /nav/goal + poll state.
+
+        Nav2 often flickers navigating false during replan/recovery. Require a short
+        stable idle window before treating that as a hard failure.
+        """
+        try:
+            sent = self._post(
+                device_code,
+                "/nav/goal",
+                {"x": x, "y": y, "yaw": yaw},
+                timeout=10.0,
+                accept_http_error=True,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            self.last_nav_error = f"goal send: {exc}"
+            return "FAILED"
+        if not sent.get("success"):
+            self.last_nav_error = str(sent.get("message") or "goal not accepted")
+            return "FAILED"
+
+        deadline = time.time() + max(1.0, float(timeout_sec))
+        saw_navigating = False
+        idle_since: float | None = None
+        # status topic can drop EXECUTING briefly; wait before declaring abort
+        idle_fail_sec = float(os.environ.get("PICK_NAV_IDLE_FAIL_SEC", "2.5"))
+        near_ok_m = arrive_radius_m * 1.35
+
+        while time.time() < deadline:
+            try:
+                state = self._get(device_code, "/nav/state", timeout=3.0)
+            except Exception:
+                time.sleep(0.4)
+                continue
+            navigating = bool(state.get("navigating"))
+            pose = state.get("pose") if isinstance(state.get("pose"), dict) else None
+            dist = None
+            if pose and pose.get("x") is not None and pose.get("y") is not None:
+                dx = float(pose["x"]) - float(x)
+                dy = float(pose["y"]) - float(y)
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist <= arrive_radius_m and not navigating:
+                    return "ARRIVED"
+
+            if navigating:
+                saw_navigating = True
+                idle_since = None
+            elif saw_navigating:
+                if idle_since is None:
+                    idle_since = time.time()
+                idle_for = time.time() - idle_since
+                if dist is not None and dist <= near_ok_m:
+                    return "ARRIVED"
+                if idle_for >= idle_fail_sec:
+                    self.last_nav_error = (
+                        f"nav ended far from goal (dist={dist:.2f}m)"
+                        if dist is not None
+                        else "nav ended without pose"
+                    )
+                    return "FAILED"
+            time.sleep(0.35)
+
+        # Timeout: accept near-miss rather than hard-fail a completed approach
+        try:
+            state = self._get(device_code, "/nav/state", timeout=3.0)
+            pose = state.get("pose") if isinstance(state.get("pose"), dict) else None
+            if pose and pose.get("x") is not None and pose.get("y") is not None:
+                dx = float(pose["x"]) - float(x)
+                dy = float(pose["y"]) - float(y)
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist <= near_ok_m:
+                    return "ARRIVED"
+                self.last_nav_error = f"nav poll timeout (dist={dist:.2f}m)"
+            else:
+                self.last_nav_error = "nav poll timeout"
+        except Exception:
+            self.last_nav_error = "nav poll timeout"
+        return "FAILED"
+
+    def get_pose(self, device_code: str) -> dict[str, float] | None:
+        try:
+            state = self._get(device_code, "/nav/state")
+            pose = state.get("pose")
+            if (
+                isinstance(pose, dict)
+                and pose.get("x") is not None
+                and pose.get("y") is not None
+            ):
+                return {
+                    "x": float(pose["x"]),
+                    "y": float(pose["y"]),
+                    "yaw": float(pose.get("yaw") or 0.0),
+                }
         except Exception:
             pass
-        return {"deviceCode": code}
+        return None
 
-    def navigate(
-        self, device_code: str = "", waypoint: str = ""
-    ) -> Literal["ARRIVED", "FAILED"]:
+    def is_reachable(self, device_code: str) -> bool:
+        if self._base(device_code) is None:
+            return False
         try:
-            result = self._post(
-                "/cmd/navigate",
-                {"deviceCode": device_code, "waypoint": waypoint},
-            )
-            status = result.get("status", "ARRIVED")
-            return "ARRIVED" if status == "ARRIVED" else "FAILED"
+            self._get(device_code, "/health", timeout=2.0)
+            return True
         except Exception:
-            return "FAILED"
+            return False
+
+    def stop_nav(self, device_code: str) -> dict[str, Any]:
+        try:
+            return self._post(
+                device_code,
+                "/nav/stop",
+                {},
+                timeout=5.0,
+                accept_http_error=True,
+            )
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}

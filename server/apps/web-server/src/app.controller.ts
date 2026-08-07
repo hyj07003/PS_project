@@ -10,12 +10,14 @@ import {
   Post,
   Put,
   Query,
+  Res,
   UploadedFile,
   UseGuards,
   UseInterceptors,
 } from "@nestjs/common";
 import { FileInterceptor } from "@nestjs/platform-express";
 import { JwtService } from "@nestjs/jwt";
+import type { Response } from "express";
 import type {
   AuthLoginInput,
   AuthRegisterInput,
@@ -32,6 +34,7 @@ import { AdminGuard, AuthGuard, CurrentUser, type AuthPayload } from "./auth";
 import { controllerJson } from "./controller-client";
 import {
   listPinkyRobots,
+  pinkyBinary,
   pinkyJson,
   resolvePinkyUrl,
 } from "./pinky-client";
@@ -317,12 +320,34 @@ export class AppController {
   @UseGuards(AdminGuard)
   async robotsMonitor() {
     const targets = listPinkyRobots();
+    let queueLength = 0;
+    try {
+      const q = await controllerJson<{ queueLength?: number }>(
+        "/missions/queue",
+      );
+      queueLength = q.queueLength ?? 0;
+    } catch {
+      queueLength = 0;
+    }
+
     const robots = await Promise.all(
       targets.map(async (t) => {
+        let assignment: unknown = null;
         try {
-          const [health, sensors] = await Promise.all([
+          const missions = await controllerJson<unknown[]>(
+            `/missions?deviceCode=${encodeURIComponent(t.id)}&active=1&includeOrder=1`,
+          );
+          assignment =
+            Array.isArray(missions) && missions.length > 0 ? missions[0] : null;
+        } catch {
+          assignment = null;
+        }
+
+        try {
+          const [health, sensors, nav] = await Promise.all([
             pinkyJson("/health", undefined, t.url),
             pinkyJson("/sensors", undefined, t.url),
+            pinkyJson("/nav/state", undefined, t.url).catch(() => null),
           ]);
           return {
             id: t.id,
@@ -331,6 +356,8 @@ export class AppController {
             online: true,
             health,
             sensors,
+            nav,
+            assignment,
             error: null as string | null,
           };
         } catch (err) {
@@ -342,12 +369,119 @@ export class AppController {
             online: false,
             health: null,
             sensors: null,
+            nav: null,
+            assignment,
             error: e.message || "unreachable",
           };
         }
       }),
     );
-    return { robots, count: robots.length };
+    return { robots, count: robots.length, queueLength };
+  }
+
+  @Get("admin/robot/missions")
+  @UseGuards(AdminGuard)
+  async robotMissions(
+    @Query("robot") robot?: string,
+    @Query("active") active?: string,
+  ) {
+    try {
+      const qs = new URLSearchParams();
+      if (robot) qs.set("deviceCode", robot);
+      if (active) qs.set("active", active);
+      qs.set("includeOrder", "1");
+      const q = qs.toString();
+      return await controllerJson(`/missions${q ? `?${q}` : ""}`);
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Get("admin/robot/map/meta")
+  @UseGuards(AdminGuard)
+  async robotMapMeta(@Query("robot") robot?: string) {
+    try {
+      return await pinkyJson("/map/meta", undefined, resolvePinkyUrl(robot));
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Get("admin/robot/map/image")
+  @UseGuards(AdminGuard)
+  async robotMapImage(
+    @Query("robot") robot: string | undefined,
+    @Res() res: Response,
+  ) {
+    try {
+      const { buffer, contentType } = await pinkyBinary(
+        "/map/image",
+        resolvePinkyUrl(robot),
+      );
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "public, max-age=60");
+      res.send(buffer);
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Get("admin/robot/nav/state")
+  @UseGuards(AdminGuard)
+  async robotNavState(@Query("robot") robot?: string) {
+    try {
+      return await pinkyJson("/nav/state", undefined, resolvePinkyUrl(robot));
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Post("admin/robot/nav/initialpose")
+  @UseGuards(AdminGuard)
+  async robotNavInitialPose(
+    @Body() body: Record<string, unknown>,
+    @Query("robot") robot?: string,
+  ) {
+    try {
+      return await pinkyJson(
+        "/nav/initialpose",
+        { method: "POST", body: JSON.stringify(body) },
+        resolvePinkyUrl(robot),
+      );
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Post("admin/robot/nav/goal")
+  @UseGuards(AdminGuard)
+  async robotNavGoal(
+    @Body() body: Record<string, unknown>,
+    @Query("robot") robot?: string,
+  ) {
+    try {
+      return await pinkyJson(
+        "/nav/goal",
+        { method: "POST", body: JSON.stringify(body) },
+        resolvePinkyUrl(robot),
+      );
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Post("admin/robot/nav/stop")
+  @UseGuards(AdminGuard)
+  async robotNavStop(@Query("robot") robot?: string) {
+    try {
+      return await pinkyJson(
+        "/nav/stop",
+        { method: "POST", body: "{}" },
+        resolvePinkyUrl(robot),
+      );
+    } catch (err) {
+      wrapError(err);
+    }
   }
 
   @Get("admin/robot/health")

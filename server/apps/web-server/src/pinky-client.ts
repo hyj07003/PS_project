@@ -105,3 +105,24 @@ export async function pinkyJson<T>(
   }
   return data as T;
 }
+
+/** Binary proxy (e.g. map PNG). Does not force JSON Content-Type. */
+export async function pinkyBinary(
+  pathname: string,
+  baseUrl?: string,
+): Promise<{ buffer: Buffer; contentType: string }> {
+  const url = `${(baseUrl || pinkyUrl()).replace(/\/$/, "")}${pathname}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const err = new Error(
+      `pinky binary ${pathname} → ${res.status}`,
+    ) as Error & { status: number };
+    err.status = res.status;
+    throw err;
+  }
+  const ab = await res.arrayBuffer();
+  return {
+    buffer: Buffer.from(ab),
+    contentType: res.headers.get("content-type") || "application/octet-stream",
+  };
+}

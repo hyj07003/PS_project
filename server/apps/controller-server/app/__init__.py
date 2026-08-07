@@ -28,7 +28,8 @@ def create_app() -> Flask:
     users = UsersService(conn)
     carts = CartsService(conn, products)
     orders = OrdersService(conn, carts)
-    robot = RobotService(conn)
+    robot = RobotService(conn, orders)
+    robot.set_orders_service(orders)
 
     app.extensions["db"] = conn
     app.extensions["services"] = {
@@ -38,6 +39,13 @@ def create_app() -> Flask:
         "orders": orders,
         "robot": robot,
     }
+
+    # Resume queue after restart
+    try:
+        orders.reclaim_stale_carts()
+        orders.try_dispatch()
+    except Exception:
+        pass
 
     @app.errorhandler(ApiError)
     def handle_api_error(err: ApiError):

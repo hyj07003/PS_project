@@ -6,17 +6,18 @@ from typing import Any
 
 from .hardware import HardwareSensors
 from .lidar import LidarReader
+from .pro_launch import defer_battery_to_pro, defer_lidar_to_pro
 
 
 class SensorPublisherController:
     """
     pinky_pro 호환 센서 토픽을 발행하는 ROS2 컨트롤러.
 
-    Publishes:
-      battery/percent, battery/voltage
-      imu_raw
-      us_sensor/range, ir_sensor/range
-      scan (LaserScan)  ← RPLidar /dev/ttyAMA0
+    Publishes (기본):
+      imu_raw, us_sensor/range, ir_sensor/range
+    Optional (pinky_pro 와 겹치면 끔):
+      battery/*  — PINKY_DEFER_BATTERY / auto_launch 시 pinky_pro battery_publisher
+      scan       — PINKY_DEFER_LIDAR / auto_launch 시 pinky_pro sllidar
     """
 
     def __init__(self) -> None:
@@ -29,10 +30,19 @@ class SensorPublisherController:
             "true",
             "True",
         )
+        self._defer_lidar = defer_lidar_to_pro()
+        self._defer_battery = defer_battery_to_pro()
 
     @property
     def hardware_status(self) -> list[str]:
-        return self._hw.status + self._lidar.status
+        status = list(self._hw.status)
+        if self._defer_lidar:
+            status.append("lidar: deferred to pinky_pro sllidar")
+        else:
+            status.extend(self._lidar.status)
+        if self._defer_battery:
+            status.append("battery: deferred to pinky_pro battery_publisher")
+        return status
 
     @property
     def lidar(self) -> LidarReader:
@@ -51,25 +61,42 @@ class SensorPublisherController:
         class _PublisherNode(Node):
             pass
 
-        self._lidar.start()
+        if not self._defer_lidar:
+            self._lidar.start()
 
         self._node = _PublisherNode("pinky_sensor_publisher")
-        self._batt_pct_pub = self._node.create_publisher(Float32, "battery/percent", 10)
-        self._batt_v_pub = self._node.create_publisher(Float32, "battery/voltage", 10)
+        self._batt_pct_pub = None
+        self._batt_v_pub = None
+        self._scan_pub = None
+
+        if not self._defer_battery:
+            self._batt_pct_pub = self._node.create_publisher(
+                Float32, "battery/percent", 10
+            )
+            self._batt_v_pub = self._node.create_publisher(
+                Float32, "battery/voltage", 10
+            )
+
         self._imu_pub = self._node.create_publisher(Imu, "imu_raw", 10)
         self._us_pub = self._node.create_publisher(Range, "us_sensor/range", 10)
-        self._ir_pub = self._node.create_publisher(UInt16MultiArray, "ir_sensor/range", 10)
-        self._scan_pub = self._node.create_publisher(LaserScan, "scan", 10)
+        self._ir_pub = self._node.create_publisher(
+            UInt16MultiArray, "ir_sensor/range", 10
+        )
+
+        if not self._defer_lidar:
+            self._scan_pub = self._node.create_publisher(LaserScan, "scan", 10)
 
         batt_hz = float(os.environ.get("PINKY_BATT_HZ", "0.5"))
         imu_hz = float(os.environ.get("PINKY_IMU_HZ", "20"))
         us_hz = float(os.environ.get("PINKY_US_HZ", "10"))
         lidar_hz = float(os.environ.get("PINKY_LIDAR_HZ", "5"))
 
-        self._node.create_timer(1.0 / max(batt_hz, 0.1), self._tick_battery)
+        if not self._defer_battery:
+            self._node.create_timer(1.0 / max(batt_hz, 0.1), self._tick_battery)
         self._node.create_timer(1.0 / max(imu_hz, 1.0), self._tick_imu)
         self._node.create_timer(1.0 / max(us_hz, 1.0), self._tick_ultrasonic)
-        self._node.create_timer(1.0 / max(lidar_hz, 1.0), self._tick_lidar)
+        if not self._defer_lidar:
+            self._node.create_timer(1.0 / max(lidar_hz, 1.0), self._tick_lidar)
 
         ros2_runtime.add_node(self._node)
         self._started = True
@@ -85,10 +112,13 @@ class SensorPublisherController:
         if self._node is not None:
             ros2_runtime.remove_node(self._node)
             self._node = None
-        self._lidar.stop()
+        if not self._defer_lidar:
+            self._lidar.stop()
         self._started = False
 
     def _tick_battery(self) -> None:
+        if self._batt_pct_pub is None:
+            return
         from std_msgs.msg import Float32
 
         reading = self._hw.read_battery()
@@ -101,7 +131,7 @@ class SensorPublisherController:
             msg = Float32()
             msg.data = float(reading.percent)
             self._batt_pct_pub.publish(msg)
-        if reading.voltage is not None:
+        if reading.voltage is not None and self._batt_v_pub is not None:
             msg = Float32()
             msg.data = float(reading.voltage)
             self._batt_v_pub.publish(msg)
@@ -164,9 +194,10 @@ class SensorPublisherController:
             self._ir_pub.publish(ir)
 
     def _tick_lidar(self) -> None:
+        if self._scan_pub is None:
+            return
         from sensor_msgs.msg import LaserScan
 
-        # sllidar가 직접 /scan 을 발행 중이면 중복 발행하지 않음
         if getattr(self._lidar, "external_sllidar", False):
             return
 

@@ -29,6 +29,18 @@ def create_app() -> Flask:
     device_code = get_device_code()
     backend = get_backend()
 
+    # pinky_pro bringup + Nav2 (서브프로세스) — 센서 publisher 보다 먼저
+    pro_launcher = None
+    if backend == "ros2":
+        try:
+            from controllers.pro_launch import get_pro_launcher
+
+            pro_launcher = get_pro_launcher()
+            pro_launcher.start()
+        except Exception as exc:
+            logger.exception("pinky_pro auto-launch failed: %s", exc)
+            pro_launcher = None
+
     sensor_publisher = None
     if should_start_sensor_publisher():
         try:
@@ -40,7 +52,6 @@ def create_app() -> Flask:
                 "sensor publisher started: %s",
                 "; ".join(sensor_publisher.hardware_status),
             )
-            # 구독 노드가 첫 메시지를 받을 시간을 잠깐 확보
             import time as _time
 
             _time.sleep(0.5)
@@ -51,10 +62,20 @@ def create_app() -> Flask:
     robot = PinkyRobot(backend=backend, device_code=device_code)
     robot.start()
 
+    # sllidar 가 /scan 만 만들고 데이터를 안 줄 때 LidarReader 로 복구
+    if backend == "ros2":
+        try:
+            from controllers.lidar_recovery import ensure_lidar
+
+            ensure_lidar(robot)
+        except Exception as exc:
+            logger.exception("lidar recovery error: %s", exc)
+
     app.extensions["robot"] = robot
     app.extensions["device_code"] = device_code
     app.extensions["controller"] = ControllerClient(get_controller_url())
     app.extensions["sensor_publisher"] = sensor_publisher
+    app.extensions["pro_launcher"] = pro_launcher
 
     def _shutdown() -> None:
         try:
@@ -64,6 +85,11 @@ def create_app() -> Flask:
             pass
         try:
             robot.stop()
+        except Exception:
+            pass
+        try:
+            if pro_launcher is not None:
+                pro_launcher.stop()
         except Exception:
             pass
         if backend == "ros2":
