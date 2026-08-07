@@ -153,7 +153,57 @@ class OrdersService:
         """
         idle로 되돌림: active 미션이 없는데 busy/error 인 cart.
         (이전 실패·재시작으로 할당이 멈춘 경우 복구)
+        또한 ASSIGNED 상태로 너무 오래 멈춘 미션은 FAILED 처리
+        (피킹 스레드가 죽거나 DB 락에 걸린 경우).
         """
+        fixed = 0
+        # Stuck ASSIGNED with no progress (no PICKING+)
+        stuck_sec = float(os.environ.get("PICK_ASSIGNED_STUCK_SEC", "90"))
+        stuck = self.conn.execute(
+            """
+            SELECT m.id, m.order_id, m.device_id, m.created_at
+            FROM missions m
+            WHERE m.status = 'ASSIGNED'
+            """
+        ).fetchall()
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        for m in stuck:
+            # Prefer mission event time for ASSIGNED if available
+            ev = self.conn.execute(
+                """
+                SELECT created_at FROM mission_events
+                WHERE mission_id = ? AND to_status = 'ASSIGNED'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (m["id"],),
+            ).fetchone()
+            ts_raw = (ev["created_at"] if ev else m["created_at"]) or ""
+            try:
+                assigned_at = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            age = (now - assigned_at).total_seconds()
+            if age < stuck_sec:
+                continue
+            oid = int(m["order_id"])
+            mid = int(m["id"])
+            self._set_status(
+                oid,
+                mid,
+                "FAILED",
+                note=f"failed:stuck in ASSIGNED >{stuck_sec:.0f}s (robot offline or tour thread dead)",
+            )
+            self._set_waypoint(mid, None)
+            if m["device_id"]:
+                self.conn.execute(
+                    "UPDATE devices SET status = 'idle' WHERE id = ?",
+                    (m["device_id"],),
+                )
+                self.conn.commit()
+            fixed += 1
+
         rows = self.conn.execute(
             """
             SELECT d.id, d.code, d.status
@@ -161,7 +211,6 @@ class OrdersService:
             WHERE d.type = 'cart' AND d.status IN ('busy', 'error')
             """
         ).fetchall()
-        fixed = 0
         for d in rows:
             active = self.conn.execute(
                 """
@@ -452,6 +501,12 @@ class OrdersService:
     ) -> None:
         home = home_for_device(device_code)
         try:
+            if not self.cart_port.is_reachable(device_code):
+                raise RuntimeError(
+                    f"pinky unreachable for {device_code} "
+                    f"(PINKY_ROBOTS URL / robot run.py 확인)"
+                )
+
             self.ai_port.request_pick_plan(order_id)
             self.cart_port.notify_assign(device_code, order_id)
 
@@ -531,27 +586,30 @@ class OrdersService:
             )
             self._release_device(mission_id)
         except Exception as exc:
-            # 실패해도 대기장소 복귀 완료 전까지는 RETURNING 으로 할당 표시 유지
-            try:
-                self._set_status(
-                    order_id,
-                    mission_id,
-                    "RETURNING",
-                    note=f"abort return home:{exc}",
-                )
-            except Exception:
-                pass
-            home_ok = self._return_home(
-                device_code,
-                mission_id,
-                stop_first=True,
-                best_effort=True,
-            )
+            # Don't block forever on home return when pinky is already down
             note = f"failed:{exc}"
-            if home_ok:
-                note = f"{note}; arrived wait spot"
-            else:
-                note = f"{note}; home return failed"
+            try:
+                if self.cart_port.is_reachable(device_code):
+                    self._set_status(
+                        order_id,
+                        mission_id,
+                        "RETURNING",
+                        note=f"abort return home:{exc}",
+                    )
+                    home_ok = self._return_home(
+                        device_code,
+                        mission_id,
+                        stop_first=True,
+                        best_effort=True,
+                    )
+                    if home_ok:
+                        note = f"{note}; arrived wait spot"
+                    else:
+                        note = f"{note}; home return failed"
+                else:
+                    note = f"{note}; skip home (pinky unreachable)"
+            except Exception as home_exc:
+                note = f"{note}; home exc:{home_exc}"
             self._set_waypoint(mission_id, None)
             self._set_status(order_id, mission_id, "FAILED", note=note)
             self._release_device(mission_id)

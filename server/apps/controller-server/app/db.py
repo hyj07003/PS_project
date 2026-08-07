@@ -10,15 +10,49 @@ from urllib.parse import quote, urlparse
 _db_lock = threading.RLock()
 
 
+class LockedCursor:
+    """Cursor whose fetch* methods hold the same DB lock as LockedConnection."""
+
+    def __init__(self, cursor: sqlite3.Cursor):
+        self._cursor = cursor
+
+    def fetchone(self):
+        with _db_lock:
+            return self._cursor.fetchone()
+
+    def fetchall(self):
+        with _db_lock:
+            return self._cursor.fetchall()
+
+    def fetchmany(self, size: int | None = None):
+        with _db_lock:
+            if size is None:
+                return self._cursor.fetchmany()
+            return self._cursor.fetchmany(size)
+
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def __iter__(self):
+        with _db_lock:
+            rows = self._cursor.fetchall()
+        return iter(rows)
+
+
 class LockedConnection:
-    """Serialize SQLite access across Flask request threads and mock pipeline."""
+    """Serialize SQLite access across Flask request threads and pick-tour threads."""
 
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
 
     def execute(self, *args, **kwargs):
         with _db_lock:
-            return self._conn.execute(*args, **kwargs)
+            return LockedCursor(self._conn.execute(*args, **kwargs))
 
     def executescript(self, *args, **kwargs):
         with _db_lock:
