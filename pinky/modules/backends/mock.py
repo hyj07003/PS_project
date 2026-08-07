@@ -71,6 +71,7 @@ class MockBackend(RobotBackend):
             range_max=12.0,
             frame_id="rplidar_link",
             stamp=time.time(),
+            source="mock",
         )
 
     def get_imu(self) -> ImuData:
@@ -87,6 +88,7 @@ class MockBackend(RobotBackend):
             linear_acceleration={"x": 0.0, "y": 0.0, "z": 9.81},
             frame_id="imu_link",
             stamp=time.time(),
+            source="mock",
         )
 
     def get_ultrasonic(self) -> UltrasonicData:
@@ -99,6 +101,7 @@ class MockBackend(RobotBackend):
                 int(750 + 40 * math.cos(t)),
                 int(780 + 30 * math.sin(t * 1.3)),
             ],
+            source="mock",
         )
 
     def set_led(

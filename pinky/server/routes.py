@@ -82,29 +82,60 @@ def health():
     )
 
 
+def _annotate_sensor_sources(payload: dict) -> dict:
+    """Overlay publisher fallback sources + isDummy flags onto sensor dicts."""
+    from modules.types import is_dummy_source
+
+    pub = current_app.extensions.get("sensor_publisher")
+    sources = {}
+    if pub is not None and hasattr(pub, "sensor_sources"):
+        sources = pub.sensor_sources
+    robot = _robot()
+    if robot.backend_name == "mock":
+        for key in ("battery", "imu", "ultrasonic", "lidar"):
+            sources.setdefault(key, "mock")
+
+    for key, src in sources.items():
+        block = payload.get(key)
+        if not isinstance(block, dict):
+            continue
+        # publisher dummy/fallback overrides topic-level "ros2"
+        if src and src != "unknown":
+            block["source"] = src
+        block["isDummy"] = is_dummy_source(block.get("source"))
+        if block["isDummy"] and key == "battery":
+            # keep explicit label for UI
+            block["dummyLabel"] = "더미값"
+    return payload
+
+
 @bp.get("/sensors")
 def sensors_all():
-    return jsonify(_robot().snapshot().to_dict())
+    return jsonify(_annotate_sensor_sources(_robot().snapshot().to_dict()))
 
 
 @bp.get("/sensors/battery")
 def sensors_battery():
-    return jsonify(_robot().battery.read().to_dict())
+    data = _robot().battery.read().to_dict()
+    return jsonify(_annotate_sensor_sources({"battery": data})["battery"])
 
 
 @bp.get("/sensors/lidar")
 def sensors_lidar():
-    return jsonify(_robot().lidar.read().to_dict())
+    data = _robot().lidar.read().to_dict()
+    return jsonify(_annotate_sensor_sources({"lidar": data})["lidar"])
 
 
 @bp.get("/sensors/imu")
 def sensors_imu():
-    return jsonify(_robot().imu.read().to_dict())
+    data = _robot().imu.read().to_dict()
+    return jsonify(_annotate_sensor_sources({"imu": data})["imu"])
 
 
 @bp.get("/sensors/ultrasonic")
 def sensors_ultrasonic():
-    return jsonify(_robot().ultrasonic.read().to_dict())
+    data = _robot().ultrasonic.read().to_dict()
+    return jsonify(_annotate_sensor_sources({"ultrasonic": data})["ultrasonic"])
 
 
 # ----- Map + Navigation -----

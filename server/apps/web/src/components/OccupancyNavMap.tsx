@@ -147,19 +147,17 @@ export function OccupancyNavMap({
       sy: row * scale,
     });
 
-    const LIDAR_YAW_OFFSET = Math.PI;
+    // LaserScan → map: 앞뒤+좌우 반전 ≡ 180° (원래 표시)
     if (pose && lidarPoints.length) {
       const c = Math.cos(pose.yaw);
       const s = Math.sin(pose.yaw);
-      const lc = Math.cos(LIDAR_YAW_OFFSET);
-      const ls = Math.sin(LIDAR_YAW_OFFSET);
       ctx.fillStyle = "rgba(80, 120, 90, 0.85)";
       for (const p of lidarPoints) {
         if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
-        const bx = lc * p.x - ls * p.y;
-        const by = ls * p.x + lc * p.y;
-        const mx = pose.x + c * bx - s * by;
-        const my = pose.y + s * bx + c * by;
+        const lx = -p.x;
+        const ly = -p.y;
+        const mx = pose.x + c * lx - s * ly;
+        const my = pose.y + s * lx + c * ly;
         const { col, row } = worldToPixel(meta, mx, my);
         const { sx, sy } = toScreen(col, row);
         ctx.beginPath();

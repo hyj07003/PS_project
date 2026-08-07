@@ -17,6 +17,7 @@ type Battery = {
   percent?: number | null;
   voltage?: number | null;
   source?: string;
+  isDummy?: boolean;
 };
 
 type Lidar = {
@@ -32,6 +33,8 @@ type Lidar = {
   points?: { x: number; y: number; r?: number }[];
   angleMin?: number;
   angleIncrement?: number;
+  source?: string;
+  isDummy?: boolean;
 };
 
 type Imu = {
@@ -40,6 +43,8 @@ type Imu = {
   linearAcceleration?: { x: number; y: number; z: number };
   frameId?: string;
   stamp?: number | null;
+  source?: string;
+  isDummy?: boolean;
 };
 
 type Ultrasonic = {
@@ -48,6 +53,8 @@ type Ultrasonic = {
   maxRange?: number;
   irRaw?: number[];
   frameId?: string;
+  source?: string;
+  isDummy?: boolean;
 };
 
 type Snapshot = {
@@ -124,6 +131,41 @@ function fmt(n: number | null | undefined, digits = 2): string {
   return n.toFixed(digits);
 }
 
+const DUMMY_SOURCES = new Set([
+  "mock",
+  "dummy",
+  "fallback",
+  "synthetic",
+  "unavailable",
+]);
+
+function isDummySensor(
+  source?: string | null,
+  isDummy?: boolean,
+  backend?: string | null,
+): boolean {
+  if (isDummy) return true;
+  if ((backend || "").toLowerCase() === "mock") return true;
+  return DUMMY_SOURCES.has((source || "").toLowerCase().trim());
+}
+
+function DummyTag({ show }: { show: boolean }) {
+  if (!show) return null;
+  return (
+    <span
+      className="error"
+      style={{
+        marginLeft: "0.35rem",
+        fontSize: "0.8em",
+        fontWeight: 600,
+        whiteSpace: "nowrap",
+      }}
+    >
+      · 더미값
+    </span>
+  );
+}
+
 const MISSION_STATUS_LABEL: Record<string, string> = {
   CREATED: "대기열",
   ASSIGNED: "할당됨",
@@ -142,6 +184,27 @@ function missionStatusLabel(status: string): string {
 function RobotBlock({ robot }: { robot: RobotMonitor }) {
   const health = robot.health;
   const snap = robot.sensors;
+  const backend = health?.backend || snap?.backend;
+  const battDummy = isDummySensor(
+    snap?.battery?.source,
+    snap?.battery?.isDummy,
+    backend,
+  );
+  const usDummy = isDummySensor(
+    snap?.ultrasonic?.source,
+    snap?.ultrasonic?.isDummy,
+    backend,
+  );
+  const imuDummy = isDummySensor(
+    snap?.imu?.source,
+    snap?.imu?.isDummy,
+    backend,
+  );
+  const lidarDummy = isDummySensor(
+    snap?.lidar?.source,
+    snap?.lidar?.isDummy,
+    backend,
+  );
   const hd = snap?.hasData;
   const allMissing =
     hd && !hd.battery && !hd.imu && !hd.ultrasonic && !hd.lidar;
@@ -322,7 +385,10 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
         </div>
 
         <div className="monitor-card">
-          <h3>배터리</h3>
+          <h3>
+            배터리
+            <DummyTag show={battDummy} />
+          </h3>
           <p className="monitor-metric">
             {fmt(snap?.battery?.percent, 1)}
             <small>%</small>
@@ -336,10 +402,7 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
               <dt>소스</dt>
               <dd>
                 {snap?.battery?.source || "—"}
-                {(snap?.battery?.source === "mock" ||
-                  (health?.backend || snap?.backend) === "mock") && (
-                  <span className="error"> (더미)</span>
-                )}
+                {battDummy ? <span className="error"> (더미값)</span> : null}
               </dd>
             </div>
           </dl>
@@ -350,7 +413,11 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
               }}
             />
           </div>
-          {!snap?.hasData?.battery ? (
+          {battDummy ? (
+            <p className="error" style={{ marginTop: "0.75rem", marginBottom: 0 }}>
+              표시 값은 더미(fallback/mock)입니다. 실측 ADC·battery publisher를 확인하세요.
+            </p>
+          ) : !snap?.hasData?.battery ? (
             <p className="muted" style={{ marginTop: "0.75rem", marginBottom: 0 }}>
               측정값 없음
             </p>
@@ -358,7 +425,10 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
         </div>
 
         <div className="monitor-card">
-          <h3>초음파 / IR</h3>
+          <h3>
+            초음파 / IR
+            <DummyTag show={usDummy} />
+          </h3>
           <p className="monitor-metric">
             {fmt(snap?.ultrasonic?.rangeM, 3)}
             <small>m</small>
@@ -375,11 +445,21 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
               <dt>IR raw</dt>
               <dd>{(snap?.ultrasonic?.irRaw || []).join(", ") || "—"}</dd>
             </div>
+            <div>
+              <dt>소스</dt>
+              <dd>
+                {snap?.ultrasonic?.source || "—"}
+                {usDummy ? <span className="error"> (더미값)</span> : null}
+              </dd>
+            </div>
           </dl>
         </div>
 
         <div className="monitor-card monitor-card-wide">
-          <h3>IMU</h3>
+          <h3>
+            IMU
+            <DummyTag show={imuDummy} />
+          </h3>
           <div className="imu-grid">
             <div>
               <h4>Orientation</h4>
@@ -400,10 +480,17 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
               </pre>
             </div>
           </div>
+          <p className="muted" style={{ marginTop: "0.5rem", marginBottom: 0 }}>
+            소스: {snap?.imu?.source || "—"}
+            {imuDummy ? <span className="error"> (더미값)</span> : null}
+          </p>
         </div>
 
         <div className="monitor-card monitor-card-wide">
-          <h3>맵 · 네비게이션</h3>
+          <h3>
+            맵 · 네비게이션
+            <DummyTag show={lidarDummy} />
+          </h3>
           <p className="muted" style={{ marginTop: 0, fontSize: "0.85rem" }}>
             좌드래그: 현재 pose · 우드래그: 목표 위치+최종 yaw (Nav2 goal)
           </p>

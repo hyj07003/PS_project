@@ -12,7 +12,18 @@ class BatteryData:
     source: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["isDummy"] = is_dummy_source(self.source)
+        return d
+
+
+DUMMY_SOURCES = frozenset(
+    {"mock", "dummy", "fallback", "synthetic", "unavailable"}
+)
+
+
+def is_dummy_source(source: str | None) -> bool:
+    return (source or "").lower().strip() in DUMMY_SOURCES
 
 
 @dataclass
@@ -26,6 +37,7 @@ class LidarData:
     frame_id: str = "rplidar_link"
     stamp: float | None = None
     raw_pairs: list[tuple[float, float]] = field(default_factory=list)
+    source: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         import os
@@ -97,6 +109,8 @@ class LidarData:
         d["rangeMax"] = self.range_max
         d["frameId"] = self.frame_id
         d["points"] = points
+        d["source"] = self.source
+        d["isDummy"] = is_dummy_source(self.source)
         d.pop("ranges", None)
         d.pop("raw_pairs", None)
         return d
@@ -115,6 +129,7 @@ class ImuData:
     )
     frame_id: str = "imu_link"
     stamp: float | None = None
+    source: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +138,8 @@ class ImuData:
             "linearAcceleration": self.linear_acceleration,
             "frameId": self.frame_id,
             "stamp": self.stamp,
+            "source": self.source,
+            "isDummy": is_dummy_source(self.source),
         }
 
 
@@ -133,6 +150,7 @@ class UltrasonicData:
     max_range: float = 3.0
     frame_id: str = "ultrasonic_link"
     ir_raw: list[int] = field(default_factory=list)
+    source: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,6 +159,8 @@ class UltrasonicData:
             "maxRange": self.max_range,
             "frameId": self.frame_id,
             "irRaw": self.ir_raw,
+            "source": self.source,
+            "isDummy": is_dummy_source(self.source),
         }
 
 
@@ -168,12 +188,22 @@ class RobotSnapshot:
         warnings: list[str] = []
         if not has_battery:
             warnings.append("battery: no data (publisher/pinkylib/ADC 확인)")
+        elif battery.get("isDummy"):
+            warnings.append("battery: 더미값")
         if not has_lidar:
             warnings.append("lidar: no /scan (sllidar bringup 확인)")
+        elif lidar.get("isDummy"):
+            warnings.append("lidar: 더미값")
         if not has_imu:
             warnings.append("imu: no data (BNO055/I2C 또는 publisher 확인)")
+        elif imu.get("isDummy"):
+            warnings.append("imu: 더미값")
         if not has_us:
             warnings.append("ultrasonic: no data (ADC/I2C 또는 publisher 확인)")
+        elif ultrasonic.get("isDummy"):
+            warnings.append("ultrasonic: 더미값")
+        if self.backend == "mock":
+            warnings.append("backend: mock (전체 더미)")
         return {
             "deviceCode": self.device_code,
             "backend": self.backend,

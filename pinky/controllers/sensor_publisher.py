@@ -32,6 +32,17 @@ class SensorPublisherController:
         )
         self._defer_lidar = defer_lidar_to_pro()
         self._defer_battery = defer_battery_to_pro()
+        # /sensors 에 노출할 최근 소스 (fallback 시 "dummy")
+        self._sources: dict[str, str] = {
+            "battery": "unknown",
+            "imu": "unknown",
+            "ultrasonic": "unknown",
+            "lidar": "unknown",
+        }
+
+    @property
+    def sensor_sources(self) -> dict[str, str]:
+        return dict(self._sources)
 
     @property
     def hardware_status(self) -> list[str]:
@@ -127,6 +138,8 @@ class SensorPublisherController:
                 return
             reading.voltage = 7.4
             reading.percent = 50.0
+            reading.source = "dummy"
+        self._sources["battery"] = reading.source or "dummy"
         if reading.percent is not None:
             msg = Float32()
             msg.data = float(reading.percent)
@@ -146,10 +159,12 @@ class SensorPublisherController:
             ox, oy, oz, ow = (0.0, 0.0, 0.0, 1.0)
             av = (0.0, 0.0, 0.0)
             la = (0.0, 0.0, 9.81)
+            self._sources["imu"] = "dummy"
         else:
             ox, oy, oz, ow = reading.orientation
             av = reading.angular_velocity
             la = reading.linear_acceleration
+            self._sources["imu"] = reading.source or "bno055"
 
         msg = Imu()
         msg.header.stamp = self._node.get_clock().now().to_msg()
@@ -176,6 +191,8 @@ class SensorPublisherController:
                 return
             reading.range_m = 0.5
             reading.ir_raw = [0, 0, 0]
+            reading.source = "dummy"
+        self._sources["ultrasonic"] = reading.source or "dummy"
 
         if reading.range_m is not None:
             msg = Range()
@@ -204,6 +221,7 @@ class SensorPublisherController:
         scan = self._lidar.read()
         if scan is None or not scan.ranges:
             return
+        self._sources["lidar"] = getattr(scan, "source", None) or "lidar"
 
         msg = LaserScan()
         msg.header.stamp = self._node.get_clock().now().to_msg()

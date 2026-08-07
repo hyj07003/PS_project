@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -27,6 +28,16 @@ from .carts import CartsService
 _dispatch_lock = threading.Lock()
 
 ACTIVE_STATUSES = ("ASSIGNED", "PICKING", "CHECKOUT", "PACKING", "RETURNING")
+# 대기장소(S1/S2) 복귀 시 강제 헤딩 — map +x (오른쪽)
+HOME_YAW = 0.0
+
+
+def _wrap_angle(a: float) -> float:
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
 
 
 class OrdersService:
@@ -325,9 +336,12 @@ class OrdersService:
         y: float,
         yaw: float,
         waypoint_id: str,
+        *,
+        require_yaw: bool = False,
     ) -> None:
         # Nav2 aborts/replans mid-leg often; retry before failing the whole tour.
         attempts = max(1, int(os.environ.get("PICK_NAV_RETRIES", "3")))
+        yaw_tol = float(os.environ.get("PICK_HOME_YAW_TOL_RAD", "0.12"))
         last_detail = "unknown"
         for attempt in range(1, attempts + 1):
             result = self.cart_port.navigate_pose(
@@ -336,6 +350,8 @@ class OrdersService:
                 y,
                 yaw,
                 timeout_sec=self._nav_timeout,
+                require_yaw=require_yaw,
+                yaw_tol_rad=yaw_tol,
             )
             if result == "ARRIVED":
                 return
@@ -378,8 +394,9 @@ class OrdersService:
         stop_first: bool = False,
         best_effort: bool = False,
     ) -> bool:
-        """Navigate to device wait spot (S1/S2). best_effort: never raise."""
+        """Navigate to wait spot (S1/S2) facing yaw=0 (+x) for both carts."""
         home = home_for_device(device_code)
+        yaw_tol = float(os.environ.get("PICK_HOME_YAW_TOL_RAD", "0.12"))
         if stop_first:
             try:
                 self.cart_port.stop_nav(device_code)
@@ -388,7 +405,29 @@ class OrdersService:
                 pass
         self._set_waypoint(mission_id, home.id)
         try:
-            self._nav_or_fail(device_code, home.x, home.y, home.yaw, home.id)
+            self._nav_or_fail(
+                device_code, home.x, home.y, HOME_YAW, home.id, require_yaw=False
+            )
+            for align in range(1, 4):
+                pose = self.cart_port.get_pose(device_code)
+                if pose:
+                    err = abs(
+                        _wrap_angle(float(pose.get("yaw") or 0.0) - HOME_YAW)
+                    )
+                    if err <= yaw_tol:
+                        break
+                    self._mission_note(
+                        mission_id,
+                        f"home yaw align {home.id} err={err:.2f} try={align}",
+                    )
+                self._nav_or_fail(
+                    device_code,
+                    home.x,
+                    home.y,
+                    HOME_YAW,
+                    f"{home.id}-yaw",
+                    require_yaw=True,
+                )
             self._dwell_at(device_code, mission_id, home.id)
             return True
         except Exception:
@@ -416,26 +455,34 @@ class OrdersService:
             self.ai_port.request_pick_plan(order_id)
             self.cart_port.notify_assign(device_code, order_id)
 
-            # 최초 이니셜 포즈: 홈(S1/S2), 오른쪽(+x, yaw=0)
+            # 최초 이니셜 포즈: 홈(S1/S2), yaw=0 (+x)
             self.cart_port.set_initial_pose(
-                device_code, home.x, home.y, home.yaw
+                device_code, home.x, home.y, HOME_YAW
             )
-            # AMCL settle after initialpose
-            time.sleep(float(os.environ.get("PICK_INITIALPOSE_SETTLE_SEC", "1.5")))
+            settle = float(os.environ.get("PICK_INITIALPOSE_SETTLE_SEC", "2.5"))
+            time.sleep(max(0.5, settle * 0.5))
+            self.cart_port.set_initial_pose(
+                device_code, home.x, home.y, HOME_YAW
+            )
+            time.sleep(max(0.5, settle * 0.5))
 
+            # 방금 홈으로 리셋했으므로 투어 시작점은 홈 (낡은 TF pose 로 NN 꼬이지 않게)
+            start = home
             pose = self.cart_port.get_pose(device_code)
             if pose:
-                from ..waypoints import Waypoint
+                dx = float(pose["x"]) - home.x
+                dy = float(pose["y"]) - home.y
+                # AMCL 이 홈 근처로 수렴했을 때만 현재 pose 사용
+                if (dx * dx + dy * dy) ** 0.5 < 0.4:
+                    from ..waypoints import Waypoint
 
-                start = Waypoint(
-                    id="START",
-                    label="current",
-                    x=pose["x"],
-                    y=pose["y"],
-                    yaw=float(pose.get("yaw") or 0.0),
-                )
-            else:
-                start = home
+                    start = Waypoint(
+                        id="START",
+                        label="current",
+                        x=pose["x"],
+                        y=pose["y"],
+                        yaw=float(pose.get("yaw") or home.yaw),
+                    )
 
             rows = self.conn.execute(
                 """

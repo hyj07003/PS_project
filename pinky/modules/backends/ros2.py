@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+import threading
 import time
 from typing import Any
 
@@ -157,8 +159,15 @@ class Ros2Backend(RobotBackend):
         self._Time = Time
 
         self._nav_client = ActionClient(self._node, NavigateToPose, "navigate_to_pose")
+        # AMCL subscribes with transient_local; match so late/missed msgs still apply
+        initialpose_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self._initial_pose_pub = self._node.create_publisher(
-            PoseWithCovarianceStamped, "initialpose", 10
+            PoseWithCovarianceStamped, "initialpose", initialpose_qos
         )
         self._cancel_client = self._node.create_client(
             CancelGoal, "navigate_to_pose/_action/cancel_goal"
@@ -183,6 +192,43 @@ class Ros2Backend(RobotBackend):
         )
         self._node.create_timer(0.1, self._update_pose_from_tf)
         self._node.get_logger().info("Navigation bridge (Nav2 + TF map→base_link) ready")
+        # Apply S1/S2 (or PINKY_INITIAL_POSE) after AMCL is up
+        delay = float(os.environ.get("PINKY_INITIAL_POSE_DELAY_SEC", "2.0"))
+        if delay <= 0:
+            self._apply_boot_initial_pose()
+        else:
+            threading.Timer(delay, self._apply_boot_initial_pose).start()
+
+    def _default_home_pose(self) -> tuple[float, float, float]:
+        """cart-1→S1, cart-2→S2 (controller waypoints.py 와 동일)."""
+        raw = (os.environ.get("PINKY_INITIAL_POSE") or "").strip()
+        if raw:
+            parts = [p.strip() for p in raw.split(",")]
+            if len(parts) >= 2:
+                return (
+                    float(parts[0]),
+                    float(parts[1]),
+                    float(parts[2]) if len(parts) > 2 else 0.0,
+                )
+        code = (os.environ.get("PINKY_DEVICE_CODE") or "cart-1").strip().lower()
+        if code in ("cart-2", "cart2", "2"):
+            return (0.038474577957370054, -0.1911947634013857, 0.0)  # S2
+        return (0.036703343955750284, 0.0005066978948139312, 0.0)  # S1
+
+    def _apply_boot_initial_pose(self) -> None:
+        if not self._nav_enabled:
+            return
+        try:
+            x, y, yaw = self._default_home_pose()
+            result = self.set_initial_pose(x, y, yaw)
+            if self._node:
+                self._node.get_logger().info(
+                    f"boot initialpose → ({x:.4f},{y:.4f},yaw={yaw:.3f}) "
+                    f"ok={result.get('success')}"
+                )
+        except Exception as exc:
+            if self._node:
+                self._node.get_logger().warn(f"boot initialpose failed: {exc}")
 
     def _quat_to_yaw(self, q) -> float:
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -235,20 +281,29 @@ class Ros2Backend(RobotBackend):
 
         msg = PoseWithCovarianceStamped()
         msg.header.frame_id = "map"
-        msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.pose.pose.position.x = float(x)
         msg.pose.pose.position.y = float(y)
         msg.pose.pose.orientation.z = math.sin(float(yaw) / 2.0)
         msg.pose.pose.orientation.w = math.cos(float(yaw) / 2.0)
+        # Modest covariance so AMCL accepts and can refine with lidar
         msg.pose.covariance[0] = 0.25
         msg.pose.covariance[7] = 0.25
         msg.pose.covariance[35] = 0.06853891909122467
-        self._initial_pose_pub.publish(msg)
+
+        # AMCL often misses a single publish (startup / QoS). Repeat briefly.
+        repeats = max(1, int(os.environ.get("PINKY_INITIAL_POSE_PUBLISHES", "5")))
+        gap = float(os.environ.get("PINKY_INITIAL_POSE_GAP_SEC", "0.15"))
+        for _ in range(repeats):
+            msg.header.stamp = self._node.get_clock().now().to_msg()
+            self._initial_pose_pub.publish(msg)
+            if gap > 0:
+                time.sleep(gap)
+
         with self._lock:
             self._nav_pose = (float(x), float(y), float(yaw))
         return {
             "success": True,
-            "message": "initialpose published",
+            "message": f"initialpose published x{repeats}",
             "pose": {"x": x, "y": y, "yaw": yaw},
         }
 
@@ -485,6 +540,7 @@ class Ros2Backend(RobotBackend):
                     frame_id=scan.frame_id,
                     stamp=scan.stamp,
                     raw_pairs=raw,
+                    source=getattr(scan, "source", None) or "lidar",
                 )
         except Exception:
             pass

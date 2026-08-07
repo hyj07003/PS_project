@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.error
@@ -16,6 +17,15 @@ ORDER_FLOW = [
     "RETURNING",
     "COMPLETED",
 ]
+
+
+def _wrap_angle(a: float) -> float:
+    """Normalize radians to [-pi, pi]."""
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
 
 
 def parse_pinky_robot_urls() -> dict[str, str]:
@@ -75,8 +85,9 @@ class MockCartAdapter:
         y: float,
         yaw: float = 0.0,
         timeout_sec: float = 120.0,
+        **_kwargs: Any,
     ) -> Literal["ARRIVED", "FAILED"]:
-        del device_code, x, y, yaw, timeout_sec
+        del device_code, x, y, yaw, timeout_sec, _kwargs
         time.sleep(0.5)
         return "ARRIVED"
 
@@ -204,9 +215,13 @@ class PinkyHttpCartAdapter:
         y: float,
         yaw: float = 0.0,
         timeout_sec: float = 180.0,
+        *,
+        require_yaw: bool = False,
+        yaw_tol_rad: float = 0.12,
     ) -> Literal["ARRIVED", "FAILED"]:
         self.last_nav_error = None
         use_wait = self._goal_wait_supported.get(device_code, True)
+        poll_kw = dict(require_yaw=require_yaw, yaw_tol_rad=yaw_tol_rad)
         if use_wait:
             try:
                 result = self._post(
@@ -220,9 +235,12 @@ class PinkyHttpCartAdapter:
                 if http_status == 404:
                     self._goal_wait_supported[device_code] = False
                     return self._navigate_goal_poll(
-                        device_code, x, y, yaw, timeout_sec
+                        device_code, x, y, yaw, timeout_sec, **poll_kw
                     )
                 if result.get("success") or result.get("status") == "SUCCEEDED":
+                    if require_yaw and not self._yaw_ok(device_code, yaw, yaw_tol_rad):
+                        self.last_nav_error = "yaw not aligned after goal_wait"
+                        return "FAILED"
                     return "ARRIVED"
                 self.last_nav_error = str(
                     result.get("message") or result.get("status") or "goal_wait failed"
@@ -232,14 +250,24 @@ class PinkyHttpCartAdapter:
                 if exc.code == 404:
                     self._goal_wait_supported[device_code] = False
                     return self._navigate_goal_poll(
-                        device_code, x, y, yaw, timeout_sec
+                        device_code, x, y, yaw, timeout_sec, **poll_kw
                     )
                 self.last_nav_error = f"HTTP {exc.code}"
                 return "FAILED"
             except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
                 self.last_nav_error = str(exc)
                 return "FAILED"
-        return self._navigate_goal_poll(device_code, x, y, yaw, timeout_sec)
+        return self._navigate_goal_poll(
+            device_code, x, y, yaw, timeout_sec, **poll_kw
+        )
+
+    def _yaw_ok(
+        self, device_code: str, yaw: float, yaw_tol_rad: float
+    ) -> bool:
+        pose = self.get_pose(device_code)
+        if not pose:
+            return False
+        return abs(_wrap_angle(float(pose.get("yaw") or 0.0) - float(yaw))) <= yaw_tol_rad
 
     def _navigate_goal_poll(
         self,
@@ -248,13 +276,12 @@ class PinkyHttpCartAdapter:
         y: float,
         yaw: float,
         timeout_sec: float,
-        arrive_radius_m: float = 0.05, # 0.55
+        arrive_radius_m: float = 0.05,  # 0.55
+        *,
+        require_yaw: bool = False,
+        yaw_tol_rad: float = 0.12,
     ) -> Literal["ARRIVED", "FAILED"]:
-        """Compat path for pinky without /nav/goal_wait: POST /nav/goal + poll state.
-
-        Nav2 often flickers navigating false during replan/recovery. Require a short
-        stable idle window before treating that as a hard failure.
-        """
+        """Compat path for pinky without /nav/goal_wait: POST /nav/goal + poll state."""
         try:
             sent = self._post(
                 device_code,
@@ -273,9 +300,16 @@ class PinkyHttpCartAdapter:
         deadline = time.time() + max(1.0, float(timeout_sec))
         saw_navigating = False
         idle_since: float | None = None
-        # status topic can drop EXECUTING briefly; wait before declaring abort
         idle_fail_sec = float(os.environ.get("PICK_NAV_IDLE_FAIL_SEC", "2.5"))
         near_ok_m = arrive_radius_m * 1.35
+
+        def arrived(pose: dict, dist: float | None, radius: float) -> bool:
+            if dist is None or dist > radius:
+                return False
+            if not require_yaw:
+                return True
+            py = float(pose.get("yaw") or 0.0)
+            return abs(_wrap_angle(py - float(yaw))) <= yaw_tol_rad
 
         while time.time() < deadline:
             try:
@@ -290,7 +324,7 @@ class PinkyHttpCartAdapter:
                 dx = float(pose["x"]) - float(x)
                 dy = float(pose["y"]) - float(y)
                 dist = (dx * dx + dy * dy) ** 0.5
-                if dist <= arrive_radius_m and not navigating:
+                if not navigating and arrived(pose, dist, arrive_radius_m):
                     return "ARRIVED"
 
             if navigating:
@@ -300,18 +334,28 @@ class PinkyHttpCartAdapter:
                 if idle_since is None:
                     idle_since = time.time()
                 idle_for = time.time() - idle_since
-                if dist is not None and dist <= near_ok_m:
+                if pose and arrived(pose, dist, near_ok_m):
                     return "ARRIVED"
                 if idle_for >= idle_fail_sec:
-                    self.last_nav_error = (
-                        f"nav ended far from goal (dist={dist:.2f}m)"
-                        if dist is not None
-                        else "nav ended without pose"
-                    )
+                    if (
+                        require_yaw
+                        and pose
+                        and dist is not None
+                        and dist <= near_ok_m
+                    ):
+                        err = abs(
+                            _wrap_angle(float(pose.get("yaw") or 0.0) - float(yaw))
+                        )
+                        self.last_nav_error = f"yaw not aligned (err={err:.2f}rad)"
+                    else:
+                        self.last_nav_error = (
+                            f"nav ended far from goal (dist={dist:.2f}m)"
+                            if dist is not None
+                            else "nav ended without pose"
+                        )
                     return "FAILED"
             time.sleep(0.35)
 
-        # Timeout: accept near-miss rather than hard-fail a completed approach
         try:
             state = self._get(device_code, "/nav/state", timeout=3.0)
             pose = state.get("pose") if isinstance(state.get("pose"), dict) else None
@@ -319,7 +363,7 @@ class PinkyHttpCartAdapter:
                 dx = float(pose["x"]) - float(x)
                 dy = float(pose["y"]) - float(y)
                 dist = (dx * dx + dy * dy) ** 0.5
-                if dist <= near_ok_m:
+                if arrived(pose, dist, near_ok_m):
                     return "ARRIVED"
                 self.last_nav_error = f"nav poll timeout (dist={dist:.2f}m)"
             else:
