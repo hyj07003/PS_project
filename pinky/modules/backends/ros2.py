@@ -60,6 +60,8 @@ class Ros2Backend(RobotBackend):
 
         # Navigation (Nav2 bridge)
         self._nav_pose: tuple[float, float, float] | None = None
+        self._pose_hold_until = 0.0
+        self._pose_hold_target: tuple[float, float, float] | None = None
         self._is_navigating = False
         self._nav_client = None
         self._initial_pose_pub = None
@@ -67,6 +69,8 @@ class Ros2Backend(RobotBackend):
         self._tf_buffer = None
         self._tf_listener = None
         self._nav_enabled = True
+        self._Time = None
+        self._GoalStatus = None
 
     def start(self) -> None:
         if self._started:
@@ -131,6 +135,7 @@ class Ros2Backend(RobotBackend):
         flag = os.environ.get("PINKY_NAV", "1").lower().strip()
         if flag in ("0", "false", "off", "no"):
             self._nav_enabled = False
+            self._seed_home_pose_for_monitor()
             return
         self._nav_enabled = True
         try:
@@ -153,6 +158,7 @@ class Ros2Backend(RobotBackend):
                     f"Nav2/tf2 not available ({exc}); navigation disabled"
                 )
             self._nav_enabled = False
+            self._seed_home_pose_for_monitor()
             return
 
         self._GoalStatus = GoalStatus
@@ -192,43 +198,73 @@ class Ros2Backend(RobotBackend):
         )
         self._node.create_timer(0.1, self._update_pose_from_tf)
         self._node.get_logger().info("Navigation bridge (Nav2 + TF map→base_link) ready")
-        # Apply S1/S2 (or PINKY_INITIAL_POSE) after AMCL is up
-        delay = float(os.environ.get("PINKY_INITIAL_POSE_DELAY_SEC", "2.0"))
-        if delay <= 0:
-            self._apply_boot_initial_pose()
-        else:
-            threading.Timer(delay, self._apply_boot_initial_pose).start()
+        # 모니터용: TF 전에 홈(S1/S2)을 바로 /nav/state 에 반영
+        code = (os.environ.get("PINKY_DEVICE_CODE") or "cart-1").strip()
+        self._node.get_logger().info(
+            f"home pose deviceCode={code} "
+            "(cart-2 로봇이면 PINKY_DEVICE_CODE=cart-2 + S2 INITIAL_POSE 필요)"
+        )
+        self._seed_home_pose_for_monitor()
+        delay = float(os.environ.get("PINKY_INITIAL_POSE_DELAY_SEC", "3.0"))
+        threading.Timer(max(0.5, delay), self._boot_home_pose_loop).start()
 
-    def _default_home_pose(self) -> tuple[float, float, float]:
-        """cart-1→S1, cart-2→S2 (controller waypoints.py 와 동일)."""
-        raw = (os.environ.get("PINKY_INITIAL_POSE") or "").strip()
-        if raw:
-            parts = [p.strip() for p in raw.split(",")]
-            if len(parts) >= 2:
-                return (
-                    float(parts[0]),
-                    float(parts[1]),
-                    float(parts[2]) if len(parts) > 2 else 0.0,
-                )
-        code = (os.environ.get("PINKY_DEVICE_CODE") or "cart-1").strip().lower()
-        if code in ("cart-2", "cart2", "2"):
-            return (0.038474577957370054, -0.1911947634013857, 0.0)  # S2
-        return (0.036703343955750284, 0.0005066978948139312, 0.0)  # S1
+    def _seed_home_pose_for_monitor(self) -> None:
+        """AMCL/TF 대기 중에도 모니터링 현재좌표가 S1/S2로 보이게 시드."""
+        from ..home_poses import home_pose_for_device
 
-    def _apply_boot_initial_pose(self) -> None:
+        x, y, yaw = home_pose_for_device()
+        hold = float(os.environ.get("PINKY_POSE_HOLD_SEC", "12.0"))
+        with self._lock:
+            self._nav_pose = (x, y, yaw)
+            self._pose_hold_target = (x, y, yaw)
+            self._pose_hold_until = time.time() + max(1.0, hold)
+        if self._node:
+            self._node.get_logger().info(
+                f"monitor seed home pose → ({x:.4f},{y:.4f},yaw={yaw:.3f})"
+            )
+
+    def _boot_home_pose_loop(self) -> None:
+        """Publish home initialpose until AMCL TF is near S1/S2 or attempts exhausted."""
         if not self._nav_enabled:
             return
-        try:
-            x, y, yaw = self._default_home_pose()
-            result = self.set_initial_pose(x, y, yaw)
-            if self._node:
-                self._node.get_logger().info(
-                    f"boot initialpose → ({x:.4f},{y:.4f},yaw={yaw:.3f}) "
-                    f"ok={result.get('success')}"
-                )
-        except Exception as exc:
-            if self._node:
-                self._node.get_logger().warn(f"boot initialpose failed: {exc}")
+        from ..home_poses import home_pose_for_device
+
+        x, y, yaw = home_pose_for_device()
+        attempts = max(1, int(os.environ.get("PINKY_INITIAL_POSE_RETRIES", "6")))
+        gap = float(os.environ.get("PINKY_INITIAL_POSE_RETRY_GAP_SEC", "2.0"))
+        near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.35"))
+
+        for i in range(1, attempts + 1):
+            try:
+                result = self.set_initial_pose(x, y, yaw)
+                if self._node:
+                    self._node.get_logger().info(
+                        f"boot home pose try {i}/{attempts} → "
+                        f"({x:.4f},{y:.4f},yaw={yaw:.3f}) ok={result.get('success')}"
+                    )
+            except Exception as exc:
+                if self._node:
+                    self._node.get_logger().warn(f"boot home pose try {i} failed: {exc}")
+            time.sleep(max(0.3, gap * 0.5))
+            # 모니터용 hold pose가 아닌 실제 TF로 수렴 판정
+            tf_pose = self._lookup_tf_pose()
+            if tf_pose:
+                dx = tf_pose[0] - x
+                dy = tf_pose[1] - y
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist <= near_m:
+                    if self._node:
+                        self._node.get_logger().info(
+                            f"boot home pose settled dist={dist:.3f}m"
+                        )
+                    return
+            if i < attempts:
+                time.sleep(max(0.2, gap * 0.5))
+        if self._node:
+            self._node.get_logger().warn(
+                "boot home pose: TF not near home after retries "
+                "(맵/AMCL/라이다 확인) — monitor는 seed 홈 좌표 유지"
+            )
 
     def _quat_to_yaw(self, q) -> float:
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -249,19 +285,40 @@ class Ros2Backend(RobotBackend):
         with self._lock:
             self._is_navigating = navigating
 
-    def _update_pose_from_tf(self) -> None:
-        if self._tf_buffer is None:
-            return
+    def _lookup_tf_pose(self) -> tuple[float, float, float] | None:
+        if self._tf_buffer is None or self._Time is None:
+            return None
         try:
             trans = self._tf_buffer.lookup_transform(
                 "map", "base_link", self._Time()
             )
             t = trans.transform
             yaw = self._quat_to_yaw(t.rotation)
-            with self._lock:
-                self._nav_pose = (t.translation.x, t.translation.y, yaw)
+            return (float(t.translation.x), float(t.translation.y), float(yaw))
         except Exception:
-            pass
+            return None
+
+    def _update_pose_from_tf(self) -> None:
+        tf_pose = self._lookup_tf_pose()
+        if tf_pose is None:
+            return
+        x, y, yaw = tf_pose
+        near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.35"))
+        now = time.time()
+        with self._lock:
+            hold_until = self._pose_hold_until
+            hold_target = self._pose_hold_target
+            # initialpose 직후: AMCL 옛 TF가 모니터 좌표를 덮지 않도록 hold
+            if hold_until > now and hold_target is not None:
+                hx, hy, _hyaw = hold_target
+                dx = x - hx
+                dy = y - hy
+                if (dx * dx + dy * dy) ** 0.5 > near_m:
+                    return
+                # TF가 홈 근처로 수렴하면 hold 해제
+                self._pose_hold_until = 0.0
+                self._pose_hold_target = None
+            self._nav_pose = (x, y, yaw)
 
     def get_nav_pose(self) -> dict[str, float] | None:
         with self._lock:
@@ -299,8 +356,11 @@ class Ros2Backend(RobotBackend):
             if gap > 0:
                 time.sleep(gap)
 
+        hold = float(os.environ.get("PINKY_POSE_HOLD_SEC", "12.0"))
         with self._lock:
             self._nav_pose = (float(x), float(y), float(yaw))
+            self._pose_hold_target = (float(x), float(y), float(yaw))
+            self._pose_hold_until = time.time() + max(1.0, hold)
         return {
             "success": True,
             "message": f"initialpose published x{repeats}",

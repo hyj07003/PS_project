@@ -61,6 +61,27 @@ export function resolvePinkyUrl(robotId?: string): string {
   return found.url;
 }
 
+/** cart-1→S1, cart-2→S2 (controller waypoints.py 와 동일). */
+export function homePoseForDevice(deviceCode: string): {
+  x: number;
+  y: number;
+  yaw: number;
+} {
+  const code = (deviceCode || "cart-1").trim().toLowerCase();
+  if (code === "cart-2" || code === "cart2" || code === "2") {
+    return {
+      x: 0.038474577957370054,
+      y: -0.1911947634013857,
+      yaw: 0.0,
+    };
+  }
+  return {
+    x: 0.036703343955750284,
+    y: 0.0005066978948139312,
+    yaw: 0.0,
+  };
+}
+
 export async function pinkyFetch(
   pathname: string,
   init?: RequestInit,

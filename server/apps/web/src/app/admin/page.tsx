@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { OccupancyNavMap } from "@/components/OccupancyNavMap";
 
@@ -21,28 +21,7 @@ type Battery = {
 };
 
 type Lidar = {
-  rangesCount?: number;
-  rangesSample?: number[];
-  range_min?: number;
-  range_max?: number;
-  rangeMin?: number;
-  rangeMax?: number;
-  frame_id?: string;
-  frameId?: string;
-  stamp?: number | null;
   points?: { x: number; y: number; r?: number }[];
-  angleMin?: number;
-  angleIncrement?: number;
-  source?: string;
-  isDummy?: boolean;
-};
-
-type Imu = {
-  orientation?: { x: number; y: number; z: number; w: number };
-  angularVelocity?: { x: number; y: number; z: number };
-  linearAcceleration?: { x: number; y: number; z: number };
-  frameId?: string;
-  stamp?: number | null;
   source?: string;
   isDummy?: boolean;
 };
@@ -63,14 +42,12 @@ type Snapshot = {
   online?: boolean;
   battery?: Battery;
   lidar?: Lidar;
-  imu?: Imu;
   ultrasonic?: Ultrasonic;
   pose?: { x: number; y: number; yaw: number } | null;
   navigating?: boolean;
   hasData?: {
     battery?: boolean;
     lidar?: boolean;
-    imu?: boolean;
     ultrasonic?: boolean;
   };
   warnings?: string[];
@@ -108,6 +85,26 @@ type OrderAssignment = {
   } | null;
 };
 
+type MissionListItem = {
+  id: number;
+  orderId: number;
+  deviceCode?: string | null;
+  status: string;
+  createdAt?: string;
+  currentWaypoint?: string | null;
+  order?: {
+    id: number;
+    status: string;
+    totalPrice: number;
+    createdAt?: string;
+    items: {
+      productName: string;
+      unitPrice: number;
+      quantity: number;
+    }[];
+  } | null;
+};
+
 type RobotMonitor = {
   id: string;
   label: string;
@@ -125,6 +122,17 @@ type RobotsResponse = {
   count: number;
   queueLength?: number;
 };
+
+const ROBOT_COLORS: Record<string, string> = {
+  "cart-1": "#1f6f6a",
+  "cart-2": "#c45c26",
+};
+
+function robotColor(id: string, index: number): string {
+  if (ROBOT_COLORS[id]) return ROBOT_COLORS[id];
+  const fallback = ["#1f6f6a", "#c45c26", "#3d5a80", "#8b5e34"];
+  return fallback[index % fallback.length];
+}
 
 function fmt(n: number | null | undefined, digits = 2): string {
   if (n == null || Number.isNaN(n)) return "—";
@@ -149,23 +157,6 @@ function isDummySensor(
   return DUMMY_SOURCES.has((source || "").toLowerCase().trim());
 }
 
-function DummyTag({ show }: { show: boolean }) {
-  if (!show) return null;
-  return (
-    <span
-      className="error"
-      style={{
-        marginLeft: "0.35rem",
-        fontSize: "0.8em",
-        fontWeight: 600,
-        whiteSpace: "nowrap",
-      }}
-    >
-      · 더미값
-    </span>
-  );
-}
-
 const MISSION_STATUS_LABEL: Record<string, string> = {
   CREATED: "대기열",
   ASSIGNED: "할당됨",
@@ -181,7 +172,13 @@ function missionStatusLabel(status: string): string {
   return MISSION_STATUS_LABEL[status] || status;
 }
 
-function RobotBlock({ robot }: { robot: RobotMonitor }) {
+function CartStatusPanel({
+  robot,
+  color,
+}: {
+  robot: RobotMonitor;
+  color: string;
+}) {
   const health = robot.health;
   const snap = robot.sensors;
   const backend = health?.backend || snap?.backend;
@@ -195,344 +192,99 @@ function RobotBlock({ robot }: { robot: RobotMonitor }) {
     snap?.ultrasonic?.isDummy,
     backend,
   );
-  const imuDummy = isDummySensor(
-    snap?.imu?.source,
-    snap?.imu?.isDummy,
-    backend,
-  );
-  const lidarDummy = isDummySensor(
-    snap?.lidar?.source,
-    snap?.lidar?.isDummy,
-    backend,
-  );
-  const hd = snap?.hasData;
-  const allMissing =
-    hd && !hd.battery && !hd.imu && !hd.ultrasonic && !hd.lidar;
-  const partial =
-    hd &&
-    (hd.battery || hd.imu || hd.ultrasonic || hd.lidar) &&
-    (snap?.warnings?.length ?? 0) > 0;
+  const pose = robot.nav?.pose || snap?.pose || null;
+  const navigating = Boolean(robot.nav?.navigating || snap?.navigating);
+  const connected = robot.online && (health?.online ?? true);
+  const linkLabel = connected
+    ? "Online"
+    : robot.online
+      ? "Offline"
+      : "연결실패";
+  const assign = robot.assignment;
+  const order = assign?.order;
+  const itemsShort = order
+    ? order.items.map((it) => `${it.productName}×${it.quantity}`).join(", ")
+    : "";
+  const battPct = snap?.battery?.percent;
+  const usRange = snap?.ultrasonic?.rangeM;
 
   return (
-    <section className="robot-block">
-      <header className="robot-block-head">
-        <div>
-          <h2 className="robot-block-title">{robot.label}</h2>
-          <p className="muted robot-block-url">{robot.url}</p>
-        </div>
-        <div className="robot-block-status">
-          <span
-            className={`status-dot ${robot.online && (health?.online ?? true) ? "on" : "off"}`}
-          />
-          {robot.online
-            ? health?.online === false
-              ? "Offline"
-              : "Online"
-            : "연결 실패"}
-        </div>
-      </header>
+    <section className="cart-status-panel" style={{ borderLeftColor: color }}>
+      <div className="cart-status-compact-head">
+        <span className="cart-color-swatch" style={{ background: color }} />
+        <strong className="cart-status-name">{robot.label}</strong>
+        <span className={`status-dot ${connected ? "on" : "off"}`} />
+        <span className="cart-status-link">{linkLabel}</span>
+        <span className="cart-status-pill">
+          {navigating ? "주행" : "대기"}
+        </span>
+        {backend === "mock" ? (
+          <span className="error cart-status-pill">mock</span>
+        ) : null}
+      </div>
 
       {robot.error ? (
-        <p className="error" style={{ marginBottom: "0.75rem" }}>
-          {robot.error}
-        </p>
+        <p className="error cart-status-err">{robot.error}</p>
       ) : null}
 
-      {(health?.backend || snap?.backend) === "mock" ? (
-        <div className="error" style={{ marginBottom: "0.75rem" }}>
-          <strong>더미(mock) 백엔드입니다</strong>
-          <p className="muted" style={{ margin: "0.5rem 0 0" }}>
-            BFF는 로봇(<code>{robot.url}</code>)에 정상 연결되었지만, 로봇의{" "}
-            <code>run.py</code>가 <code>PINKY_BACKEND=mock</code> 으로 떠 있습니다.
-            라즈베리에서 <code>pinky.env</code>에 <code>PINKY_BACKEND=ros2</code> 확인 후
-            기존 프로세스를 종료하고 재시작하세요.
-          </p>
-          <pre
-            className="muted"
+      <div className="cart-kv">
+        <div>
+          <span>배터리</span>
+          <b>
+            {fmt(battPct, 0)}%
+            {snap?.battery?.voltage != null
+              ? ` · ${fmt(snap.battery.voltage, 2)}V`
+              : ""}
+            {battDummy ? <em className="error"> 더미</em> : null}
+          </b>
+        </div>
+        <div className="cart-batt-mini">
+          <i
             style={{
-              margin: "0.6rem 0 0",
-              whiteSpace: "pre-wrap",
-              fontSize: "0.85rem",
+              width: `${Math.min(100, Math.max(0, battPct ?? 0))}%`,
+              background: color,
             }}
-          >
-            {`# 로봇(SSH)에서
-curl -sS http://127.0.0.1:4200/health   # backend 확인
-pkill -f 'python.*run.py' || true
-cd ~/pinky && source /opt/ros/jazzy/setup.bash
-.venv/bin/python run.py
-# 로그에 backend=ros2 가 보여야 함`}
-          </pre>
-        </div>
-      ) : null}
-
-      {allMissing ? (
-        <div className="error" style={{ marginBottom: "0.75rem" }}>
-          <strong>센서 데이터가 없습니다</strong>
-          <p className="muted" style={{ margin: "0.5rem 0 0" }}>
-            로봇 `run.py`(PINKY_BACKEND=ros2)와 해당 URL을 확인하세요.
-          </p>
-        </div>
-      ) : null}
-
-      {partial ? (
-        <div
-          className="muted"
-          style={{
-            marginBottom: "0.75rem",
-            padding: "0.75rem 1rem",
-            border: "1px solid var(--line)",
-            background: "rgba(255,255,255,0.4)",
-          }}
-        >
-          <strong style={{ color: "var(--ink)" }}>일부 센서만 수신</strong>
-          <ul style={{ margin: "0.4rem 0 0", paddingLeft: "1.2rem" }}>
-            {(snap?.warnings || []).map((w) => (
-              <li key={w}>{w}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      <div className="monitor-grid">
-        <div className="monitor-card monitor-card-wide">
-          <h3>할당 주문</h3>
-          {robot.assignment?.order ? (
-            <>
-              <dl className="monitor-dl">
-                <div>
-                  <dt>주문</dt>
-                  <dd>#{robot.assignment.order.id}</dd>
-                </div>
-                <div>
-                  <dt>상태</dt>
-                  <dd>{missionStatusLabel(robot.assignment.status)}</dd>
-                </div>
-                <div>
-                  <dt>경유지</dt>
-                  <dd>
-                    {robot.assignment.currentWaypoint
-                      ? `${robot.assignment.currentWaypoint}${
-                          robot.assignment.currentWaypointLabel
-                            ? ` · ${robot.assignment.currentWaypointLabel}`
-                            : ""
-                        }`
-                      : "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>합계</dt>
-                  <dd>
-                    {robot.assignment.order.totalPrice.toLocaleString("ko-KR")}원
-                  </dd>
-                </div>
-              </dl>
-              <ul
-                style={{
-                  margin: "0.5rem 0 0",
-                  paddingLeft: "1.2rem",
-                  fontSize: "0.9rem",
-                }}
-              >
-                {robot.assignment.order.items.map((it, idx) => (
-                  <li key={`${it.productName}-${idx}`}>
-                    {it.productName} × {it.quantity}
-                  </li>
-                ))}
-              </ul>
-            </>
-          ) : (
-            <p className="muted" style={{ margin: 0 }}>
-              대기 중 (idle) — 할당된 주문이 없습니다.
-            </p>
-          )}
-        </div>
-
-        <div className="monitor-card">
-          <h3>연결</h3>
-          <dl className="monitor-dl">
-            <div>
-              <dt>상태</dt>
-              <dd>
-                <span
-                  className={`status-dot ${robot.online && (health?.online ?? true) ? "on" : "off"}`}
-                />
-                {robot.online
-                  ? health?.online === false
-                    ? "Offline"
-                    : "Online"
-                  : "연결 실패"}
-              </dd>
-            </div>
-            <div>
-              <dt>Backend</dt>
-              <dd>{health?.backend || snap?.backend || "—"}</dd>
-            </div>
-            <div>
-              <dt>Device</dt>
-              <dd>{health?.deviceCode || snap?.deviceCode || robot.id}</dd>
-            </div>
-            <div>
-              <dt>Publisher</dt>
-              <dd>
-                {health?.sensorPublisher == null
-                  ? "—"
-                  : health.sensorPublisher
-                    ? "ON"
-                    : "OFF"}
-              </dd>
-            </div>
-          </dl>
-        </div>
-
-        <div className="monitor-card">
-          <h3>
-            배터리
-            <DummyTag show={battDummy} />
-          </h3>
-          <p className="monitor-metric">
-            {fmt(snap?.battery?.percent, 1)}
-            <small>%</small>
-          </p>
-          <dl className="monitor-dl">
-            <div>
-              <dt>전압</dt>
-              <dd>{fmt(snap?.battery?.voltage, 3)} V</dd>
-            </div>
-            <div>
-              <dt>소스</dt>
-              <dd>
-                {snap?.battery?.source || "—"}
-                {battDummy ? <span className="error"> (더미값)</span> : null}
-              </dd>
-            </div>
-          </dl>
-          <div className="battery-bar">
-            <i
-              style={{
-                width: `${Math.min(100, Math.max(0, snap?.battery?.percent ?? 0))}%`,
-              }}
-            />
-          </div>
-          {battDummy ? (
-            <p className="error" style={{ marginTop: "0.75rem", marginBottom: 0 }}>
-              표시 값은 더미(fallback/mock)입니다. 실측 ADC·battery publisher를 확인하세요.
-            </p>
-          ) : !snap?.hasData?.battery ? (
-            <p className="muted" style={{ marginTop: "0.75rem", marginBottom: 0 }}>
-              측정값 없음
-            </p>
-          ) : null}
-        </div>
-
-        <div className="monitor-card">
-          <h3>
-            초음파 / IR
-            <DummyTag show={usDummy} />
-          </h3>
-          <p className="monitor-metric">
-            {fmt(snap?.ultrasonic?.rangeM, 3)}
-            <small>m</small>
-          </p>
-          <dl className="monitor-dl">
-            <div>
-              <dt>범위</dt>
-              <dd>
-                {fmt(snap?.ultrasonic?.minRange, 2)} –{" "}
-                {fmt(snap?.ultrasonic?.maxRange, 2)} m
-              </dd>
-            </div>
-            <div>
-              <dt>IR raw</dt>
-              <dd>{(snap?.ultrasonic?.irRaw || []).join(", ") || "—"}</dd>
-            </div>
-            <div>
-              <dt>소스</dt>
-              <dd>
-                {snap?.ultrasonic?.source || "—"}
-                {usDummy ? <span className="error"> (더미값)</span> : null}
-              </dd>
-            </div>
-          </dl>
-        </div>
-
-        <div className="monitor-card monitor-card-wide">
-          <h3>
-            IMU
-            <DummyTag show={imuDummy} />
-          </h3>
-          <div className="imu-grid">
-            <div>
-              <h4>Orientation</h4>
-              <pre>
-                {JSON.stringify(snap?.imu?.orientation || {}, null, 2)}
-              </pre>
-            </div>
-            <div>
-              <h4>Angular velocity</h4>
-              <pre>
-                {JSON.stringify(snap?.imu?.angularVelocity || {}, null, 2)}
-              </pre>
-            </div>
-            <div>
-              <h4>Linear acceleration</h4>
-              <pre>
-                {JSON.stringify(snap?.imu?.linearAcceleration || {}, null, 2)}
-              </pre>
-            </div>
-          </div>
-          <p className="muted" style={{ marginTop: "0.5rem", marginBottom: 0 }}>
-            소스: {snap?.imu?.source || "—"}
-            {imuDummy ? <span className="error"> (더미값)</span> : null}
-          </p>
-        </div>
-
-        <div className="monitor-card monitor-card-wide">
-          <h3>
-            맵 · 네비게이션
-            <DummyTag show={lidarDummy} />
-          </h3>
-          <p className="muted" style={{ marginTop: 0, fontSize: "0.85rem" }}>
-            좌드래그: 현재 pose · 우드래그: 목표 위치+최종 yaw (Nav2 goal)
-          </p>
-          <dl className="monitor-dl">
-            <div>
-              <dt>라이다</dt>
-              <dd>
-                {snap?.lidar?.points?.length ?? 0} pts
-                {robot.nav?.mapId ? ` · map ${robot.nav.mapId}` : ""}
-              </dd>
-            </div>
-            <div>
-              <dt>주행</dt>
-              <dd>
-                {robot.nav?.navigating || snap?.navigating
-                  ? "navigating"
-                  : "idle"}
-              </dd>
-            </div>
-            <div>
-              <dt>현재 좌표</dt>
-              <dd>
-                {(() => {
-                  const p = robot.nav?.pose || snap?.pose;
-                  return p
-                    ? `x=${p.x.toFixed(3)}, y=${p.y.toFixed(3)}, yaw=${p.yaw.toFixed(3)}`
-                    : "—";
-                })()}
-              </dd>
-            </div>
-          </dl>
-          <OccupancyNavMap
-            robotId={robot.id}
-            lidarPoints={snap?.lidar?.points || []}
-            pose={
-              robot.nav?.pose ||
-              snap?.pose ||
-              null
-            }
-            navigating={Boolean(robot.nav?.navigating || snap?.navigating)}
           />
         </div>
+        <div>
+          <span>초음파</span>
+          <b>
+            {fmt(usRange, 2)}m
+            {(snap?.ultrasonic?.irRaw || []).length
+              ? ` · IR ${(snap?.ultrasonic?.irRaw || []).join("/")}`
+              : ""}
+            {usDummy ? <em className="error"> 더미</em> : null}
+          </b>
+        </div>
+        <div>
+          <span>좌표</span>
+          <b className="cart-mono">
+            {pose
+              ? `${pose.x.toFixed(2)}, ${pose.y.toFixed(2)}, ${pose.yaw.toFixed(2)}`
+              : "—"}
+          </b>
+        </div>
+        <div>
+          <span>주문</span>
+          <b>
+            {order
+              ? `#${order.id} · ${missionStatusLabel(assign?.status || "")}${
+                  assign?.currentWaypoint
+                    ? ` · ${assign.currentWaypoint}`
+                    : ""
+                }`
+              : "없음 (idle)"}
+          </b>
+        </div>
+        {order ? (
+          <div>
+            <span>품목</span>
+            <b className="cart-items-one-line" title={itemsShort}>
+              {itemsShort || "—"}
+              {` · ${order.totalPrice.toLocaleString("ko-KR")}원`}
+            </b>
+          </div>
+        ) : null}
       </div>
     </section>
   );
@@ -541,22 +293,43 @@ cd ~/pinky && source /opt/ros/jazzy/setup.bash
 export default function AdminRobotPage() {
   const [robots, setRobots] = useState<RobotMonitor[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
+  const [missions, setMissions] = useState<MissionListItem[]>([]);
   const [queueLength, setQueueLength] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
   const [auto, setAuto] = useState(true);
+  const [controlRobotId, setControlRobotId] = useState<string>("");
+  const mapColRef = useRef<HTMLDivElement>(null);
+  const sideColRef = useRef<HTMLDivElement>(null);
+
+  const syncSideHeight = useCallback(() => {
+    const left = mapColRef.current;
+    const right = sideColRef.current;
+    if (!left || !right) return;
+    // 왼쪽(맵 600 고정) 높이에 오른쪽을 맞춤
+    right.style.height = `${left.offsetHeight}px`;
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
-      const [res, d] = await Promise.all([
+      const [res, d, m] = await Promise.all([
         api<RobotsResponse>("/admin/robots"),
         api<Device[]>("/admin/robot/devices").catch(() => [] as Device[]),
+        api<MissionListItem[]>("/admin/robot/missions").catch(
+          () => [] as MissionListItem[],
+        ),
       ]);
-      setRobots(res.robots || []);
+      const list = res.robots || [];
+      setRobots(list);
       setQueueLength(res.queueLength ?? 0);
       setDevices(d);
+      setMissions(Array.isArray(m) ? m : []);
       setError(null);
       setUpdatedAt(new Date().toLocaleTimeString("ko-KR"));
+      setControlRobotId((prev) => {
+        if (prev && list.some((r) => r.id === prev)) return prev;
+        return list[0]?.id || "";
+      });
     } catch (err) {
       setError(
         err instanceof Error
@@ -576,6 +349,42 @@ export default function AdminRobotPage() {
     return () => window.clearInterval(id);
   }, [auto, refresh]);
 
+  const mapRobotId = useMemo(() => {
+    const online = robots.find((r) => r.online);
+    return online?.id || robots[0]?.id || "";
+  }, [robots]);
+
+  const mapOverlays = useMemo(
+    () =>
+      robots.map((r, i) => ({
+        id: r.id,
+        label: r.label,
+        color: robotColor(r.id, i),
+        pose: r.nav?.pose || r.sensors?.pose || null,
+        navigating: Boolean(r.nav?.navigating || r.sensors?.navigating),
+        lidarPoints: r.sensors?.lidar?.points || [],
+      })),
+    [robots],
+  );
+
+  // 왼쪽 맵(뷰포트 600 고정) 높이에 오른쪽 패널을 맞춤
+  useEffect(() => {
+    const left = mapColRef.current;
+    if (!left) return;
+    const run = () => syncSideHeight();
+    run();
+    const ro =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(run)
+        : null;
+    ro?.observe(left);
+    window.addEventListener("resize", run);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener("resize", run);
+    };
+  }, [syncSideHeight, robots.length, missions.length, mapRobotId, controlRobotId]);
+
   return (
     <div className="admin-panel">
       <div className="admin-panel-head">
@@ -584,7 +393,7 @@ export default function AdminRobotPage() {
             로봇 모니터링
           </h1>
           <p className="muted">
-            주행로봇별 영역 — 연결 · 할당 주문 · 배터리 · Occupancy 맵/네비
+            공유 맵 · 카트별 상태
             {robots.length ? ` (${robots.length}대)` : ""}
             {queueLength > 0 ? ` · 대기 큐 ${queueLength}건` : ""}
           </p>
@@ -623,14 +432,132 @@ export default function AdminRobotPage() {
         </p>
       ) : null}
 
-      <div className="robot-stack">
-        {robots.map((r) => (
-          <RobotBlock key={r.id} robot={r} />
-        ))}
-        {!robots.length && !error ? (
-          <p className="muted">등록된 로봇이 없습니다.</p>
-        ) : null}
-      </div>
+      {!robots.length && !error ? (
+        <p className="muted">등록된 로봇이 없습니다.</p>
+      ) : null}
+
+      {robots.length ? (
+        <div className="monitor-split">
+          <div className="monitor-map-col" ref={mapColRef}>
+            <div className="monitor-card monitor-map-card">
+              <h3>맵 · 네비게이션</h3>
+              <p className="muted" style={{ marginTop: 0, fontSize: "0.85rem" }}>
+                두 카트 pose를 한 맵에 표시합니다. 드롭다운으로 조종할 로봇을 고른 뒤
+                좌드래그(pose) · 우드래그(goal)로 제어하세요.
+              </p>
+              <div className="map-robot-legend">
+                {robots.map((r, i) => (
+                  <span key={r.id} className="map-robot-legend-item">
+                    <i style={{ background: robotColor(r.id, i) }} />
+                    {r.label}
+                  </span>
+                ))}
+              </div>
+              {mapRobotId && controlRobotId ? (
+                <OccupancyNavMap
+                  mapRobotId={mapRobotId}
+                  robots={mapOverlays}
+                  controlRobotId={controlRobotId}
+                  onControlRobotChange={setControlRobotId}
+                />
+              ) : null}
+            </div>
+          </div>
+
+          <div className="monitor-side-col" ref={sideColRef}>
+            {robots.map((r, i) => (
+              <CartStatusPanel
+                key={r.id}
+                robot={r}
+                color={robotColor(r.id, i)}
+              />
+            ))}
+            <section className="order-list-panel">
+              <header className="order-list-head">
+                <h3>주문 목록</h3>
+                <span className="muted">{missions.length}건</span>
+              </header>
+              <div className="order-list-scroll">
+                {missions.length ? (
+                  <ul className="order-list">
+                    {missions.map((m) => {
+                      const order = m.order;
+                      const items = order?.items || [];
+                      const itemsShort = items
+                        .map((it) => `${it.productName}×${it.quantity}`)
+                        .join(", ");
+                      const assigned = Boolean(m.deviceCode);
+                      const cartColor = m.deviceCode
+                        ? robotColor(m.deviceCode, 0)
+                        : undefined;
+                      return (
+                        <li key={m.id} className="order-list-item">
+                          <div className="order-list-row">
+                            <strong>#{m.orderId}</strong>
+                            <span className="order-list-status">
+                              {missionStatusLabel(m.status)}
+                            </span>
+                            {assigned ? (
+                              <span
+                                className="order-list-cart"
+                                style={
+                                  cartColor
+                                    ? {
+                                        borderColor: cartColor,
+                                        color: cartColor,
+                                      }
+                                    : undefined
+                                }
+                              >
+                                {m.deviceCode}
+                              </span>
+                            ) : (
+                              <span className="order-list-cart muted">
+                                미할당
+                              </span>
+                            )}
+                          </div>
+                          <div className="order-list-meta">
+                            <span>
+                              {(order?.totalPrice ?? 0).toLocaleString("ko-KR")}
+                              원
+                            </span>
+                            {m.currentWaypoint ? (
+                              <span>· {m.currentWaypoint}</span>
+                            ) : null}
+                            {m.createdAt || order?.createdAt ? (
+                              <span className="muted">
+                                ·{" "}
+                                {new Date(
+                                  m.createdAt || order?.createdAt || "",
+                                ).toLocaleString("ko-KR", {
+                                  month: "numeric",
+                                  day: "numeric",
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                })}
+                              </span>
+                            ) : null}
+                          </div>
+                          {itemsShort ? (
+                            <p className="order-list-items" title={itemsShort}>
+                              {itemsShort}
+                            </p>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : (
+                  <p className="muted" style={{ margin: 0, fontSize: "0.85rem" }}>
+                    주문이 없습니다.
+                  </p>
+                )}
+              </div>
+            </section>
+          </div>
+        </div>
+      ) : null}
 
       <section className="robot-block robot-block-devices">
         <header className="robot-block-head">

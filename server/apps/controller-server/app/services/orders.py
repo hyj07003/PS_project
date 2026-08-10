@@ -54,6 +54,45 @@ class OrdersService:
         self._dwell_sec = float(os.environ.get("PICK_DWELL_SEC", "3"))
         self._nav_timeout = float(os.environ.get("PICK_NAV_TIMEOUT_SEC", "180"))
 
+    def sync_device_home_poses(self, *, only_idle: bool = True) -> None:
+        """
+        PINKY_ROBOTS 키 기준 cart-1→S1, cart-2→S2 initialpose.
+        (로봇 pinky.env 의 PINKY_DEVICE_CODE 가 잘못돼도 URL 매핑으로 교정)
+        """
+        codes = list(getattr(self.cart_port, "urls", {}) or {})
+        if not codes:
+            codes = ["cart-1", "cart-2"]
+        for code in codes:
+            try:
+                if not self.cart_port.is_reachable(code):
+                    continue
+                if only_idle:
+                    row = self.conn.execute(
+                        """
+                        SELECT m.id FROM missions m
+                        JOIN devices d ON d.id = m.device_id
+                        WHERE d.code = ?
+                          AND m.status IN (
+                            'ASSIGNED', 'PICKING', 'CHECKOUT',
+                            'PACKING', 'RETURNING'
+                          )
+                        LIMIT 1
+                        """,
+                        (code,),
+                    ).fetchone()
+                    if row:
+                        continue
+                home = home_for_device(code)
+                self.cart_port.set_initial_pose(
+                    code, home.x, home.y, HOME_YAW
+                )
+                time.sleep(0.35)
+                self.cart_port.set_initial_pose(
+                    code, home.x, home.y, HOME_YAW
+                )
+            except Exception:
+                pass
+
     def get_by_id(self, order_id: int) -> dict[str, Any]:
         order = self.conn.execute(
             "SELECT * FROM orders WHERE id = ?",

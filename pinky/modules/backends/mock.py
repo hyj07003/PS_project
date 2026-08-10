@@ -32,7 +32,13 @@ class MockBackend(RobotBackend):
         self._brightness = 128
         self._emotion = "basic"
         self._cmd_vel = {"linearX": 0.0, "angularZ": 0.0}
-        self._nav_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+        try:
+            from ..home_poses import home_pose_for_device
+
+            hx, hy, hyaw = home_pose_for_device()
+            self._nav_pose = {"x": hx, "y": hy, "yaw": hyaw}
+        except Exception:
+            self._nav_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
         self._nav_goal: dict[str, float] | None = None
         self._is_navigating = False
         self._nav_goal_t0 = 0.0
