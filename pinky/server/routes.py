@@ -39,6 +39,7 @@ def index():
                 "GET /map/meta",
                 "GET /map/image",
                 "GET /nav/state",
+                "GET /nav/plan",
                 "POST /nav/initialpose",
                 "POST /nav/goal",
                 "POST /nav/goal_wait",
@@ -163,6 +164,12 @@ def map_image():
 @bp.get("/nav/state")
 def nav_state():
     return jsonify(_robot().navigation.state())
+
+
+@bp.get("/nav/plan")
+def nav_plan():
+    """Nav2 /plan (global path) snapshot for remote clients."""
+    return jsonify(_robot().navigation.get_plan())
 
 
 @bp.post("/nav/initialpose")

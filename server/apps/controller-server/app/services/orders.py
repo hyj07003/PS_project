@@ -53,45 +53,165 @@ class OrdersService:
         self.ai_port = MockAiAdapter()
         self._dwell_sec = float(os.environ.get("PICK_DWELL_SEC", "3"))
         self._nav_timeout = float(os.environ.get("PICK_NAV_TIMEOUT_SEC", "180"))
+        self._aborted_missions: set[int] = set()
+        self._abort_lock = threading.Lock()
+        self._returning_home: set[str] = set()
+
+    def _mark_aborted(self, mission_id: int) -> None:
+        with self._abort_lock:
+            self._aborted_missions.add(mission_id)
+
+    def _clear_aborted(self, mission_id: int) -> None:
+        with self._abort_lock:
+            self._aborted_missions.discard(mission_id)
+
+    def _is_aborted(self, mission_id: int) -> bool:
+        with self._abort_lock:
+            return mission_id in self._aborted_missions
+
+    def _ensure_not_aborted(self, mission_id: int) -> None:
+        if self._is_aborted(mission_id):
+            raise RuntimeError("aborted by operator (stop)")
+
+    def _active_mission_for_device(self, device_code: str):
+        return self.conn.execute(
+            """
+            SELECT m.id, m.order_id, m.status, d.id AS device_id, d.code
+            FROM missions m
+            JOIN devices d ON d.id = m.device_id
+            WHERE d.code = ?
+              AND m.status IN (
+                'ASSIGNED', 'PICKING', 'CHECKOUT', 'PACKING', 'RETURNING'
+              )
+            ORDER BY m.id DESC
+            LIMIT 1
+            """,
+            (device_code,),
+        ).fetchone()
+
+    def abort_device(self, device_code: str) -> dict[str, Any]:
+        """
+        주행 정지: Nav2 stop + 활성 미션 FAILED.
+        그 자리에 멈춤 (홈 복귀 없음).
+        """
+        code = (device_code or "").strip()
+        if not code:
+            raise ApiError(400, "deviceCode required")
+
+        mission = self._active_mission_for_device(code)
+        try:
+            self.cart_port.stop_nav(code)
+        except Exception:
+            pass
+
+        aborted_mission = None
+        if mission:
+            mid = int(mission["id"])
+            oid = int(mission["order_id"])
+            self._mark_aborted(mid)
+            # 투어 스레드가 홈 복귀하지 않도록 즉시 FAILED
+            if mission["status"] != "FAILED":
+                self._set_waypoint(mid, None)
+                self._set_status(
+                    oid,
+                    mid,
+                    "FAILED",
+                    note="failed:operator stop — stayed in place",
+                )
+            self._release_device(mid)
+            aborted_mission = {
+                "id": mid,
+                "orderId": oid,
+                "status": "FAILED",
+            }
+
+        threading.Thread(target=self.try_dispatch, daemon=True).start()
+        return {
+            "ok": True,
+            "deviceCode": code,
+            "stopped": True,
+            "mission": aborted_mission,
+        }
+
+    def return_home_device(self, device_code: str) -> dict[str, Any]:
+        """
+        활성 작업이 있으면 FAILED 처리 후, 해당 카트 대기장소(S1/S2)로 복귀.
+        """
+        code = (device_code or "").strip()
+        if not code:
+            raise ApiError(400, "deviceCode required")
+
+        abort_info = self.abort_device(code)
+        home = home_for_device(code)
+
+        with self._abort_lock:
+            if code in self._returning_home:
+                return {
+                    "ok": True,
+                    "deviceCode": code,
+                    "home": home.id,
+                    "alreadyReturning": True,
+                    "mission": abort_info.get("mission"),
+                }
+            self._returning_home.add(code)
+
+        # 복귀 중 busy 유지 (다른 주문 할당 방지)
+        self.conn.execute(
+            "UPDATE devices SET status = 'busy' WHERE code = ?",
+            (code,),
+        )
+        self.conn.commit()
+
+        def _go() -> None:
+            try:
+                try:
+                    self.cart_port.stop_nav(code)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+                # 미션 없이 홈으로 이동
+                attempts = max(1, int(os.environ.get("PICK_NAV_RETRIES", "3")))
+                for attempt in range(1, attempts + 1):
+                    result = self.cart_port.navigate_pose(
+                        code,
+                        home.x,
+                        home.y,
+                        HOME_YAW,
+                        timeout_sec=self._nav_timeout,
+                        require_yaw=False,
+                    )
+                    if result == "ARRIVED":
+                        break
+                    if attempt < attempts:
+                        time.sleep(1.0)
+            finally:
+                with self._abort_lock:
+                    self._returning_home.discard(code)
+                self.conn.execute(
+                    "UPDATE devices SET status = 'idle' WHERE code = ?",
+                    (code,),
+                )
+                self.conn.commit()
+                threading.Thread(target=self.try_dispatch, daemon=True).start()
+
+        threading.Thread(
+            target=_go, name=f"return-home-{code}", daemon=True
+        ).start()
+        return {
+            "ok": True,
+            "deviceCode": code,
+            "home": {"id": home.id, "x": home.x, "y": home.y, "yaw": HOME_YAW},
+            "returning": True,
+            "mission": abort_info.get("mission"),
+        }
 
     def sync_device_home_poses(self, *, only_idle: bool = True) -> None:
+        """홈 initialpose 자동 동기화는 하지 않는다.
+
+        과거: idle/pose 공백 때 S1/S2 를 넣어 작업 중 멈칫·dwell 레이스로
+        대기장소 점프가 반복됨. 홈 시드는 로봇 pinky 부트 루프만 담당.
         """
-        PINKY_ROBOTS 키 기준 cart-1→S1, cart-2→S2 initialpose.
-        (로봇 pinky.env 의 PINKY_DEVICE_CODE 가 잘못돼도 URL 매핑으로 교정)
-        """
-        codes = list(getattr(self.cart_port, "urls", {}) or {})
-        if not codes:
-            codes = ["cart-1", "cart-2"]
-        for code in codes:
-            try:
-                if not self.cart_port.is_reachable(code):
-                    continue
-                if only_idle:
-                    row = self.conn.execute(
-                        """
-                        SELECT m.id FROM missions m
-                        JOIN devices d ON d.id = m.device_id
-                        WHERE d.code = ?
-                          AND m.status IN (
-                            'ASSIGNED', 'PICKING', 'CHECKOUT',
-                            'PACKING', 'RETURNING'
-                          )
-                        LIMIT 1
-                        """,
-                        (code,),
-                    ).fetchone()
-                    if row:
-                        continue
-                home = home_for_device(code)
-                self.cart_port.set_initial_pose(
-                    code, home.x, home.y, HOME_YAW
-                )
-                time.sleep(0.35)
-                self.cart_port.set_initial_pose(
-                    code, home.x, home.y, HOME_YAW
-                )
-            except Exception:
-                pass
+        return
 
     def get_by_id(self, order_id: int) -> dict[str, Any]:
         order = self.conn.execute(
@@ -299,6 +419,9 @@ class OrdersService:
                 # Prefer reachable Pinky; skip offline cart-1 when only cart-2 is up
                 for cand in candidates:
                     code = str(cand["code"])
+                    with self._abort_lock:
+                        if code in self._returning_home:
+                            continue
                     if self.cart_port.is_reachable(code):
                         device = cand
                         break
@@ -426,12 +549,15 @@ class OrdersService:
         waypoint_id: str,
         *,
         require_yaw: bool = False,
+        mission_id: int | None = None,
     ) -> None:
         # Nav2 aborts/replans mid-leg often; retry before failing the whole tour.
         attempts = max(1, int(os.environ.get("PICK_NAV_RETRIES", "3")))
         yaw_tol = float(os.environ.get("PICK_HOME_YAW_TOL_RAD", "0.12"))
         last_detail = "unknown"
         for attempt in range(1, attempts + 1):
+            if mission_id is not None:
+                self._ensure_not_aborted(mission_id)
             result = self.cart_port.navigate_pose(
                 device_code,
                 x,
@@ -442,6 +568,8 @@ class OrdersService:
                 yaw_tol_rad=yaw_tol,
             )
             if result == "ARRIVED":
+                if mission_id is not None:
+                    self._ensure_not_aborted(mission_id)
                 return
             last_detail = getattr(self.cart_port, "last_nav_error", None) or "unknown"
             if attempt < attempts:
@@ -457,11 +585,13 @@ class OrdersService:
         mission_id: int,
         waypoint_id: str,
     ) -> None:
-        """Stop at goal, then wait PICK_DWELL_SEC (default 3s) before next goal."""
-        try:
-            self.cart_port.stop_nav(device_code)
-        except Exception:
-            pass
+        """웨이포인트 도착 후 PICK_DWELL_SEC(기본 3s) 대기.
+
+        stop_nav 를 호출하지 않는다. goal_wait 로 이미 도착한 뒤 stop 하면
+        AMCL idle-freeze 가 걸리고, 그 사이 pose 조회 실패 시 홈 initialpose
+        가 들어와 계산대 이동 중 대기장소로 점프한다.
+        """
+        self._ensure_not_aborted(mission_id)
         dwell = max(0.0, float(self._dwell_sec))
         self._set_waypoint(
             mission_id,
@@ -470,7 +600,10 @@ class OrdersService:
         )
         self._mission_note(mission_id, f"dwell start {waypoint_id} {dwell}s")
         if dwell > 0:
-            time.sleep(dwell)
+            end = time.time() + dwell
+            while time.time() < end:
+                self._ensure_not_aborted(mission_id)
+                time.sleep(min(0.25, end - time.time()))
         self._mission_note(mission_id, f"dwell end {waypoint_id}")
         self._set_waypoint(mission_id, waypoint_id)
 
@@ -494,9 +627,16 @@ class OrdersService:
         self._set_waypoint(mission_id, home.id)
         try:
             self._nav_or_fail(
-                device_code, home.x, home.y, HOME_YAW, home.id, require_yaw=False
+                device_code,
+                home.x,
+                home.y,
+                HOME_YAW,
+                home.id,
+                require_yaw=False,
+                mission_id=mission_id,
             )
             for align in range(1, 4):
+                self._ensure_not_aborted(mission_id)
                 pose = self.cart_port.get_pose(device_code)
                 if pose:
                     err = abs(
@@ -515,6 +655,7 @@ class OrdersService:
                     HOME_YAW,
                     f"{home.id}-yaw",
                     require_yaw=True,
+                    mission_id=mission_id,
                 )
             self._dwell_at(device_code, mission_id, home.id)
             return True
@@ -549,33 +690,26 @@ class OrdersService:
             self.ai_port.request_pick_plan(order_id)
             self.cart_port.notify_assign(device_code, order_id)
 
-            # 최초 이니셜 포즈: 홈(S1/S2), yaw=0 (+x)
-            self.cart_port.set_initial_pose(
-                device_code, home.x, home.y, HOME_YAW
-            )
-            settle = float(os.environ.get("PICK_INITIALPOSE_SETTLE_SEC", "2.5"))
-            time.sleep(max(0.5, settle * 0.5))
-            self.cart_port.set_initial_pose(
-                device_code, home.x, home.y, HOME_YAW
-            )
-            time.sleep(max(0.5, settle * 0.5))
-
-            # 방금 홈으로 리셋했으므로 투어 시작점은 홈 (낡은 TF pose 로 NN 꼬이지 않게)
-            start = home
+            # 현재 pose 기준 투어 시작. 홈 initialpose 는 넣지 않음
+            # (작업 중/재할당 시 대기장소 점프 방지 — pinky ensure 가 현재 pose 사용)
+            near_m = float(os.environ.get("PICK_HOME_POSE_NEAR_M", "0.4"))
             pose = self.cart_port.get_pose(device_code)
-            if pose:
+            start = home
+            if pose and pose.get("x") is not None and pose.get("y") is not None:
                 dx = float(pose["x"]) - home.x
                 dy = float(pose["y"]) - home.y
-                # AMCL 이 홈 근처로 수렴했을 때만 현재 pose 사용
-                if (dx * dx + dy * dy) ** 0.5 < 0.4:
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist < near_m:
+                    start = home
+                else:
                     from ..waypoints import Waypoint
 
                     start = Waypoint(
                         id="START",
                         label="current",
-                        x=pose["x"],
-                        y=pose["y"],
-                        yaw=float(pose.get("yaw") or home.yaw),
+                        x=float(pose["x"]),
+                        y=float(pose["y"]),
+                        yaw=float(pose.get("yaw") or HOME_YAW),
                     )
 
             rows = self.conn.execute(
@@ -594,23 +728,38 @@ class OrdersService:
             self._set_status(order_id, mission_id, "PICKING", note="pick tour start")
 
             for wp in tour:
+                self._ensure_not_aborted(mission_id)
                 self._set_waypoint(mission_id, wp.id)
-                self._nav_or_fail(device_code, wp.x, wp.y, wp.yaw, wp.id)
+                self._nav_or_fail(
+                    device_code,
+                    wp.x,
+                    wp.y,
+                    wp.yaw,
+                    wp.id,
+                    mission_id=mission_id,
+                )
                 self._dwell_at(device_code, mission_id, wp.id)
 
+            self._ensure_not_aborted(mission_id)
             self._set_status(order_id, mission_id, "CHECKOUT", note="checkout")
             c = get_waypoint("C")
             self._set_waypoint(mission_id, "C")
-            self._nav_or_fail(device_code, c.x, c.y, c.yaw, "C")
+            self._nav_or_fail(
+                device_code, c.x, c.y, c.yaw, "C", mission_id=mission_id
+            )
             self._dwell_at(device_code, mission_id, "C")
 
+            self._ensure_not_aborted(mission_id)
             self._set_status(order_id, mission_id, "PACKING", note="transport wait")
             p = get_waypoint("P")
             self._set_waypoint(mission_id, "P")
-            self._nav_or_fail(device_code, p.x, p.y, p.yaw, "P")
+            self._nav_or_fail(
+                device_code, p.x, p.y, p.yaw, "P", mission_id=mission_id
+            )
             self._dwell_at(device_code, mission_id, "P")
 
             # 대기장소 복귀 중 — 모니터링 할당은 이때까지 유지, 도착 후 COMPLETED
+            self._ensure_not_aborted(mission_id)
             self._set_status(
                 order_id, mission_id, "RETURNING", note="returning to wait spot"
             )
@@ -625,34 +774,39 @@ class OrdersService:
             )
             self._release_device(mission_id)
         except Exception as exc:
-            # Don't block forever on home return when pinky is already down
-            note = f"failed:{exc}"
-            try:
-                if self.cart_port.is_reachable(device_code):
-                    self._set_status(
-                        order_id,
-                        mission_id,
-                        "RETURNING",
-                        note=f"abort return home:{exc}",
-                    )
-                    home_ok = self._return_home(
-                        device_code,
-                        mission_id,
-                        stop_first=True,
-                        best_effort=True,
-                    )
-                    if home_ok:
-                        note = f"{note}; arrived wait spot"
+            if self._is_aborted(mission_id):
+                # 운영자 정지: 이미 FAILED 처리됨 — 그 자리 유지, 홈 복귀 안 함
+                pass
+            else:
+                # Don't block forever on home return when pinky is already down
+                note = f"failed:{exc}"
+                try:
+                    if self.cart_port.is_reachable(device_code):
+                        self._set_status(
+                            order_id,
+                            mission_id,
+                            "RETURNING",
+                            note=f"abort return home:{exc}",
+                        )
+                        home_ok = self._return_home(
+                            device_code,
+                            mission_id,
+                            stop_first=True,
+                            best_effort=True,
+                        )
+                        if home_ok:
+                            note = f"{note}; arrived wait spot"
+                        else:
+                            note = f"{note}; home return failed"
                     else:
-                        note = f"{note}; home return failed"
-                else:
-                    note = f"{note}; skip home (pinky unreachable)"
-            except Exception as home_exc:
-                note = f"{note}; home exc:{home_exc}"
-            self._set_waypoint(mission_id, None)
-            self._set_status(order_id, mission_id, "FAILED", note=note)
-            self._release_device(mission_id)
+                        note = f"{note}; skip home (pinky unreachable)"
+                except Exception as home_exc:
+                    note = f"{note}; home exc:{home_exc}"
+                self._set_waypoint(mission_id, None)
+                self._set_status(order_id, mission_id, "FAILED", note=note)
+                self._release_device(mission_id)
         finally:
+            self._clear_aborted(mission_id)
             threading.Thread(target=self.try_dispatch, daemon=True).start()
 
     def queue_length(self) -> int:

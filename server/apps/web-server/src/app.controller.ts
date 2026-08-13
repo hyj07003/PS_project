@@ -52,9 +52,8 @@ function normalizeDeviceCode(code: string | undefined | null): string {
   return c;
 }
 
-/** Idle 로봇이 홈에서 멀거나 DEVICE_CODE 불일치면 S1/S2 initialpose 재적용 (스로틀). */
-const homeSyncAt = new Map<string, number>();
-
+/** DEVICE_CODE mismatch 배지만. 홈 initialpose 자동 적용 금지
+ *  (작업 중 멈칫/폴링 때 대기장소 점프 원인). */
 async function ensureRobotHomePose(opts: {
   robotId: string;
   url: string;
@@ -66,38 +65,7 @@ async function ensureRobotHomePose(opts: {
   const expected = normalizeDeviceCode(opts.robotId);
   const reported = normalizeDeviceCode(opts.reportedDeviceCode);
   const mismatch = Boolean(reported && expected && reported !== expected);
-  if (opts.navigating || opts.hasActiveAssignment) {
-    return { synced: false, mismatch };
-  }
-  const home = homePoseForDevice(opts.robotId);
-  let far = true;
-  if (opts.pose && typeof opts.pose.x === "number") {
-    const dx = opts.pose.x - home.x;
-    const dy = opts.pose.y - home.y;
-    far = Math.hypot(dx, dy) > 0.35;
-  }
-  if (!mismatch && !far) {
-    return { synced: false, mismatch };
-  }
-  const now = Date.now();
-  const last = homeSyncAt.get(opts.robotId) || 0;
-  if (now - last < 15_000) {
-    return { synced: false, mismatch };
-  }
-  homeSyncAt.set(opts.robotId, now);
-  try {
-    await pinkyJson(
-      "/nav/initialpose",
-      {
-        method: "POST",
-        body: JSON.stringify({ x: home.x, y: home.y, yaw: home.yaw }),
-      },
-      opts.url,
-    );
-    return { synced: true, mismatch };
-  } catch {
-    return { synced: false, mismatch };
-  }
+  return { synced: false, mismatch };
 }
 
 @Controller()
@@ -462,11 +430,8 @@ export class AppController {
             navigating: Boolean(navObj?.navigating),
             hasActiveAssignment,
           });
-          // URL 역할(cart-2) 기준 홈 — DEVICE_CODE 오설정 시 모니터도 S2로
-          const pose =
-            homeFix.synced || homeFix.mismatch
-              ? home
-              : livePose || home;
+          // 실제 로봇 pose 우선 — mismatch만으로 모니터를 홈으로 덮지 않음
+          const pose = homeFix.synced ? home : livePose || home;
           const nav = {
             ...(navObj || {}),
             pose,
@@ -526,6 +491,16 @@ export class AppController {
       qs.set("includeOrder", "1");
       const q = qs.toString();
       return await controllerJson(`/missions${q ? `?${q}` : ""}`);
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Get("admin/robot/missions/:id")
+  @UseGuards(AdminGuard)
+  async robotMissionDetail(@Param("id") id: string) {
+    try {
+      return await controllerJson(`/missions/${encodeURIComponent(id)}`);
     } catch (err) {
       wrapError(err);
     }
@@ -608,10 +583,25 @@ export class AppController {
   @UseGuards(AdminGuard)
   async robotNavStop(@Query("robot") robot?: string) {
     try {
-      return await pinkyJson(
-        "/nav/stop",
+      const code = robot || listPinkyRobots()[0]?.id || "cart-1";
+      // 컨트롤러: 미션 FAILED + 자리 정지, Pinky stop 포함
+      return await controllerJson(`/devices/${encodeURIComponent(code)}/abort`, {
+        method: "POST",
+        body: "{}",
+      });
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Post("admin/robot/return-home")
+  @UseGuards(AdminGuard)
+  async robotReturnHome(@Query("robot") robot?: string) {
+    try {
+      const code = robot || listPinkyRobots()[0]?.id || "cart-1";
+      return await controllerJson(
+        `/devices/${encodeURIComponent(code)}/return-home`,
         { method: "POST", body: "{}" },
-        resolvePinkyUrl(robot),
       );
     } catch (err) {
       wrapError(err);

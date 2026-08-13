@@ -52,8 +52,8 @@ def create_app() -> Flask:
 
     # cart-1→S1, cart-2→S2 — URL 키 기준 (로봇 DEVICE_CODE 오설정 교정)
     def _home_pose_bootstrap() -> None:
-        # 초반 자주, 이후 idle 유지용으로 가끔 재적용
-        schedule = [2.0, 6.0, 12.0, 20.0, 35.0, 60.0, 90.0, 120.0]
+        # 초반 소수회만, 이후 idle 유지용으로 드물게 (AMCL idle freeze 깨우기 최소화)
+        schedule = [5.0, 25.0, 90.0]
         elapsed = 0.0
         for delay in schedule:
             time.sleep(max(0.1, delay - elapsed))
@@ -63,7 +63,7 @@ def create_app() -> Flask:
             except Exception:
                 pass
         while True:
-            time.sleep(45.0)
+            time.sleep(120.0)
             try:
                 orders.sync_device_home_poses(only_idle=True)
             except Exception:

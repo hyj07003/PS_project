@@ -839,6 +839,28 @@ img {
   font-size: 0.8rem;
 }
 
+.order-list-item-btn {
+  display: block;
+  width: 100%;
+  margin: 0;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  appearance: none;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.order-list-item-btn:hover {
+  background: rgba(255, 255, 255, 0.72);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+
+.order-list-item-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .order-list-row {
   display: flex;
   align-items: center;
@@ -877,6 +899,122 @@ img {
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--ink);
+}
+
+.mission-log-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(28, 24, 20, 0.45);
+}
+
+.mission-log-modal {
+  width: min(560px, 100%);
+  max-height: min(78vh, 640px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  background: var(--bg, #f3efe6);
+  box-shadow: 0 12px 40px rgba(20, 16, 12, 0.22);
+}
+
+.mission-log-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.85rem 1rem 0.65rem;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.mission-log-head h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+}
+
+.mission-log-sub {
+  margin: 0.25rem 0 0;
+  font-size: 0.8rem;
+}
+
+.mission-log-close {
+  flex-shrink: 0;
+  padding: 0.3rem 0.65rem;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.55);
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.mission-log-close:hover {
+  background: rgba(255, 255, 255, 0.85);
+}
+
+.mission-log-items {
+  margin: 0;
+  padding: 0.55rem 1rem 0.35rem;
+  font-size: 0.82rem;
+  flex-shrink: 0;
+}
+
+.mission-log-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.35rem 0.75rem 0.9rem;
+  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.mission-log-entry {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr;
+  gap: 0.45rem 0.65rem;
+  padding: 0.4rem 0.45rem;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.4);
+  font-size: 0.8rem;
+}
+
+.mission-log-time {
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.mission-log-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.mission-log-status {
+  font-weight: 650;
+}
+
+.mission-log-note {
+  color: var(--ink-soft);
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.74rem;
+  line-height: 1.4;
+}
+
+.mission-log-empty {
+  margin: 0.75rem 1rem;
+  font-size: 0.85rem;
 }
 
 .map-robot-legend {

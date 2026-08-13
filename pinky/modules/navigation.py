@@ -54,11 +54,51 @@ class NavigationModule:
     def cancel(self) -> dict[str, Any]:
         return self._backend.cancel_navigation()
 
+    def get_plan(self) -> dict[str, Any]:
+        getter = getattr(self._backend, "get_nav_plan", None)
+        if callable(getter):
+            try:
+                return getter() or {
+                    "ok": True,
+                    "frameId": "map",
+                    "stampSec": None,
+                    "pointCount": 0,
+                    "poses": [],
+                    "message": "no plan",
+                }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "frameId": "map",
+                    "stampSec": None,
+                    "pointCount": 0,
+                    "poses": [],
+                    "message": str(exc),
+                }
+        return {
+            "ok": True,
+            "frameId": "map",
+            "stampSec": None,
+            "pointCount": 0,
+            "poses": [],
+            "message": "no plan",
+        }
+
     def state(self) -> dict[str, Any]:
         info = self.map_info()
+        loc = {}
+        getter = getattr(self._backend, "get_localization_mode", None)
+        if callable(getter):
+            try:
+                loc = getter() or {}
+            except Exception:
+                loc = {}
         return {
             "pose": self.get_pose(),
             "navigating": self.is_navigating(),
             "mapId": info.get("mapId") if info else None,
             "map": info,
+            "amclActive": loc.get("amclActive"),
+            "localizationMode": loc.get("localizationMode") or "active",
+            "amclIdleFreeze": bool(loc.get("amclIdleFreeze")),
         }

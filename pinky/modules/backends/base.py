@@ -74,5 +74,22 @@ class RobotBackend(ABC):
         del timeout_sec
         return self.navigate_to(x, y, yaw)
 
-    def cancel_navigation(self) -> dict[str, Any]:
+    def cancel_navigation(self, *, freeze: bool = True) -> dict[str, Any]:
         return {"success": False, "message": "navigation not supported"}
+
+    def get_localization_mode(self) -> dict[str, Any]:
+        return {
+            "amclActive": None,
+            "localizationMode": "active",
+            "amclIdleFreeze": False,
+        }
+
+    def get_nav_plan(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "frameId": "map",
+            "stampSec": None,
+            "pointCount": 0,
+            "poses": [],
+            "message": "no plan",
+        }

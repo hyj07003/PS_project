@@ -162,6 +162,38 @@ class MockBackend(RobotBackend):
             "pose": dict(self._nav_pose),
         }
 
+    def get_localization_mode(self) -> dict[str, Any]:
+        return {
+            "amclActive": False,
+            "localizationMode": "idle",
+            "amclIdleFreeze": True,
+        }
+
+    def get_nav_plan(self) -> dict[str, Any]:
+        self._tick_nav()
+        if not self._nav_goal:
+            return {
+                "ok": True,
+                "frameId": "map",
+                "stampSec": None,
+                "pointCount": 0,
+                "poses": [],
+                "message": "no plan",
+            }
+        g = self._nav_goal
+        p = self._nav_pose
+        poses = [
+            {"x": float(p["x"]), "y": float(p["y"]), "yaw": float(p["yaw"])},
+            {"x": float(g["x"]), "y": float(g["y"]), "yaw": float(g["yaw"])},
+        ]
+        return {
+            "ok": True,
+            "frameId": "map",
+            "stampSec": time.time(),
+            "pointCount": len(poses),
+            "poses": poses,
+        }
+
     def navigate_to(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
         self._nav_goal = {"x": float(x), "y": float(y), "yaw": float(yaw)}
         self._nav_goal_t0 = time.time()
@@ -201,10 +233,10 @@ class MockBackend(RobotBackend):
             "message": "mock nav timeout",
         }
 
-    def cancel_navigation(self) -> dict[str, Any]:
+    def cancel_navigation(self, *, freeze: bool = True) -> dict[str, Any]:
         self._is_navigating = False
         self._nav_goal = None
-        return {"success": True, "message": "mock cancel ok"}
+        return {"success": True, "message": "mock cancel ok", "freeze": bool(freeze)}
 
     def _tick_nav(self) -> None:
         if not self._is_navigating or not self._nav_goal:

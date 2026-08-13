@@ -117,7 +117,8 @@ export CONTROLLER_URL=http://<PC_IP>:4100
 | POST   | `/cmd/navigate`           | Controller → 웨이포인트        |
 | GET    | `/map/meta`               | Occupancy 맵 메타 (yaml)      |
 | GET    | `/map/image`              | 맵 PNG (`PINKY_MAP`)        |
-| GET    | `/nav/state`              | pose · navigating · mapId |
+| GET    | `/nav/state`              | pose · navigating · mapId · amclActive · localizationMode |
+| GET    | `/nav/plan`               | Nav2 `/plan` 글로벌 경로 `{poses:[{x,y,yaw},...]}` |
 | POST   | `/nav/initialpose`        | `{x,y,yaw}` map 좌표 → AMCL |
 | POST   | `/nav/goal`               | `{x,y,yaw?}` → Nav2 goal (비동기) |
 | POST   | `/nav/goal_wait`          | 동일 + 도착/실패/타임아웃까지 대기     |
@@ -173,6 +174,25 @@ Controller에서 Pinky로 명령을내려면 `.env`에 `PINKY_URL=http://127.0.0
 사전: ROS2 + pinky_pro 워크스페이스 source, `ros2` CLI 사용 가능.
 
 끄려면: `PINKY_AUTO_LAUNCH=0` (수동으로 위 launch 실행).
+
+**중요: Nav2는 한 세트만.** `PINKY_AUTO_LAUNCH`와 수동 `ros2 launch pinky_navigation`을 동시에 켜면 `/bt_navigator` 등이 중복되어 goal이 무시됩니다.
+
+### 대기 중 AMCL lifecycle
+
+대기(idle)에서는 `/amcl`을 **deactivate**해 라이다로 pose가 점프하지 않게 합니다. NavigateToPose·수동 initialpose 직전에만 activate + `initialpose` 후 주행하고, 정지·도착 시 다시 deactivate합니다.
+
+| 변수 | 기본 | 설명 |
+|------|------|------|
+| `PINKY_AMCL_IDLE_FREEZE` | `1` | idle 시 AMCL deactivate |
+| `PINKY_AMCL_NODE` | `amcl` | lifecycle 노드명 |
+| `PINKY_LOCALIZE_SETTLE_SEC` | `1.0` | activate 후 settle |
+| `PINKY_AMCL_IDLE_FREEZE_DELAY_SEC` | `45.0` | 주행 종료 후 deactivate 유예 (투어 중 유지) |
+
+투어: **첫 goal(또는 AMCL off/대기 freeze)만** `initialpose`. 이후 구간은 AMCL을 켠 채 goal만 전송.
+
+`nav2_params.yaml` 의 `amcl.set_initial_pose` 는 **false** 로 둔다. true 이면 AMCL activate 시마다 yaml 홈(S1)으로 점프한다.
+
+`GET /nav/state`에 `amclActive`, `localizationMode` (`idle`|`active`)가 포함됩니다.
 
 ### HTTP 네비 API
 

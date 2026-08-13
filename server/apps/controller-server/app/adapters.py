@@ -287,7 +287,8 @@ class PinkyHttpCartAdapter:
                 device_code,
                 "/nav/goal",
                 {"x": x, "y": y, "yaw": yaw},
-                timeout=10.0,
+                # ensure localization(AMCL activate+settle) 포함
+                timeout=45.0,
                 accept_http_error=True,
             )
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:

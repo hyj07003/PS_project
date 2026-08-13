@@ -92,6 +92,7 @@ type MissionListItem = {
   status: string;
   createdAt?: string;
   currentWaypoint?: string | null;
+  currentWaypointLabel?: string | null;
   order?: {
     id: number;
     status: string;
@@ -103,6 +104,18 @@ type MissionListItem = {
       quantity: number;
     }[];
   } | null;
+};
+
+type MissionEvent = {
+  id: number;
+  fromStatus?: string | null;
+  toStatus?: string | null;
+  note?: string | null;
+  createdAt?: string | null;
+};
+
+type MissionDetail = MissionListItem & {
+  events?: MissionEvent[];
 };
 
 type RobotMonitor = {
@@ -299,8 +312,42 @@ export default function AdminRobotPage() {
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
   const [auto, setAuto] = useState(true);
   const [controlRobotId, setControlRobotId] = useState<string>("");
+  const [logMission, setLogMission] = useState<MissionDetail | null>(null);
+  const [logLoading, setLogLoading] = useState(false);
+  const [logError, setLogError] = useState<string | null>(null);
   const mapColRef = useRef<HTMLDivElement>(null);
   const sideColRef = useRef<HTMLDivElement>(null);
+
+  const openMissionLogs = useCallback(async (missionId: number) => {
+    setLogLoading(true);
+    setLogError(null);
+    setLogMission(null);
+    try {
+      const detail = await api<MissionDetail>(
+        `/admin/robot/missions/${missionId}`,
+      );
+      setLogMission(detail);
+    } catch (e) {
+      setLogError(e instanceof Error ? e.message : "로그를 불러오지 못했습니다");
+    } finally {
+      setLogLoading(false);
+    }
+  }, []);
+
+  const closeMissionLogs = useCallback(() => {
+    setLogMission(null);
+    setLogError(null);
+    setLogLoading(false);
+  }, []);
+
+  useEffect(() => {
+    if (!logLoading && !logMission && !logError) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeMissionLogs();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [logLoading, logMission, logError, closeMissionLogs]);
 
   const syncSideHeight = useCallback(() => {
     const left = mapColRef.current;
@@ -491,7 +538,13 @@ export default function AdminRobotPage() {
                         ? robotColor(m.deviceCode, 0)
                         : undefined;
                       return (
-                        <li key={m.id} className="order-list-item">
+                        <li key={m.id}>
+                          <button
+                            type="button"
+                            className="order-list-item order-list-item-btn"
+                            onClick={() => void openMissionLogs(m.id)}
+                            title="작업 로그 보기"
+                          >
                           <div className="order-list-row">
                             <strong>#{m.orderId}</strong>
                             <span className="order-list-status">
@@ -544,6 +597,7 @@ export default function AdminRobotPage() {
                               {itemsShort}
                             </p>
                           ) : null}
+                          </button>
                         </li>
                       );
                     })}
@@ -589,6 +643,113 @@ export default function AdminRobotPage() {
           </tbody>
         </table>
       </section>
+
+      {logLoading || logMission || logError ? (
+        <div
+          className="mission-log-backdrop"
+          role="presentation"
+          onClick={closeMissionLogs}
+        >
+          <div
+            className="mission-log-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mission-log-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="mission-log-head">
+              <div>
+                <h3 id="mission-log-title">
+                  {logMission
+                    ? `주문 #${logMission.orderId} 작업 로그`
+                    : "작업 로그"}
+                </h3>
+                {logMission ? (
+                  <p className="mission-log-sub muted">
+                    미션 #{logMission.id} ·{" "}
+                    {missionStatusLabel(logMission.status)}
+                    {logMission.deviceCode
+                      ? ` · ${logMission.deviceCode}`
+                      : ""}
+                    {logMission.currentWaypointLabel ||
+                    logMission.currentWaypoint
+                      ? ` · ${
+                          logMission.currentWaypointLabel ||
+                          logMission.currentWaypoint
+                        }`
+                      : ""}
+                  </p>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                className="mission-log-close"
+                onClick={closeMissionLogs}
+              >
+                닫기
+              </button>
+            </header>
+
+            {logLoading ? (
+              <p className="muted mission-log-empty">불러오는 중…</p>
+            ) : null}
+            {logError ? <p className="error mission-log-empty">{logError}</p> : null}
+
+            {!logLoading && logMission ? (
+              <>
+                {logMission.order?.items?.length ? (
+                  <p className="mission-log-items">
+                    {logMission.order.items
+                      .map((it) => `${it.productName}×${it.quantity}`)
+                      .join(", ")}
+                    {` · ${(logMission.order.totalPrice ?? 0).toLocaleString("ko-KR")}원`}
+                  </p>
+                ) : null}
+                <ol className="mission-log-list">
+                  {(logMission.events || []).length ? (
+                    (logMission.events || []).map((ev) => {
+                      const fromL = ev.fromStatus
+                        ? missionStatusLabel(ev.fromStatus)
+                        : "—";
+                      const toL = ev.toStatus
+                        ? missionStatusLabel(ev.toStatus)
+                        : "—";
+                      const same = ev.fromStatus === ev.toStatus;
+                      return (
+                        <li key={ev.id} className="mission-log-entry">
+                          <time className="mission-log-time">
+                            {ev.createdAt
+                              ? new Date(ev.createdAt).toLocaleString("ko-KR", {
+                                  month: "numeric",
+                                  day: "numeric",
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                  second: "2-digit",
+                                })
+                              : "—"}
+                          </time>
+                          <div className="mission-log-body">
+                            <span className="mission-log-status">
+                              {same ? toL : `${fromL} → ${toL}`}
+                            </span>
+                            {ev.note ? (
+                              <span className="mission-log-note">{ev.note}</span>
+                            ) : null}
+                          </div>
+                        </li>
+                      );
+                    })
+                  ) : (
+                    <li className="muted mission-log-empty">
+                      기록된 이벤트가 없습니다.
+                    </li>
+                  )}
+                </ol>
+              </>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

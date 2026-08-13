@@ -165,6 +165,18 @@ def reclaim_devices():
     )
 
 
+@bp.post("/devices/<code>/abort")
+def abort_device(code: str):
+    """운영자 주행 정지: 활성 미션 FAILED + 그 자리 정지."""
+    return jsonify(_orders().abort_device(code))
+
+
+@bp.post("/devices/<code>/return-home")
+def return_home_device(code: str):
+    """활성 작업 실패 처리 후 대기장소(S1/S2)로 복귀."""
+    return jsonify(_orders().return_home_device(code))
+
+
 def _robot():
     return current_app.extensions["services"]["robot"]
 

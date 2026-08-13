@@ -449,13 +449,54 @@ export function OccupancyNavMap({
     if (!controlRobotId) return;
     setBusy(true);
     try {
-      await api(`/admin/robot/nav/stop${controlQ}`, {
+      const res = await api<{
+        ok?: boolean;
+        mission?: { orderId?: number } | null;
+      }>(`/admin/robot/nav/stop${controlQ}`, {
         method: "POST",
         body: "{}",
       });
-      setStatus(`${controlRobot?.label || controlRobotId} 정지 요청`);
+      const who = controlRobot?.label || controlRobotId;
+      if (res.mission?.orderId) {
+        setStatus(
+          `${who} 정지 · 주문 #${res.mission.orderId} FAILED (그 자리 유지)`,
+        );
+      } else {
+        setStatus(`${who} 정지 (할당 작업 없음)`);
+      }
     } catch (err) {
       setStatus(err instanceof Error ? err.message : "stop 오류");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onReturnHome = async () => {
+    if (!controlRobotId) return;
+    setBusy(true);
+    try {
+      const res = await api<{
+        ok?: boolean;
+        home?: { id?: string };
+        alreadyReturning?: boolean;
+        mission?: { orderId?: number } | null;
+      }>(`/admin/robot/return-home${controlQ}`, {
+        method: "POST",
+        body: "{}",
+      });
+      const who = controlRobot?.label || controlRobotId;
+      const homeId = res.home?.id || "홈";
+      if (res.alreadyReturning) {
+        setStatus(`${who} 이미 ${homeId} 복귀 중`);
+      } else if (res.mission?.orderId) {
+        setStatus(
+          `${who} → ${homeId} 복귀 · 주문 #${res.mission.orderId} FAILED`,
+        );
+      } else {
+        setStatus(`${who} → ${homeId} 복귀 시작`);
+      }
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "복귀 오류");
     } finally {
       setBusy(false);
     }
@@ -487,6 +528,14 @@ export function OccupancyNavMap({
           onClick={() => void onStop()}
         >
           주행 정지
+        </button>
+        <button
+          type="button"
+          className="btn secondary"
+          disabled={busy || !controlRobotId}
+          onClick={() => void onReturnHome()}
+        >
+          복귀
         </button>
         <span className="muted" style={{ fontSize: "0.85rem" }}>
           {controlRobot?.navigating ? "주행 중" : "대기"}
