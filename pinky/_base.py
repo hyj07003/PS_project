@@ -58,6 +58,21 @@ class RobotBackend(ABC):
     def is_navigating(self) -> bool:
         return False
 
+    def get_nav_path(self) -> dict[str, Any] | None:
+        """Latest Nav2 global path observed from the planner."""
+        return None
+
+    def compute_path_to(
+        self,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 10.0,
+        planner_id: str = "",
+    ) -> dict[str, Any]:
+        del x, y, yaw, timeout_sec, planner_id
+        return {"success": False, "message": "path planning not supported"}
+
     def set_initial_pose(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
         return {"success": False, "message": "navigation not supported"}
 
@@ -74,33 +89,5 @@ class RobotBackend(ABC):
         del timeout_sec
         return self.navigate_to(x, y, yaw)
 
-    def compute_path_to(
-        self,
-        x: float,
-        y: float,
-        yaw: float = 0.0,
-        timeout_sec: float = 10.0,
-        planner_id: str = "",
-    ) -> dict[str, Any]:
-        del x, y, yaw, timeout_sec, planner_id
-        return {"success": False, "message": "path planning not supported"}
-
-    def cancel_navigation(self, *, freeze: bool = True) -> dict[str, Any]:
+    def cancel_navigation(self) -> dict[str, Any]:
         return {"success": False, "message": "navigation not supported"}
-
-    def get_localization_mode(self) -> dict[str, Any]:
-        return {
-            "amclActive": None,
-            "localizationMode": "active",
-            "amclIdleFreeze": False,
-        }
-
-    def get_nav_plan(self) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "frameId": "map",
-            "stampSec": None,
-            "pointCount": 0,
-            "poses": [],
-            "message": "no plan",
-        }

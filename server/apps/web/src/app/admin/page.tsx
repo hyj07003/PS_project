@@ -289,6 +289,12 @@ function CartStatusPanel({
               : "없음 (idle)"}
           </b>
         </div>
+        {order && assign?.currentWaypointLabel ? (
+          <div>
+            <span>작업</span>
+            <b className="cart-aruco-phase">{assign.currentWaypointLabel}</b>
+          </div>
+        ) : null}
         {order ? (
           <div>
             <span>품목</span>
@@ -577,6 +583,11 @@ export default function AdminRobotPage() {
                             </span>
                             {m.currentWaypoint ? (
                               <span>· {m.currentWaypoint}</span>
+                            ) : null}
+                            {m.currentWaypointLabel ? (
+                              <span className="order-list-phase">
+                                · {m.currentWaypointLabel}
+                              </span>
                             ) : null}
                             {m.createdAt || order?.createdAt ? (
                               <span className="muted">

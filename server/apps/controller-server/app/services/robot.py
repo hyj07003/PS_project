@@ -65,7 +65,7 @@ class RobotService:
         row = self.conn.execute(
             """
             SELECT COUNT(*) AS c FROM missions
-            WHERE status = 'CREATED' AND device_id IS NULL
+            WHERE status IN ('QUEUED', 'CREATED') AND device_id IS NULL
             """
         ).fetchone()
         return int(row["c"] if row else 0)

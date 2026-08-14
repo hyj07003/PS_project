@@ -892,6 +892,16 @@ img {
   color: var(--ink-soft);
 }
 
+.order-list-phase {
+  color: #0b6e4f;
+  font-weight: 600;
+}
+
+.cart-aruco-phase {
+  color: #0b6e4f;
+  font-weight: 600;
+}
+
 .order-list-items {
   margin: 0.15rem 0 0;
   font-size: 0.74rem;

@@ -18,6 +18,7 @@ from ..db import now_iso
 from ..errors import ApiError
 from ..waypoints import (
     WAYPOINTS,
+    aruco_marker_id_for_waypoint,
     get_waypoint,
     home_for_device,
     nearest_neighbor_order,
@@ -392,7 +393,7 @@ class OrdersService:
         return fixed
 
     def try_dispatch(self) -> None:
-        """Assign FIFO CREATED missions to idle cart devices."""
+        """Assign FIFO QUEUED/CREATED missions to idle cart devices."""
         with _dispatch_lock:
             self.reclaim_stale_carts()
             while True:
@@ -400,7 +401,7 @@ class OrdersService:
                     """
                     SELECT m.id, m.order_id
                     FROM missions m
-                    WHERE m.status = 'CREATED' AND m.device_id IS NULL
+                    WHERE m.status IN ('QUEUED', 'CREATED') AND m.device_id IS NULL
                     ORDER BY m.id ASC
                     LIMIT 1
                     """
@@ -554,7 +555,7 @@ class OrdersService:
         # Nav2 aborts/replans mid-leg often; retry before failing the whole tour.
         attempts = max(1, int(os.environ.get("PICK_NAV_RETRIES", "3")))
         yaw_tol = float(os.environ.get("PICK_HOME_YAW_TOL_RAD", "0.12"))
-        last_detail = "unknown"
+        errors: list[str] = []
         for attempt in range(1, attempts + 1):
             if mission_id is not None:
                 self._ensure_not_aborted(mission_id)
@@ -571,12 +572,142 @@ class OrdersService:
                 if mission_id is not None:
                     self._ensure_not_aborted(mission_id)
                 return
-            last_detail = getattr(self.cart_port, "last_nav_error", None) or "unknown"
+            detail = getattr(self.cart_port, "last_nav_error", None) or "unknown"
+            errors.append(f"try{attempt}:{detail}")
+            if mission_id is not None:
+                self._mission_note(
+                    mission_id, f"nav retry {waypoint_id} {attempt}/{attempts}: {detail}"
+                )
             if attempt < attempts:
                 time.sleep(1.0)
                 continue
             raise RuntimeError(
-                f"nav failed at {waypoint_id} after {attempts} tries: {last_detail}"
+                f"nav failed at {waypoint_id} after {attempts} tries: "
+                + " | ".join(errors)
+            )
+
+    def _aruco_dock_or_fail(
+        self,
+        device_code: str,
+        waypoint_id: str,
+        mission_id: int | None = None,
+    ) -> None:
+        marker_id = aruco_marker_id_for_waypoint(waypoint_id)
+        if marker_id is None:
+            return
+        standoff = float(os.environ.get("ARUCO_DOCK_STANDOFF_M", "0.12"))
+        timeout = float(os.environ.get("ARUCO_DOCK_TIMEOUT_SEC", "60"))
+        attempts = max(1, int(os.environ.get("PICK_ARUCO_RETRIES", "2")))
+        last_detail = "unknown"
+
+        phase_labels = {
+            "SEARCH": "마커 탐색 중",
+            "LOST": "마커 재탐색 중",
+            "FACE": "정면·자세 정렬 중",
+            "SHIFT": "횡방향 위치 조정 중",
+            "APPROACH": "접근·파킹 중",
+            "ARRIVED": "도킹 완료",
+            "TIMEOUT": "도킹 타임아웃",
+            "NO_MARKER": "마커 미검출",
+        }
+
+        for attempt in range(1, attempts + 1):
+            if mission_id is not None:
+                self._ensure_not_aborted(mission_id)
+            dock = getattr(self.cart_port, "aruco_dock", None)
+            if not callable(dock):
+                return
+
+            if mission_id is not None:
+                self._set_waypoint(
+                    mission_id,
+                    waypoint_id,
+                    label_suffix="마커 탐색 중",
+                )
+                self._mission_note(
+                    mission_id,
+                    f"aruco dock start {waypoint_id} marker={marker_id} try={attempt}",
+                )
+
+            stop_poll = threading.Event()
+            last_label = ["마커 탐색 중"]
+
+            def _poll_aruco_status() -> None:
+                getter = getattr(self.cart_port, "get_nav_state", None)
+                while not stop_poll.wait(0.45):
+                    if mission_id is None or not callable(getter):
+                        continue
+                    try:
+                        state = getter(device_code) or {}
+                        dock_st = state.get("arucoDock") or {}
+                        phase = dock_st.get("phase")
+                        label = (
+                            dock_st.get("phaseLabel")
+                            or phase_labels.get(str(phase or ""), None)
+                        )
+                        if not label:
+                            continue
+                        if label == last_label[0]:
+                            continue
+                        last_label[0] = label
+                        self._set_waypoint(
+                            mission_id,
+                            waypoint_id,
+                            label_suffix=label,
+                        )
+                        self._mission_note(
+                            mission_id,
+                            f"aruco {waypoint_id}: {label}",
+                        )
+                    except Exception:
+                        continue
+
+            poller = threading.Thread(target=_poll_aruco_status, daemon=True)
+            poller.start()
+            try:
+                result = dock(
+                    device_code,
+                    marker_id,
+                    standoff_m=standoff,
+                    timeout_sec=timeout,
+                )
+            finally:
+                stop_poll.set()
+                poller.join(timeout=1.5)
+
+            if result.get("success") or result.get("status") == "ARRIVED":
+                dist = result.get("distanceM")
+                note = f"aruco dock {waypoint_id} ok"
+                if dist is not None:
+                    try:
+                        note += f" distance={float(dist):.3f}"
+                    except (TypeError, ValueError):
+                        pass
+                if mission_id is not None:
+                    self._set_waypoint(
+                        mission_id,
+                        waypoint_id,
+                        label_suffix="도킹 완료",
+                    )
+                    self._mission_note(mission_id, note)
+                return
+            last_detail = (
+                getattr(self.cart_port, "last_aruco_error", None)
+                or result.get("message")
+                or result.get("status")
+                or "unknown"
+            )
+            if mission_id is not None:
+                self._set_waypoint(
+                    mission_id,
+                    waypoint_id,
+                    label_suffix=f"도킹 재시도 {attempt}/{attempts}",
+                )
+            if attempt < attempts:
+                time.sleep(0.5)
+                continue
+            raise RuntimeError(
+                f"aruco dock failed at {waypoint_id} after {attempts} tries: {last_detail}"
             )
 
     def _dwell_at(
@@ -738,6 +869,7 @@ class OrdersService:
                     wp.id,
                     mission_id=mission_id,
                 )
+                self._aruco_dock_or_fail(device_code, wp.id, mission_id)
                 self._dwell_at(device_code, mission_id, wp.id)
 
             self._ensure_not_aborted(mission_id)
@@ -747,6 +879,7 @@ class OrdersService:
             self._nav_or_fail(
                 device_code, c.x, c.y, c.yaw, "C", mission_id=mission_id
             )
+            self._aruco_dock_or_fail(device_code, "C", mission_id)
             self._dwell_at(device_code, mission_id, "C")
 
             self._ensure_not_aborted(mission_id)
@@ -756,6 +889,7 @@ class OrdersService:
             self._nav_or_fail(
                 device_code, p.x, p.y, p.yaw, "P", mission_id=mission_id
             )
+            self._aruco_dock_or_fail(device_code, "P", mission_id)
             self._dwell_at(device_code, mission_id, "P")
 
             # 대기장소 복귀 중 — 모니터링 할당은 이때까지 유지, 도착 후 COMPLETED
@@ -813,7 +947,7 @@ class OrdersService:
         row = self.conn.execute(
             """
             SELECT COUNT(*) AS c FROM missions
-            WHERE status = 'CREATED' AND device_id IS NULL
+            WHERE status IN ('QUEUED', 'CREATED') AND device_id IS NULL
             """
         ).fetchone()
         return int(row["c"] if row else 0)

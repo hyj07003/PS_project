@@ -39,14 +39,12 @@ def index():
                 "GET /map/meta",
                 "GET /map/image",
                 "GET /nav/state",
-                "GET /nav/plan",
                 "GET /nav/path",
                 "POST /nav/plan",
                 "POST /nav/initialpose",
                 "POST /nav/goal",
                 "POST /nav/goal_wait",
                 "POST /nav/stop",
-                "POST /nav/aruco_dock",
                 "POST /actuators/led",
                 "POST /actuators/lcd",
             ],
@@ -171,23 +169,14 @@ def nav_state():
 
 @bp.get("/nav/path")
 def nav_path():
-    """Compat alias for tools expecting /nav/path (same cache as GET /nav/plan)."""
     path = _robot().navigation.get_path()
     if path is None:
-        return jsonify(
-            {"success": False, "message": "no path received yet", "path": None}
-        )
+        return jsonify({"success": False, "message": "no path received yet", "path": None})
     return jsonify({"success": True, "path": path})
 
 
-@bp.get("/nav/plan")
-def nav_plan_get():
-    """Nav2 /plan (global path) snapshot for remote clients."""
-    return jsonify(_robot().navigation.get_plan())
-
-
 @bp.post("/nav/plan")
-def nav_plan_compute():
+def nav_plan():
     """Compute a Nav2 global path without starting robot motion."""
     body = request.get_json(silent=True) or {}
     try:
@@ -250,33 +239,6 @@ def nav_goal_wait():
 @bp.post("/nav/stop")
 def nav_stop():
     result = _robot().navigation.cancel()
-    status = 200 if result.get("success") else 502
-    return jsonify(result), status
-
-
-@bp.post("/nav/aruco_dock")
-def nav_aruco_dock():
-    """Visual servo to ArUco marker (~standoffM via pose / open-loop)."""
-    body = request.get_json(silent=True) or {}
-    try:
-        marker_id = int(body.get("markerId", body.get("marker_id")))
-    except (TypeError, ValueError):
-        return jsonify({"success": False, "status": "FAILED", "message": "markerId required"}), 400
-    standoff = body.get("standoffM", body.get("standoff_m"))
-    timeout = body.get("timeoutSec", body.get("timeout_sec"))
-    try:
-        standoff_m = float(standoff) if standoff is not None else None
-    except (TypeError, ValueError):
-        return jsonify({"success": False, "status": "FAILED", "message": "invalid standoffM"}), 400
-    try:
-        timeout_sec = float(timeout) if timeout is not None else None
-    except (TypeError, ValueError):
-        return jsonify({"success": False, "status": "FAILED", "message": "invalid timeoutSec"}), 400
-    result = _robot().navigation.aruco_dock(
-        marker_id,
-        standoff_m=standoff_m,
-        timeout_sec=timeout_sec,
-    )
     status = 200 if result.get("success") else 502
     return jsonify(result), status
 

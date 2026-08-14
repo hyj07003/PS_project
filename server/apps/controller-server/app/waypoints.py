@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import math
+import os
 from dataclasses import dataclass
 from typing import Iterable
-
-
-def _yaw_from_quat(z: float, w: float) -> float:
-    """Yaw from quaternion with x=y=0."""
-    return math.atan2(2.0 * w * z, 1.0 - 2.0 * z * z)
 
 
 @dataclass(frozen=True)
@@ -19,10 +14,6 @@ class Waypoint:
     x: float
     y: float
     yaw: float
-
-
-def _wp(wid: str, label: str, x: float, y: float, z: float, w: float) -> Waypoint:
-    return Waypoint(id=wid, label=label, x=x, y=y, yaw=_yaw_from_quat(z, w))
 
 
 WAYPOINTS: dict[str, Waypoint] = {
@@ -41,69 +32,61 @@ WAYPOINTS: dict[str, Waypoint] = {
         y=-0.1911947634013857,
         yaw=0.0,
     ),
-    "W1": _wp(
-        "W1",
-        "케이크",
-        0.036703343955750284,
-        -1.377,
-        -0.7384688405958438,
-        0.6742876029329252,
+    "W1": Waypoint(
+        id="W1",
+        label="케이크",
+        x=0.036703343955750284,
+        y=-1.377,
+        yaw=-1.66159348963124,
     ),
-    "W2": _wp(
-        "W2",
-        "롤케이크",
-        0.036703343955750284,
-        -1.828,
-        -0.6965217746622735,
-        0.7175356558536427,
+    "W2": Waypoint(
+        id="W2",
+        label="롤케이크",
+        x=0.036703343955750284,
+        y=-1.828,
+        yaw=-1.54107711732223,
     ),
-    "W3": _wp(
-        "W3",
-        "샌드위치",
-        0.34820253257338263,
-        -2.3684238438867913,
-        0.034845193901868764,
-        0.9993927218375873,
+    "W3": Waypoint(
+        id="W3",
+        label="샌드위치",
+        x=0.34820253257338263,
+        y=-2.3684238438867913,
+        yaw=0.0697044983816298,
     ),
-    "W4": _wp(
-        "W4",
-        "아이스크림",
-        0.8693162124281837,
-        -2.3629413403536203,
-        0.004420686500293974,
-        0.999990228717694,
+    "W4": Waypoint(
+        id="W4",
+        label="아이스크림",
+        x=0.8693162124281837,
+        y=-2.3629413403536203,
+        yaw=0.00884140179788436,
     ),
-    "W5": _wp(
-        "W5",
-        "우유",
-        0.9911321796121323,
-        -1.513955691171541,
-        0.7036022695483656,
-        0.710594009464187,
+    "W5": Waypoint(
+        id="W5",
+        label="우유",
+        x=0.9911321796121323,
+        y=-1.513955691171541,
+        yaw=0.0,
     ),
-    "W6": _wp(
-        "W6",
-        "콜라",
-        1.0094719783231025,
-        -0.9942170400336388,
-        0.6881169938961149,
-        0.7255997537977629,
+    "W6": Waypoint(
+        id="W6",
+        label="콜라",
+        x=1.0094719783231025,
+        y=-0.9942170400336388,
+        yaw=0.0,
     ),
-    "C": _wp(
-        "C",
-        "계산대",
-        0.873037381331733,
-        -0.4628773988164313,
-        0.7201343740279695,
-        0.6938346224737885,
+    "C": Waypoint(
+        id="C",
+        label="계산대",
+        x=0.873037381331733,
+        y=-0.4628773988164313,
+        yaw=1.6079919362854,
     ),
-    "P": _wp(
-        "P",
-        "운송대기",
-        0.04392549554456563,
-        0.3766563561382236,
-        0.9983007592473406,
-        0.05827172630172554,
+    "P": Waypoint(
+        id="P",
+        label="운송대기",
+        x=0.04392549554456563,
+        y=0.3766563561382236,
+        yaw=3.02498314429096,
     ),
 }
 
@@ -169,3 +152,38 @@ def nearest_neighbor_order(
         ordered.append(nxt)
         cx, cy = nxt.x, nxt.y
     return ordered
+
+
+_DEFAULT_ARUCO_IDS = "W1:1,W2:2,W3:3,W4:4,W5:5,W6:6,C:10,P:11"
+
+
+def parse_aruco_marker_map(raw: str | None = None) -> dict[str, int]:
+    text = (
+        raw
+        if raw is not None
+        else (
+            os.environ.get("ARUCO_MARKER_BY_WAYPOINT")
+            or os.environ.get("PINKY_ARUCO_IDS")
+            or _DEFAULT_ARUCO_IDS
+        )
+    )
+    out: dict[str, int] = {}
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        key, val = part.split(":", 1)
+        try:
+            out[key.strip()] = int(val.strip())
+        except ValueError:
+            continue
+    return out
+
+
+def aruco_marker_id_for_waypoint(waypoint_id: str) -> int | None:
+    """Marker ID for W*/C/P precision dock; None for S1/S2 or unknown."""
+    if not waypoint_id:
+        return None
+    if waypoint_id.startswith("S"):
+        return None
+    return parse_aruco_marker_map().get(waypoint_id)

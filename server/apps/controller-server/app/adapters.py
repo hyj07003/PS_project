@@ -95,6 +95,16 @@ class MockCartAdapter:
         del device_code
         return None
 
+    def get_nav_state(self, device_code: str) -> dict[str, Any]:
+        del device_code
+        return {
+            "arucoDock": {
+                "active": False,
+                "phase": None,
+                "phaseLabel": None,
+            }
+        }
+
     def is_reachable(self, device_code: str) -> bool:
         del device_code
         return True
@@ -102,6 +112,23 @@ class MockCartAdapter:
     def stop_nav(self, device_code: str) -> dict[str, Any]:
         del device_code
         return {"success": True, "message": "mock stop"}
+
+    def aruco_dock(
+        self,
+        device_code: str,
+        marker_id: int,
+        standoff_m: float = 0.12,
+        timeout_sec: float = 45.0,
+    ) -> dict[str, Any]:
+        del device_code, timeout_sec
+        self.last_aruco_error = None
+        return {
+            "success": True,
+            "status": "ARRIVED",
+            "message": "mock aruco dock",
+            "markerId": int(marker_id),
+            "distanceM": float(standoff_m),
+        }
 
 
 class MockStationAdapter:
@@ -130,6 +157,7 @@ class PinkyHttpCartAdapter:
     def __init__(self, urls: dict[str, str] | None = None):
         self.urls = urls if urls is not None else parse_pinky_robot_urls()
         self.last_nav_error: str | None = None
+        self.last_aruco_error: str | None = None
         # Older pinky builds lack /nav/goal_wait — fall back once discovered.
         self._goal_wait_supported: dict[str, bool] = {}
 
@@ -242,9 +270,16 @@ class PinkyHttpCartAdapter:
                         self.last_nav_error = "yaw not aligned after goal_wait"
                         return "FAILED"
                     return "ARRIVED"
-                self.last_nav_error = str(
+                msg = str(
                     result.get("message") or result.get("status") or "goal_wait failed"
                 )
+                st = result.get("status")
+                http_status = int(result.get("httpStatus") or 200)
+                if st and st not in msg:
+                    msg = f"{msg} (status={st})"
+                if http_status >= 400:
+                    msg = f"HTTP {http_status}: {msg}"
+                self.last_nav_error = msg
                 return "FAILED"
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
@@ -391,6 +426,12 @@ class PinkyHttpCartAdapter:
             pass
         return None
 
+    def get_nav_state(self, device_code: str) -> dict[str, Any]:
+        try:
+            return self._get(device_code, "/nav/state", timeout=2.5)
+        except Exception:
+            return {}
+
     def is_reachable(self, device_code: str) -> bool:
         if self._base(device_code) is None:
             return False
@@ -411,3 +452,40 @@ class PinkyHttpCartAdapter:
             )
         except Exception as exc:
             return {"success": False, "message": str(exc)}
+
+    def aruco_dock(
+        self,
+        device_code: str,
+        marker_id: int,
+        standoff_m: float = 0.12,
+        timeout_sec: float = 45.0,
+    ) -> dict[str, Any]:
+        """POST /nav/aruco_dock — blocking visual approach to marker."""
+        self.last_aruco_error = None
+        timeout = max(1.0, float(timeout_sec))
+        try:
+            result = self._post(
+                device_code,
+                "/nav/aruco_dock",
+                {
+                    "markerId": int(marker_id),
+                    "standoffM": float(standoff_m),
+                    "timeoutSec": timeout,
+                },
+                timeout=timeout + 20.0,
+                accept_http_error=True,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            self.last_aruco_error = str(exc)
+            return {
+                "success": False,
+                "status": "FAILED",
+                "message": str(exc),
+                "markerId": int(marker_id),
+            }
+        if result.get("success") or result.get("status") == "ARRIVED":
+            return result
+        self.last_aruco_error = str(
+            result.get("message") or result.get("status") or "aruco_dock failed"
+        )
+        return result

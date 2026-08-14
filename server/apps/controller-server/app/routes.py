@@ -204,7 +204,10 @@ def mission_queue():
     return jsonify(
         {
             "queueLength": _robot().queue_length(),
-            "waiting": _robot().list_missions(status="CREATED"),
+            "waiting": (
+                _robot().list_missions(status="QUEUED")
+                + _robot().list_missions(status="CREATED")
+            ),
         }
     )
 

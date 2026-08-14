@@ -119,12 +119,13 @@ export CONTROLLER_URL=http://<PC_IP>:4100
 | GET    | `/map/image`              | 맵 PNG (`PINKY_MAP`)        |
 | GET    | `/nav/state`              | pose · navigating · mapId · amclActive · localizationMode |
 | GET    | `/nav/plan`               | Nav2 `/plan` 글로벌 경로 `{poses:[{x,y,yaw},...]}` |
+| GET    | `/nav/path`               | `/nav/plan` 호환 래퍼 `{success,path:{frameId,count,poses}}` |
+| POST   | `/nav/plan`               | ComputePathToPose — 이동 없이 경로만 `{x,y,yaw?,timeoutSec?,plannerId?}` |
 | POST   | `/nav/initialpose`        | `{x,y,yaw}` map 좌표 → AMCL |
 | POST   | `/nav/goal`               | `{x,y,yaw?}` → Nav2 goal (비동기) |
 | POST   | `/nav/goal_wait`          | 동일 + 도착/실패/타임아웃까지 대기     |
 | POST   | `/nav/stop`               | 주행 취소                       |
-
-
+| POST   | `/nav/aruco_dock`         | ArUco 정밀 도킹 `{markerId, standoffM?, timeoutSec?}` |
 
 
 ### Controller 연동
@@ -175,8 +176,16 @@ Controller에서 Pinky로 명령을내려면 `.env`에 `PINKY_URL=http://127.0.0
 
 끄려면: `PINKY_AUTO_LAUNCH=0` (수동으로 위 launch 실행).
 
-**중요: Nav2는 한 세트만.** `PINKY_AUTO_LAUNCH`와 수동 `ros2 launch pinky_navigation`을 동시에 켜면 `/bt_navigator` 등이 중복되어 goal이 무시됩니다.
+**중요: Nav2는 한 세트만.** `PINKY_AUTO_LAUNCH`와 수동 `ros2 launch pinky_navigation`을 동시에 켜면 `/amcl` `/bt_navigator` 등이 **여러 개**로 보여 goal이 `REJECTED`/`NO_TF` 됩니다. `run.py` auto-launch는 이미 Nav2가 있으면 추가 기동하지 않습니다. 중복이 감지되면 기본(`PINKY_NAV2_REPLACE_DUPLICATES=1`)으로 Nav2만 정리한 뒤 **한 세트**를 다시 띄웁니다. 끄려면 `PINKY_NAV2_REPLACE_DUPLICATES=0`. 수동 정리:
 
+```bash
+pkill -f 'pinky_navigation|pinky_bringup|nav2_container|component_container_isolated|run.py'
+# 한 번만
+cd ~/pinky && python3 run.py
+# 확인: ros2 node list | grep amcl   → /amcl 한 줄만
+```
+
+투어/작업 중 `ensure localization`은 S1/S2 **홈 fallback을 하지 않습니다**. TF·마지막 주행 pose·도킹 hold만 사용하고, 없으면 goal을 거부합니다 (대기 점프 방지).
 ### 대기 중 AMCL lifecycle
 
 대기(idle)에서는 `/amcl`을 **deactivate**해 라이다로 pose가 점프하지 않게 합니다. NavigateToPose·수동 initialpose 직전에만 activate + `initialpose` 후 주행하고, 정지·도착 시 다시 deactivate합니다.
@@ -190,6 +199,10 @@ Controller에서 Pinky로 명령을내려면 `.env`에 `PINKY_URL=http://127.0.0
 
 투어: **첫 goal(또는 AMCL off/대기 freeze)만** `initialpose`. 이후 구간은 AMCL을 켠 채 goal만 전송.
 
+`/initialpose` 발행은 **VOLATILE** (래치 없음). 예전 TRANSIENT_LOCAL 은 부트 홈 pose가 남아 AMCL 재활성 시 대기장소로 점프하는 원인이 됨.
+
+작업/투어 중에는 S1/S2 **홈 initialpose·모니터 시드가 거부**됩니다 (`home seed locked out`). 대기장소 idle freeze 시에만 잠금이 풀립니다.
+
 `nav2_params.yaml` 의 `amcl.set_initial_pose` 는 **false** 로 둔다. true 이면 AMCL activate 시마다 yaml 홈(S1)으로 점프한다.
 
 `GET /nav/state`에 `amclActive`, `localizationMode` (`idle`|`active`)가 포함됩니다.
@@ -201,6 +214,52 @@ Controller에서 Pinky로 명령을내려면 `.env`에 `PINKY_URL=http://127.0.0
 좌표는 **map 프레임 미터**. 관리자 UI: 좌드래그 pose · 우클릭 goal.
 
 맵 파일: `PINKY_MAP=map_test1` → `map_test1.yaml` + `.pgm`
+
+### ArUco 정밀 도킹
+
+Nav2로 W*/C/P 근처 도착 후 **SEARCH → FACE(정면) → SHIFT(짧은 횡스텝) → FACE 재검출 반복 → APPROACH(거리)** 순으로 도킹합니다. 횡이동은 한 번에 크게 밀지 않고 `SHIFT_STEP_M`만큼만 옮긴 뒤 마커를 다시 잡아 정밀 조정합니다. 도킹 중 AMCL을 freeze 해 모니터 pose 점프를 막습니다.
+
+| 변수 | 기본 | 설명 |
+|------|------|------|
+| `PINKY_CAMERA_DEVICE` | `/dev/video0` | V4L 장치 (USB) |
+| `PINKY_CAMERA_BACKEND` | `auto` | `picamera2` (Pi CSI 권장) / `v4l2` / `gstreamer` |
+| `PINKY_CAMERA_FLIP` | `hv` | `hv`/`180`=180°(권장), `v`=수직만(미러→ArUco 깨짐), `h`, `none` |
+| `PINKY_CAMERA_WIDTH` / `HEIGHT` | `640` / `480` | 캡처 해상도 (캘리브와 맞출 것) |
+| `PINKY_CAMERA_CALIB_PATH` | `camera_calibration.npz` | `camera_matrix`, `distortion_coefficients` |
+| `PINKY_ARUCO_DICT` | `DICT_5X5_50` | 마커 딕셔너리 |
+| `PINKY_CAMERA_INTRINSICS` | `auto` | `auto`: 깨진 calib(과대 fx·왜곡)이면 FOV 핀홀 사용. `fov` 강제 / `calib` 파일 그대로 |
+| `PINKY_CAMERA_HFOV_DEG` | `62` | FOV 모드 수평 화각 (Pi 캠 대략값) |
+| `PINKY_ARUCO_MARKER_LENGTH_M` | `0.037` | **검은 사각형 한 변 실측(m)** (3.7cm). 거리·횡이동 스케일 |
+| `PINKY_ARUCO_DOCK_STANDOFF_M` | `0.12` | 도착 거리(~12cm). **정자세(중앙·횡·정면) 우선** 후 이 거리 이내만 ARRIVED |
+| `PINKY_ARUCO_CENTER_TOL_PX` | `15` | ALIGN 완료 판정 (가로 px) |
+| `PINKY_ARUCO_CENTER_Y_TOL_PX` | `25` | ALIGN 완료 판정 (세로 px) |
+| `PINKY_ARUCO_ALIGN_SETTLE_FRAMES` | `8` | 중앙 유지 연속 프레임 후 APPROACH |
+| `PINKY_ARUCO_SHIFT_STEP_M` | `0.04` | 횡이동 1회 최대 거리 (m) — 이후 FACE 재검출 |
+| `PINKY_ARUCO_SHIFT_STEP_GAIN` | `0.55` | 이번 스텝에서 보정할 tx 비율 |
+| `PINKY_ARUCO_SHIFT_MAX_ITERS` | `12` | micro-SHIFT 최대 반복 |
+| `PINKY_ARUCO_SHIFT_SETTLE_SEC` | `0.25` | 스텝 후 정지·재검출 대기 |
+| `PINKY_ARUCO_APPROACH_V` | `0.04` | 최대 접근 속도 (m/s) |
+| `PINKY_ARUCO_APPROACH_GAIN` | `0.35` | 속도 = gain × (현재거리 − standoff) |
+| `PINKY_ARUCO_SEARCH_W` | `0.15` | SEARCH 회전 속도 (rad/s) |
+| `PINKY_ARUCO_SEARCH_AMPLITUDE_DEG` | `70` | 한쪽 끝 각도. T=amp/w 후 2T로 반대쪽까지 왕복 (양쪽 FOV) |
+| `PINKY_ARUCO_IDS` | `W1:1,…,C:10,P:11` | 웨이포인트→마커 ID |
+
+캘리브 파일: 저장소의 `pinky/camera_calibration.npz`.
+
+수동 검증:
+
+```bash
+# mock
+curl -s -X POST http://127.0.0.1:4200/nav/aruco_dock \
+  -H 'Content-Type: application/json' \
+  -d '{"markerId":1,"standoffM":0.03,"timeoutSec":45}'
+
+# 실기: 마커를 카메라 앞에 두고 동일 호출 → ALIGN→APPROACH→~3cm
+# 주문 투어: mission note 에 `aruco dock W3 ok distance=0.031` 확인
+# 마커 없음: status NO_MARKER / TIMEOUT → 미션 실패
+```
+
+Controller는 Nav2 성공 후 W*/C/P에 `POST /nav/aruco_dock`을 호출합니다 (`ARUCO_MARKER_BY_WAYPOINT`로 ID 덮어쓰기 가능).
 
 ---
 

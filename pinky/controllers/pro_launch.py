@@ -76,6 +76,77 @@ def _pro_root() -> Path:
     return Path(__file__).resolve().parents[2] / "pinky_pro"
 
 
+def _nav2_already_running() -> bool:
+    """True if amcl/map_server already in the ROS graph (avoid triple Nav2)."""
+    try:
+        out = subprocess.check_output(
+            ["ros2", "node", "list"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return False
+    names = {ln.strip() for ln in out.splitlines() if ln.strip()}
+    # Count unique basenames; duplicates look like /amcl three times
+    amcl = sum(1 for n in names if n.rstrip("/").endswith("/amcl") or n == "/amcl")
+    maps = sum(
+        1 for n in names if n.rstrip("/").endswith("/map_server") or n == "/map_server"
+    )
+    # node list may show the same name repeated on separate lines
+    amcl_lines = sum(1 for ln in out.splitlines() if ln.strip() in ("/amcl", "amcl"))
+    map_lines = sum(
+        1 for ln in out.splitlines() if ln.strip() in ("/map_server", "map_server")
+    )
+    return (amcl_lines >= 1 or amcl >= 1) and (map_lines >= 1 or maps >= 1)
+
+
+def _count_nav2_duplicates() -> dict[str, int]:
+    try:
+        out = subprocess.check_output(
+            ["ros2", "node", "list"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return {}
+    keys = ("/amcl", "/map_server", "/bt_navigator", "/controller_server")
+    counts = {k: 0 for k in keys}
+    for ln in out.splitlines():
+        name = ln.strip()
+        if name in counts:
+            counts[name] += 1
+    return counts
+
+
+def _has_nav2_duplicates(counts: dict[str, int] | None = None) -> bool:
+    counts = counts if counts is not None else _count_nav2_duplicates()
+    return any(v > 1 for v in counts.values())
+
+
+def _kill_nav2_stacks() -> None:
+    """Kill Nav2 launch/containers only (keep pinky_bringup motors when possible)."""
+    patterns = (
+        "pinky_navigation",
+        "nav2_container",
+        "component_container_isolated",
+        "bringup_launch.xml",
+    )
+    for pat in patterns:
+        try:
+            subprocess.run(
+                ["pkill", "-f", pat],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception as exc:
+            logger.warning("pkill %s failed: %s", pat, exc)
+    time.sleep(2.0)
+
+
 class ProStackLauncher:
     """
     pinky_pro ROS2 launch 를 서브프로세스로 기동/종료.
@@ -96,6 +167,44 @@ class ProStackLauncher:
             return
         if not should_auto_launch_pro():
             logger.info("PINKY_AUTO_LAUNCH off — skip pinky_pro launches")
+            return
+
+        dup = _count_nav2_duplicates()
+        replaced_dup = False
+        if _has_nav2_duplicates(dup):
+            if _truthy("PINKY_NAV2_REPLACE_DUPLICATES", "1"):
+                logger.error(
+                    "Nav2 nodes duplicated %s — killing Nav2 stacks, then launching one set",
+                    dup,
+                )
+                _kill_nav2_stacks()
+                replaced_dup = True
+                dup = _count_nav2_duplicates()
+                if _has_nav2_duplicates(dup):
+                    logger.error(
+                        "Nav2 still duplicated after kill %s — refuse extra launch. "
+                        "Manual: pkill -f 'pinky_navigation|nav2_container|component_container'",
+                        dup,
+                    )
+                    self._started = True
+                    return
+            else:
+                logger.error(
+                    "Nav2 nodes already duplicated %s — NOT launching another stack "
+                    "(set PINKY_NAV2_REPLACE_DUPLICATES=1 to auto-clean). "
+                    "Kill extras: pkill -f 'pinky_navigation|nav2_container|component_container'",
+                    dup,
+                )
+                self._started = True  # do not spawn more
+                return
+
+        if _nav2_already_running() and not replaced_dup:
+            logger.warning(
+                "Nav2/amcl already running — skip auto-launch "
+                "(PINKY_AUTO_LAUNCH would create duplicates). counts=%s",
+                dup or _count_nav2_duplicates(),
+            )
+            self._started = True
             return
 
         map_yaml = resolve_map_yaml()
@@ -121,16 +230,23 @@ class ProStackLauncher:
         except Exception:
             log_dir = Path("/tmp")
 
-        cmds: list[tuple[str, list[str]]] = [
-            (
-                "bringup",
-                [
-                    "ros2",
-                    "launch",
-                    "pinky_bringup",
-                    "bringup_robot.launch.xml",
-                ],
-            ),
+        # 중복 정리 후에는 bringup(모터)이 남아 있을 수 있음 → Nav2만 재기동
+        cmds: list[tuple[str, list[str]]] = []
+        if not replaced_dup:
+            cmds.append(
+                (
+                    "bringup",
+                    [
+                        "ros2",
+                        "launch",
+                        "pinky_bringup",
+                        "bringup_robot.launch.xml",
+                    ],
+                )
+            )
+        else:
+            logger.info("skip bringup relaunch after Nav2 duplicate cleanup")
+        cmds.append(
             (
                 "nav",
                 [
@@ -140,8 +256,8 @@ class ProStackLauncher:
                     "bringup_launch.xml",
                     f"map:={map_yaml}",
                 ],
-            ),
-        ]
+            )
+        )
 
         for name, cmd in cmds:
             logger.info("spawn: %s", " ".join(cmd))

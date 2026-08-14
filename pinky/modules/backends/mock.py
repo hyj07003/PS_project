@@ -194,6 +194,37 @@ class MockBackend(RobotBackend):
             "poses": poses,
         }
 
+    def compute_path_to(
+        self,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 10.0,
+        planner_id: str = "",
+    ) -> dict[str, Any]:
+        del timeout_sec, planner_id
+        self._tick_nav()
+        p = self.get_nav_pose() or self._nav_pose
+        goal = {"x": float(x), "y": float(y), "yaw": float(yaw)}
+        poses = [
+            {"x": float(p["x"]), "y": float(p["y"]), "yaw": float(p["yaw"])},
+            dict(goal),
+        ]
+        path = {
+            "ok": True,
+            "frameId": "map",
+            "stampSec": time.time(),
+            "pointCount": len(poses),
+            "poses": poses,
+        }
+        self._nav_goal = dict(goal)
+        return {
+            "success": True,
+            "message": "mock path computed without moving robot",
+            "goal": goal,
+            "path": path,
+        }
+
     def navigate_to(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
         self._nav_goal = {"x": float(x), "y": float(y), "yaw": float(yaw)}
         self._nav_goal_t0 = time.time()
