@@ -226,8 +226,8 @@ class Ros2Backend(RobotBackend):
                 )
         code = (os.environ.get("PINKY_DEVICE_CODE") or "cart-1").strip().lower()
         if code in ("cart-2", "cart2", "2"):
-            return (0.038474577957370054, -0.1911947634013857, 0.0)  # S2
-        return (0.036703343955750284, 0.0005066978948139312, 0.0)  # S1
+            return (0.04742698442363813, -0.20226078567130157, -0.004704072590981645)
+        return (0.009931882239292611, 0.021114122581406713, 0.01045265830576832)
 
     def _apply_boot_initial_pose(self) -> None:
         if not self._nav_enabled:

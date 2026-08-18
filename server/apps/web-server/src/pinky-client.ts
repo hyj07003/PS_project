@@ -70,15 +70,15 @@ export function homePoseForDevice(deviceCode: string): {
   const code = (deviceCode || "cart-1").trim().toLowerCase();
   if (code === "cart-2" || code === "cart2" || code === "2") {
     return {
-      x: 0.038474577957370054,
-      y: -0.1911947634013857,
-      yaw: 0.0,
+      x: 0.04742698442363813,
+      y: -0.20226078567130157,
+      yaw: -0.004704072590981645,
     };
   }
   return {
-    x: 0.036703343955750284,
-    y: 0.0005066978948139312,
-    yaw: 0.0,
+    x: 0.009931882239292611,
+    y: 0.021114122581406713,
+    yaw: 0.01045265830576832,
   };
 }
 

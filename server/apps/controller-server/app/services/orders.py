@@ -177,7 +177,7 @@ class OrdersService:
                         code,
                         home.x,
                         home.y,
-                        HOME_YAW,
+                        home.yaw,
                         timeout_sec=self._nav_timeout,
                         require_yaw=False,
                     )
@@ -201,7 +201,7 @@ class OrdersService:
         return {
             "ok": True,
             "deviceCode": code,
-            "home": {"id": home.id, "x": home.x, "y": home.y, "yaw": HOME_YAW},
+            "home": {"id": home.id, "x": home.x, "y": home.y, "yaw": home.yaw},
             "returning": True,
             "mission": abort_info.get("mission"),
         }
@@ -746,8 +746,9 @@ class OrdersService:
         stop_first: bool = False,
         best_effort: bool = False,
     ) -> bool:
-        """Navigate to wait spot (S1/S2) facing yaw=0 (+x) for both carts."""
+        """Navigate to wait spot (S1/S2) using waypoint pose."""
         home = home_for_device(device_code)
+        home_yaw = float(home.yaw)
         yaw_tol = float(os.environ.get("PICK_HOME_YAW_TOL_RAD", "0.12"))
         if stop_first:
             try:
@@ -761,7 +762,7 @@ class OrdersService:
                 device_code,
                 home.x,
                 home.y,
-                HOME_YAW,
+                home_yaw,
                 home.id,
                 require_yaw=False,
                 mission_id=mission_id,
@@ -771,7 +772,7 @@ class OrdersService:
                 pose = self.cart_port.get_pose(device_code)
                 if pose:
                     err = abs(
-                        _wrap_angle(float(pose.get("yaw") or 0.0) - HOME_YAW)
+                        _wrap_angle(float(pose.get("yaw") or 0.0) - home_yaw)
                     )
                     if err <= yaw_tol:
                         break
@@ -783,7 +784,7 @@ class OrdersService:
                     device_code,
                     home.x,
                     home.y,
-                    HOME_YAW,
+                    home_yaw,
                     f"{home.id}-yaw",
                     require_yaw=True,
                     mission_id=mission_id,

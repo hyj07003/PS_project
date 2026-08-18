@@ -7,8 +7,8 @@ from typing import Tuple
 
 # server/apps/controller-server/app/waypoints.py WAYPOINTS S1/S2 와 동기화할 것
 HOME_POSES: dict[str, Tuple[float, float, float]] = {
-    "cart-1": (0.036703343955750284, 0.0005066978948139312, 0.0),  # S1, yaw=0
-    "cart-2": (0.038474577957370054, -0.1911947634013857, 0.0),  # S2, yaw=0
+    "cart-1": (0.009931882239292611, 0.021114122581406713, 0.01045265830576832),
+    "cart-2": (0.04742698442363813, -0.20226078567130157, -0.004704072590981645),
 }
 
 
