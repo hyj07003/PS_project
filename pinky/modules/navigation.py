@@ -92,6 +92,21 @@ class NavigationModule:
     def cancel(self) -> dict[str, Any]:
         return self._backend.cancel_navigation()
 
+    def relative_move(
+        self,
+        distance_m: float,
+        speed_mps: float = 0.02,
+        timeout_sec: float | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._backend.relative_move(
+            float(distance_m),
+            float(speed_mps),
+            float(timeout_sec) if timeout_sec is not None else None,
+            dry_run=bool(dry_run),
+        )
+
     def aruco_dock(
         self,
         marker_id: int,

@@ -46,6 +46,7 @@ def index():
                 "POST /nav/goal",
                 "POST /nav/goal_wait",
                 "POST /nav/stop",
+                "POST /nav/relative_move",
                 "POST /nav/aruco_dock",
                 "POST /actuators/led",
                 "POST /actuators/lcd",
@@ -259,6 +260,28 @@ def nav_goal_wait():
 def nav_stop():
     result = _robot().navigation.cancel()
     status = 200 if result.get("success") else 502
+    return jsonify(result), status
+
+
+@bp.post("/nav/relative_move")
+def nav_relative_move():
+    """Short odom-closed-loop micro motion for docking/undocking only."""
+    body = request.get_json(silent=True) or {}
+    try:
+        distance_m = float(body.get("distanceM", body.get("distance_m")))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "distanceM required"}), 400
+    try:
+        speed_mps = float(body.get("speedMps", body.get("speed_mps", 0.02)))
+        timeout_raw = body.get("timeoutSec", body.get("timeout_sec"))
+        timeout_sec = float(timeout_raw) if timeout_raw is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "invalid speedMps/timeoutSec"}), 400
+    dry_run = bool(body.get("dryRun", body.get("dry_run", False)))
+    result = _robot().navigation.relative_move(
+        distance_m, speed_mps, timeout_sec, dry_run=dry_run
+    )
+    status = 200 if result.get("success") else 409
     return jsonify(result), status
 
 
