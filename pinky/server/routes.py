@@ -212,12 +212,17 @@ def nav_initialpose():
     except (KeyError, TypeError, ValueError):
         return jsonify({"success": False, "message": "x,y required"}), 400
     yaw = float(body.get("yaw", 0.0))
-    result = _robot().navigation.set_initial_pose(x, y, yaw)
-    if result.get("ignored"):
-        status = 200
-    else:
-        status = 200 if result.get("success") else 502
-    return jsonify(result), status
+    try:
+        result = _robot().navigation.set_initial_pose(x, y, yaw)
+    except Exception as exc:
+        current_app.logger.exception("POST /nav/initialpose")
+        return jsonify({"success": False, "message": str(exc)}), 502
+    if not result.get("success") and not result.get("ignored"):
+        current_app.logger.warning(
+            "POST /nav/initialpose failed: %s", result.get("message")
+        )
+        return jsonify(result), 502
+    return jsonify(result), 200
 
 
 @bp.post("/nav/goal")

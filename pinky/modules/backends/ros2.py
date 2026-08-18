@@ -1165,12 +1165,13 @@ class Ros2Backend(RobotBackend):
         *,
         tight: bool = False,
         allow_home: bool = False,
+        force: bool = False,
     ) -> dict[str, Any]:
         if not self._nav_enabled or self._initial_pose_pub is None:
             return {"success": False, "message": "navigation not enabled"}
-        # 작업/투어 중 S1/S2 initialpose 절대 금지 (ensure/boot/raw 공통)
-        if self._pose_is_home((float(x), float(y), float(yaw))):
-            if self._should_block_home_seed():
+        # force: 관리자 맵 수동 지정. 자동 시드(boot/ensure)만 홈 가드 적용.
+        if not force and self._pose_is_home((float(x), float(y), float(yaw))):
+            if self._should_block_home_seed() or not allow_home:
                 if self._node:
                     self._node.get_logger().warn(
                         f"refuse home initialpose ({float(x):.3f},{float(y):.3f}) "
@@ -1180,13 +1181,6 @@ class Ros2Backend(RobotBackend):
                 return {
                     "success": False,
                     "message": "home initialpose blocked during tour/work",
-                    "ignored": True,
-                    "pose": {"x": x, "y": y, "yaw": yaw},
-                }
-            if not allow_home:
-                return {
-                    "success": False,
-                    "message": "home initialpose requires allow_home",
                     "ignored": True,
                     "pose": {"x": x, "y": y, "yaw": yaw},
                 }
@@ -1223,8 +1217,14 @@ class Ros2Backend(RobotBackend):
         }
 
     def set_initial_pose(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
+        """관리자/RViz 수동 pose. 홈 시드 가드를 우회하고 지정 좌표를 항상 적용."""
         if not self._nav_enabled or self._initial_pose_pub is None:
-            return {"success": False, "message": "navigation not enabled"}
+            self._setup_navigation()
+        if not self._nav_enabled or self._initial_pose_pub is None:
+            return {
+                "success": False,
+                "message": "navigation not enabled (PINKY_NAV=0 또는 Nav2/tf2 import 실패)",
+            }
 
         with self._lock:
             if self._visual_dock_active:
@@ -1233,60 +1233,6 @@ class Ros2Backend(RobotBackend):
                     "message": "ignored initialpose during visual dock",
                     "ignored": True,
                 }
-
-        # 홈 initialpose: 투어/작업·비홈 last pose 면 무조건 무시
-        if self._pose_is_home((float(x), float(y), float(yaw))):
-            if self._should_block_home_seed():
-                with self._lock:
-                    cur = self._nav_pose or self._last_good_map_pose
-                if self._node:
-                    self._node.get_logger().warn(
-                        f"ignore home initialpose ({float(x):.3f},{float(y):.3f}) "
-                        f"— tour/work lockout"
-                        + (
-                            f" cur=({cur[0]:.3f},{cur[1]:.3f})"
-                            if cur is not None
-                            else ""
-                        )
-                    )
-                return {
-                    "success": True,
-                    "message": "ignored home initialpose (tour/work)",
-                    "ignored": True,
-                    "pose": (
-                        {"x": cur[0], "y": cur[1], "yaw": cur[2]}
-                        if cur is not None
-                        else {"x": x, "y": y, "yaw": yaw}
-                    ),
-                }
-            try:
-                from ..home_poses import home_pose_for_device
-
-                hx, hy, _hyaw = home_pose_for_device()
-                near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.35"))
-                with self._lock:
-                    cur = self._nav_pose
-                tf_now = self._lookup_tf_pose()
-                ref = tf_now or cur
-                if ref is not None:
-                    cur_far = (ref[0] - hx) ** 2 + (ref[1] - hy) ** 2 > (
-                        (near_m * 1.5) ** 2
-                    )
-                    if cur_far:
-                        if self._node:
-                            self._node.get_logger().warn(
-                                f"ignore home initialpose ({float(x):.3f},{float(y):.3f}) "
-                                f"— current pose far ({ref[0]:.3f},{ref[1]:.3f})"
-                            )
-                        self._lock_out_home_seed("reject home while far")
-                        return {
-                            "success": True,
-                            "message": "ignored home initialpose (robot not at wait spot)",
-                            "ignored": True,
-                            "pose": {"x": ref[0], "y": ref[1], "yaw": ref[2]},
-                        }
-            except Exception:
-                pass
 
         with self._lock:
             was_frozen = self._localization_idle_frozen
@@ -1301,13 +1247,18 @@ class Ros2Backend(RobotBackend):
         ):
             with self._lock:
                 self._localization_idle_frozen = False
-            self._amcl_activate()
+            try:
+                self._amcl_activate()
+            except Exception as exc:
+                if self._node:
+                    self._node.get_logger().warn(f"AMCL activate for initialpose: {exc}")
             result = self._publish_initial_pose_raw(
                 float(x),
                 float(y),
                 float(yaw),
                 tight=True,
-                allow_home=self._pose_is_home((float(x), float(y), float(yaw))),
+                allow_home=True,
+                force=True,
             )
             settle = float(os.environ.get("PINKY_LOCALIZE_SETTLE_SEC", "1.0"))
             if settle > 0:
@@ -1336,7 +1287,8 @@ class Ros2Backend(RobotBackend):
             float(y),
             float(yaw),
             tight=True,
-            allow_home=self._pose_is_home((float(x), float(y), float(yaw))),
+            allow_home=True,
+            force=True,
         )
         hold = float(os.environ.get("PINKY_POSE_HOLD_SEC", "12.0"))
         with self._lock:
