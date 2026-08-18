@@ -189,8 +189,8 @@ def aruco_marker_id_for_waypoint(waypoint_id: str) -> int | None:
 
 
 def aruco_standoff_for_waypoint(waypoint_id: str) -> float:
-    """Parking standoff (m): 7cm default, 35cm for checkout (C)."""
+    """Parking standoff (m): 7cm default, 40cm for checkout (C)."""
     wid = (waypoint_id or "").strip().upper()
     if wid == "C":
-        return float(os.environ.get("ARUCO_DOCK_STANDOFF_C_M", "0.35"))
+        return float(os.environ.get("ARUCO_DOCK_STANDOFF_C_M", "0.40"))
     return float(os.environ.get("ARUCO_DOCK_STANDOFF_M", "0.07"))

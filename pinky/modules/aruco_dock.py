@@ -1052,16 +1052,19 @@ def run_aruco_dock(
 
                 # 가깝더라도 정자세 미달이면 FACE/SHIFT 우선 (거리 도착보다 자세 우선)
                 need_pose_first = (not center_ok) or (
-                    not lat_ready and not shift_stop_further
+                    not lat_ready and not shift_stop_further and phase != "APPROACH"
                 )
-                close_zone = z <= max(standoff * 2.5, standoff + 0.25)
+                # APPROACH 중에는 중앙이 크게 벗어날 때만 FACE 복귀 (close_zone 으로 전진 금지 방지)
+                approach_recenter = (
+                    phase == "APPROACH"
+                    and abs(center_err) > center_tol * 2.0
+                )
 
                 # FACE: center marker in frame first (yaw soft). Force progress after face_max_sec.
                 if (
                     phase in ("FACE", "ALIGN")
                     or need_pose_first
-                    or (phase == "APPROACH" and not center_ok)
-                    or (close_zone and not pose_arrive_ok and phase == "APPROACH")
+                    or approach_recenter
                 ):
                     if need_pose_first or not pose_arrive_ok:
                         phase = "FACE"
@@ -1088,9 +1091,10 @@ def run_aruco_dock(
                     if not lat_ready and not shift_stop_further:
                         tx_cmd = _tx_for_shift(tx)
                         if tx_cmd is None:
-                            # 부호 흔들림 — 잠깐 더 FACE 유지
-                            settle_ok = max(0, settle_frames - 2)
-                            face_started_at = time.time()
+                            # 부호 흔들림 — 횡이 애매하면 접근으로 진행 (파킹 정체 방지)
+                            phase = "APPROACH"
+                            pose_ready_before_approach = True
+                            _report("APPROACH", force=True)
                             time.sleep(0.04)
                             continue
                         if _start_shift(tx_cmd):

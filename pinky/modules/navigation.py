@@ -138,6 +138,14 @@ class NavigationModule:
         get_lidar = getattr(self._backend, "get_lidar", None)
         get_ultrasonic = getattr(self._backend, "get_ultrasonic", None)
 
+        def _drive(linear_x: float, angular_z: float) -> Any:
+            try:
+                return self._backend.drive(
+                    linear_x, angular_z, bypass_collision=True
+                )
+            except TypeError:
+                return self._backend.drive(linear_x, angular_z)
+
         def _on_progress(info: dict[str, Any]) -> None:
             self._aruco_status = {
                 "active": bool(info.get("active", True)),
@@ -155,7 +163,7 @@ class NavigationModule:
         try:
             return run_aruco_dock(
                 marker_id=int(marker_id),
-                drive=self._backend.drive,
+                drive=_drive,
                 cancel_nav=_cancel_nav,
                 hold_pose=_hold_pose,
                 release_hold=_release_hold,
