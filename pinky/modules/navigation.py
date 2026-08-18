@@ -131,16 +131,11 @@ class NavigationModule:
             begin = getattr(self._backend, "begin_visual_dock_hold", None)
             if callable(begin):
                 try:
-                    begin()
-                    return
+                    if begin():
+                        return
                 except Exception:
                     pass
-            freeze = getattr(self._backend, "_freeze_localization_idle", None)
-            if callable(freeze):
-                try:
-                    freeze()
-                except Exception:
-                    pass
+            # 홈으로 freeze 하면 맵이 S1/S2 로 점프 — fallback 금지
 
         def _release_hold() -> None:
             end = getattr(self._backend, "end_visual_dock_hold", None)
@@ -175,6 +170,10 @@ class NavigationModule:
                 "yawErrRad": info.get("yawErrRad"),
             }
 
+        def _get_odom():
+            odom = getattr(self._backend, "_odom_pose", None)
+            return odom
+
         try:
             return run_aruco_dock(
                 marker_id=int(marker_id),
@@ -185,6 +184,7 @@ class NavigationModule:
                 get_lidar=get_lidar if callable(get_lidar) else None,
                 get_ultrasonic=get_ultrasonic if callable(get_ultrasonic) else None,
                 on_progress=_on_progress,
+                get_odom=_get_odom,
                 standoff_m=standoff_m,
                 timeout_sec=timeout_sec,
                 mock=mock,

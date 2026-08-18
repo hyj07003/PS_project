@@ -194,3 +194,18 @@ def aruco_standoff_for_waypoint(waypoint_id: str) -> float:
     if wid == "C":
         return float(os.environ.get("ARUCO_DOCK_STANDOFF_C_M", "0.40"))
     return float(os.environ.get("ARUCO_DOCK_STANDOFF_M", "0.07"))
+
+
+def shelf_undock_after_aruco(waypoint_id: str) -> bool:
+    """W1–W6 선반 도킹 후 접근 전진분만큼 후진할지."""
+    wid = (waypoint_id or "").strip().upper()
+    if not wid.startswith("W") or len(wid) != 2:
+        return False
+    try:
+        n = int(wid[1:])
+    except ValueError:
+        return False
+    if n < 1 or n > 6:
+        return False
+    raw = (os.environ.get("PICK_SHELF_UNDOCK_AFTER_ARUCO") or "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")

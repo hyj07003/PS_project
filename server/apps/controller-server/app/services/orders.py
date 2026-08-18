@@ -23,6 +23,7 @@ from ..waypoints import (
     get_waypoint,
     home_for_device,
     nearest_neighbor_order,
+    shelf_undock_after_aruco,
     waypoint_ids_for_slugs,
 )
 from .carts import CartsService
@@ -679,10 +680,16 @@ class OrdersService:
 
             if result.get("success") or result.get("status") == "ARRIVED":
                 dist = result.get("distanceM")
+                approach_travel = result.get("approachTravelM")
                 note = f"aruco dock {waypoint_id} ok"
                 if dist is not None:
                     try:
                         note += f" distance={float(dist):.3f}"
+                    except (TypeError, ValueError):
+                        pass
+                if approach_travel is not None:
+                    try:
+                        note += f" approach={float(approach_travel):.3f}m"
                     except (TypeError, ValueError):
                         pass
                 if mission_id is not None:
@@ -692,6 +699,16 @@ class OrdersService:
                         label_suffix="도킹 완료",
                     )
                     self._mission_note(mission_id, note)
+                if approach_travel is not None:
+                    try:
+                        self._undock_after_shelf_aruco(
+                            device_code,
+                            waypoint_id,
+                            float(approach_travel),
+                            mission_id,
+                        )
+                    except (TypeError, ValueError):
+                        pass
                 return
             last_detail = (
                 getattr(self.cart_port, "last_aruco_error", None)
@@ -711,6 +728,79 @@ class OrdersService:
             raise RuntimeError(
                 f"aruco dock failed at {waypoint_id} after {attempts} tries: {last_detail}"
             )
+
+    def _undock_after_shelf_aruco(
+        self,
+        device_code: str,
+        waypoint_id: str,
+        approach_travel_m: float,
+        mission_id: int | None = None,
+    ) -> None:
+        """W1–W6 마커 접근 전진분만큼 후진해 다음 Nav2 goal 여유 확보."""
+        if not shelf_undock_after_aruco(waypoint_id):
+            return
+        try:
+            total = float(approach_travel_m)
+        except (TypeError, ValueError):
+            return
+        min_m = float(os.environ.get("PICK_SHELF_UNDOCK_MIN_M", "0.005"))
+        if total < min_m:
+            return
+        max_m = float(os.environ.get("PICK_SHELF_UNDOCK_MAX_M", "0.50"))
+        total = min(total, max_m)
+        speed = float(os.environ.get("PICK_SHELF_UNDOCK_SPEED_MPS", "0.02"))
+        step_max = float(os.environ.get("PICK_SHELF_UNDOCK_STEP_M", "0.20"))
+        rel = getattr(self.cart_port, "relative_move", None)
+        if not callable(rel):
+            return
+
+        if mission_id is not None:
+            self._set_waypoint(
+                mission_id,
+                waypoint_id,
+                label_suffix="후진 중",
+            )
+            self._mission_note(
+                mission_id,
+                f"undock {waypoint_id} back {total:.3f}m",
+            )
+
+        remaining = total
+        moved_sum = 0.0
+        while remaining > min_m:
+            if mission_id is not None:
+                self._ensure_not_aborted(mission_id)
+            step = min(remaining, step_max)
+            timeout = max(2.5, step / max(speed, 0.01) + 2.0)
+            result = rel(
+                device_code,
+                -step,
+                speed_mps=speed,
+                timeout_sec=timeout,
+            )
+            if not result.get("success"):
+                detail = result.get("message") or "relative_move failed"
+                if mission_id is not None:
+                    self._mission_note(
+                        mission_id,
+                        f"undock {waypoint_id} partial ({moved_sum:.3f}m): {detail}",
+                    )
+                break
+            try:
+                moved = float(result.get("movedM", step))
+            except (TypeError, ValueError):
+                moved = step
+            moved_sum += abs(moved)
+            remaining = max(0.0, total - moved_sum)
+            if moved < min_m:
+                break
+
+        if mission_id is not None:
+            self._mission_note(
+                mission_id,
+                f"undock {waypoint_id} done moved={moved_sum:.3f}m",
+            )
+            self._set_waypoint(mission_id, waypoint_id, label_suffix="후진 완료")
 
     def _dwell_at(
         self,

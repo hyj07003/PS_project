@@ -34,6 +34,7 @@ ReleaseHoldFn = Callable[[], Any]
 LidarFn = Callable[[], Any]
 UltrasonicFn = Callable[[], Any]
 ProgressFn = Callable[[dict[str, Any]], Any]
+OdomFn = Callable[[], tuple[float, float, float] | None]  # () -> (x, y, yaw) or None
 
 ARUCO_PHASE_LABELS_KO: dict[str, str] = {
     "SEARCH": "마커 탐색 중",
@@ -482,6 +483,7 @@ def run_aruco_dock(
     get_lidar: LidarFn | None = None,
     get_ultrasonic: UltrasonicFn | None = None,
     on_progress: ProgressFn | None = None,
+    get_odom: OdomFn | None = None,
     standoff_m: float | None = None,
     timeout_sec: float | None = None,
     mock: bool = False,
@@ -547,6 +549,7 @@ def run_aruco_dock(
             "markerId": int(marker_id),
             "distanceM": standoff,
             "centerErrorPx": 0.0,
+            "approachTravelM": standoff,
         }
 
     if marker_len <= 0:
@@ -653,6 +656,44 @@ def run_aruco_dock(
     us_fallback_active = False
     pose_ready_before_approach = False
     us_last: float | None = None
+    approach_travel_m = 0.0
+    approach_odom_start: tuple[float, float] | None = None
+    loop_dt = 0.04
+
+    def _snap_approach_odom() -> None:
+        """Record odom position when APPROACH begins."""
+        nonlocal approach_odom_start
+        if approach_odom_start is not None:
+            return
+        if get_odom is not None:
+            pose = get_odom()
+            if pose is not None:
+                approach_odom_start = (pose[0], pose[1])
+
+    def _odom_approach_distance() -> float | None:
+        """Euclidean distance from approach start using odom."""
+        if approach_odom_start is None or get_odom is None:
+            return None
+        pose = get_odom()
+        if pose is None:
+            return None
+        dx = pose[0] - approach_odom_start[0]
+        dy = pose[1] - approach_odom_start[1]
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _final_approach_travel() -> float:
+        """Return best estimate of approach distance: odom if available, else cmd_vel estimate."""
+        odom_d = _odom_approach_distance()
+        if odom_d is not None and odom_d > 1e-4:
+            return odom_d
+        return approach_travel_m
+
+    def _cmd_vel(linear_x: float, angular_z: float) -> Any:
+        nonlocal approach_travel_m
+        if phase in ("APPROACH", "US_APPROACH") and float(linear_x) > 0.0:
+            _snap_approach_odom()
+            approach_travel_m += float(linear_x) * loop_dt
+        return drive(linear_x, angular_z)
 
     def _search_yaw_rate() -> float:
         """Return ±search_w from paused wall-clock schedule (both sides)."""
@@ -840,6 +881,7 @@ def run_aruco_dock(
                 "yawErrRad": yaw_last,
                 "phase": "ARRIVED",
                 "phaseLabel": phase_label_ko("ARRIVED"),
+                "approachTravelM": _final_approach_travel(),
             }
         v_cmd = _approach_speed(us)
         if v_cmd <= 0.0:
@@ -859,8 +901,9 @@ def run_aruco_dock(
                 "yawErrRad": yaw_last,
                 "phase": "ARRIVED",
                 "phaseLabel": phase_label_ko("ARRIVED"),
+                "approachTravelM": _final_approach_travel(),
             }
-        drive(v_cmd, 0.0)
+        _cmd_vel(v_cmd, 0.0)
         return None
 
     def _start_shift(tx: float) -> bool:
@@ -917,7 +960,7 @@ def run_aruco_dock(
 
     def stop() -> None:
         try:
-            drive(0.0, 0.0)
+            _cmd_vel(0.0, 0.0)
         except Exception:
             pass
 
@@ -957,19 +1000,19 @@ def run_aruco_dock(
             ):
                 now = time.time()
                 if shift_stage == "pivot_out":
-                    drive(0.0, float(shift_sign) * shift_w)
+                    _cmd_vel(0.0, float(shift_sign) * shift_w)
                     if now >= shift_stage_until:
                         slide_t = shift_slide_m / max(shift_v, 0.01)
                         shift_stage = "slide"
                         shift_stage_until = now + slide_t
                 elif shift_stage == "slide":
-                    drive(shift_v, 0.0)
+                    _cmd_vel(shift_v, 0.0)
                     if now >= shift_stage_until:
                         pivot_t = (math.pi / 2.0) / max(shift_w, 0.05)
                         shift_stage = "pivot_in"
                         shift_stage_until = now + pivot_t
                 elif shift_stage == "pivot_in":
-                    drive(0.0, float(-shift_sign) * shift_w)
+                    _cmd_vel(0.0, float(-shift_sign) * shift_w)
                     if now >= shift_stage_until:
                         stop()
                         shift_stage = "settle"
@@ -1048,6 +1091,7 @@ def run_aruco_dock(
                         "yawErrRad": yaw_err,
                         "phase": "ARRIVED",
                         "phaseLabel": phase_label_ko("ARRIVED"),
+                        "approachTravelM": _final_approach_travel(),
                     }
 
                 # 가깝더라도 정자세 미달이면 FACE/SHIFT 우선 (거리 도착보다 자세 우선)
@@ -1073,12 +1117,12 @@ def run_aruco_dock(
                     _report("FACE")
                     if not center_ok:
                         settle_ok = 0
-                        drive(0.0, _align_yaw_cmd(center_err, yaw_err))
+                        _cmd_vel(0.0, _align_yaw_cmd(center_err, yaw_err))
                         time.sleep(0.04)
                         continue
                     settle_ok += 1
                     if not yaw_ready:
-                        drive(0.0, _align_yaw_cmd(center_err, yaw_err) * 0.5)
+                        _cmd_vel(0.0, _align_yaw_cmd(center_err, yaw_err) * 0.5)
                     else:
                         stop()
                     face_elapsed = time.time() - face_started_at
@@ -1128,6 +1172,7 @@ def run_aruco_dock(
                             "yawErrRad": yaw_err,
                             "phase": "ARRIVED",
                             "phaseLabel": phase_label_ko("ARRIVED"),
+                            "approachTravelM": _final_approach_travel(),
                         }
                     phase = "APPROACH"
                     if lat_ready:
@@ -1195,6 +1240,7 @@ def run_aruco_dock(
                         "yawErrRad": yaw_err,
                         "phase": "ARRIVED",
                         "phaseLabel": phase_label_ko("ARRIVED"),
+                        "approachTravelM": _final_approach_travel(),
                     }
                 # 접근 중 횡오차 커지면 다시 micro-SHIFT (한도·오버슈트 가드 내)
                 if (
@@ -1210,7 +1256,7 @@ def run_aruco_dock(
                 yaw_trim = 0.0
                 if abs(center_err) > 4.0 or abs(yaw_err) > face_yaw_tol * 0.5:
                     yaw_trim = _align_yaw_cmd(center_err, yaw_err) * 0.4
-                drive(v_cmd, yaw_trim)
+                _cmd_vel(v_cmd, yaw_trim)
             else:
                 stop()
                 if phase == "US_APPROACH" or _can_us_fallback():
@@ -1223,7 +1269,7 @@ def run_aruco_dock(
                     _enter_search(fresh=False)
                 else:
                     _report("SEARCH")
-                drive(0.0, _search_yaw_rate())
+                _cmd_vel(0.0, _search_yaw_rate())
 
             time.sleep(0.04)
 

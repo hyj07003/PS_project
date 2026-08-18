@@ -444,23 +444,27 @@ class Ros2Backend(RobotBackend):
         tf_pose: tuple[float, float, float] | None,
         last_good: tuple[float, float, float] | None = None,
     ) -> bool:
-        """작업 중 S1/S2 로 점프한 TF 인지. 대기장소에서 실제 출발할 때는 False."""
+        """작업 중 S1/S2 로 '순간 점프'한 TF 인지. 홈 근처 통과·정상 주행은 허용."""
         if tf_pose is None or not self._pose_is_home(tf_pose):
             return False
         if last_good is None:
             last_good = self._last_good_map_pose
+        if last_good is None or self._pose_is_home(last_good):
+            return False
+        # 홈 복귀 goal 이면 teleport 검사만 (정상 도착 허용)
         if self._goal_is_home():
             return self._is_home_teleport(tf_pose, last_good)
-        if last_good is not None and not self._pose_is_home(last_good):
-            return True
-        wp = self._last_waypoint_pose
-        if wp is not None and not self._pose_is_home(wp):
-            return True
-        return False
+        # 비홈 goal / 투어: last_good 과 0.5m+ 떨어진 홈 TF 만 거부 (근처 통과 허용)
+        if not (self._tour_active or self._home_seed_locked_out or self._is_navigating):
+            return False
+        return self._is_home_teleport(tf_pose, last_good)
 
     def _remember_nav_goal(self, x: float, y: float, yaw: float) -> None:
         pose = (float(x), float(y), float(yaw))
-        self._active_nav_goal = pose
+        with self._lock:
+            self._active_nav_goal = pose
+            self._pose_hold_until = 0.0
+            self._pose_hold_target = None
         if self._pose_is_home(pose):
             return
         lg = self._last_good_map_pose
@@ -506,6 +510,10 @@ class Ros2Backend(RobotBackend):
 
     def _correct_home_jump(self) -> None:
         """AMCL/TF 가 홈으로 점프하면 last_good(웨이포인트) 으로 즉시 되돌림."""
+        with self._lock:
+            if self._visual_dock_active:
+                self._pin_visual_dock_pose()
+                return
         now = time.time()
         if now - self._last_home_correct_t < 1.0:
             return
@@ -513,10 +521,16 @@ class Ros2Backend(RobotBackend):
         if src is None:
             return
         self._last_home_correct_t = now
+        driving = self._is_navigating or self._nav_session_active
         if self._node:
             self._node.get_logger().warn(
-                f"correct home jump → reseed ({src[0]:.3f},{src[1]:.3f})"
+                f"correct home jump → {'ignore TF' if driving else 'reseed'} "
+                f"({src[0]:.3f},{src[1]:.3f})"
             )
+        # 주행 중 initialpose 재발행은 AMCL/Nav2 와 싸워 pose 가 고정됨 → TF 만 무시
+        if driving:
+            return
+
         with self._lock:
             self._nav_pose = src
             self._last_good_map_pose = src
@@ -532,6 +546,10 @@ class Ros2Backend(RobotBackend):
         threading.Thread(target=_pub, daemon=True).start()
 
     def _maybe_correct_amcl_home_jump(self) -> None:
+        with self._lock:
+            if self._visual_dock_active:
+                self._pin_visual_dock_pose()
+                return
         if not (self._tour_active or self._home_seed_locked_out):
             return
         if self._non_home_seed_source() is None:
@@ -586,7 +604,7 @@ class Ros2Backend(RobotBackend):
             lg = self._last_good_map_pose
             frozen = self._nav_pose
             idle = self._localization_idle_frozen
-        if self._boot_home_cancel.is_set():
+        if self._boot_home_cancel.is_set() and lg is not None:
             # last_good 가 홈으로 오염돼도 작업 시작 이후엔 홈 시드 금지
             return True
         if lg is not None and not self._pose_is_home(lg):
@@ -644,6 +662,7 @@ class Ros2Backend(RobotBackend):
         self._invalidate_pending_freeze()
         with self._lock:
             last_good = self._last_good_map_pose
+            last_wp = self._last_waypoint_pose
             cur = self._nav_pose
         pose = self._lookup_tf_pose()
         if pose is not None and self._spurious_home_tf(pose, last_good):
@@ -651,16 +670,16 @@ class Ros2Backend(RobotBackend):
                 self._node.get_logger().warn(
                     f"visual dock hold: ignore home TF teleport ({pose[0]:.3f},{pose[1]:.3f})"
                 )
-            pose = last_good if last_good is not None and not self._pose_is_home(last_good) else None
-        if pose is None:
-            if cur is not None and not self._pose_is_home(cur):
-                pose = cur
-            elif last_good is not None and not self._pose_is_home(last_good):
-                pose = last_good
+            pose = None
         if pose is None or self._pose_is_home(pose):
+            for alt in (last_good, last_wp, cur):
+                if alt is not None and not self._pose_is_home(alt):
+                    pose = alt
+                    break
+        if pose is None:
             if self._node:
                 self._node.get_logger().warn(
-                    "visual dock hold: no TF and no non-home pose — skip home fallback"
+                    "visual dock hold: no pose at all — cannot pin"
                 )
             return False
         with self._lock:
@@ -702,10 +721,51 @@ class Ros2Backend(RobotBackend):
                 f"({pose[0]:.4f},{pose[1]:.4f},yaw={pose[2]:.3f})"
             )
 
+    def _is_nav_session_live(self) -> bool:
+        """Nav2 goal 세션 중에만 TF 를 실시간 반영."""
+        with self._lock:
+            return bool(self._is_navigating or self._nav_session_active)
+
+    def _is_driving(self) -> bool:
+        with self._lock:
+            return bool(
+                self._is_navigating
+                or self._nav_session_active
+                or self._tour_active
+                or self._visual_dock_active
+            )
+
+    def _pin_visual_dock_pose(self) -> bool:
+        """아루코 도킹 중 모니터 pose 를 선반 위치에 고정."""
+        with self._lock:
+            if not self._visual_dock_active:
+                return False
+            pose = self._visual_dock_pose or self._nav_pose
+            if pose is None:
+                lg = self._last_good_map_pose
+                wp = self._last_waypoint_pose
+                for alt in (lg, wp):
+                    if alt is not None:
+                        pose = alt
+                        self._visual_dock_pose = alt
+                        break
+            if pose is None:
+                return False
+            self._nav_pose = pose
+            if not self._pose_is_home(pose):
+                self._last_good_map_pose = pose
+            return True
+
     def _freeze_localization_idle(
         self, pose: tuple[float, float, float] | None = None
     ) -> None:
         """Stop AMCL updates and pin monitor pose (대기 모드)."""
+        if self._is_driving():
+            if self._node:
+                self._node.get_logger().info(
+                    "idle freeze skipped (nav/tour active)"
+                )
+            return
         if self._visual_dock_active:
             with self._lock:
                 pose = self._visual_dock_pose or self._nav_pose
@@ -783,6 +843,9 @@ class Ros2Backend(RobotBackend):
             self._nav_session_saw_active = False
             self._is_navigating = True
             self._localization_idle_frozen = False
+            # 주행 시작 시 pose hold 해제 — 안 하면 TF 갱신이 멈춤
+            self._pose_hold_until = 0.0
+            self._pose_hold_target = None
             if self._nav_pose is not None and not self._pose_is_home(self._nav_pose):
                 self._home_seed_locked_out = True
             elif (
@@ -807,7 +870,7 @@ class Ros2Backend(RobotBackend):
                     return
                 if sid != self._nav_session_id:
                     return
-                if self._nav_session_active or self._is_navigating:
+                if self._nav_session_active or self._is_navigating or self._tour_active:
                     return
                 if self._localization_idle_frozen:
                     return
@@ -856,6 +919,8 @@ class Ros2Backend(RobotBackend):
         block_home = (
             tour_or_work or away_from_home or self._should_block_home_seed()
         )
+        if block_home and self._goal_is_home():
+            block_home = False
         seed: tuple[float, float, float] | None = None
         if x is not None and y is not None:
             seed = (float(x), float(y), float(yaw if yaw is not None else 0.0))
@@ -993,6 +1058,20 @@ class Ros2Backend(RobotBackend):
             )
 
         if seed is None:
+            repl = self._non_home_seed_source()
+            if repl is not None:
+                seed = (
+                    repl[0],
+                    repl[1],
+                    float(yaw) if yaw is not None else repl[2],
+                )
+                if self._node:
+                    self._node.get_logger().warn(
+                        "ensure localization → no TF; reseed from cached pose "
+                        f"({seed[0]:.3f},{seed[1]:.3f})"
+                    )
+
+        if seed is None:
             # 홈 시드 없이 TF 만 대기
             settle = float(os.environ.get("PINKY_LOCALIZE_SETTLE_SEC", "1.0"))
             if was_idle_frozen or not amcl_on:
@@ -1109,6 +1188,9 @@ class Ros2Backend(RobotBackend):
                     "monitor seed home skipped (tour/work or non-home pose)"
                 )
             return
+        with self._lock:
+            if self._visual_dock_active:
+                return
         from ..home_poses import home_pose_for_device
 
         x, y, yaw = home_pose_for_device()
@@ -1416,15 +1498,20 @@ class Ros2Backend(RobotBackend):
         return None
 
     def _update_pose_from_tf(self) -> None:
+        if self._pin_visual_dock_pose():
+            return
+        live_tf = self._is_nav_session_live()
         with self._lock:
-            if self._localization_idle_frozen:
+            # Nav2 주행 중에만 idle freeze 무시; 아루코 도킹은 visual_dock_pose 고정
+            if self._localization_idle_frozen and not live_tf:
                 return
             last_good = self._last_good_map_pose
         tf_pose = self._lookup_tf_pose()
         if tf_pose is None:
             return
         x, y, yaw = tf_pose
-        if self._spurious_home_tf(tf_pose, last_good):
+        # Nav2 주행 중에만 TF 그대로; 그 외 홈 순간점프는 무시
+        if not live_tf and self._spurious_home_tf(tf_pose, last_good):
             if self._node and (time.time() - self._last_home_correct_t) >= 1.0:
                 keep = last_good or self._last_waypoint_pose
                 keep_s = (
@@ -1435,19 +1522,20 @@ class Ros2Backend(RobotBackend):
                 )
             self._correct_home_jump()
             return
-        near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.35"))
         now = time.time()
         with self._lock:
-            hold_until = self._pose_hold_until
-            hold_target = self._pose_hold_target
-            if hold_until > now and hold_target is not None:
-                hx, hy, _hyaw = hold_target
+            if live_tf:
+                self._localization_idle_frozen = False
+                self._pose_hold_until = 0.0
+                self._pose_hold_target = None
+            elif self._pose_hold_until > now and self._pose_hold_target is not None:
+                hx, hy, _hyaw = self._pose_hold_target
+                near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.35"))
                 dx = x - hx
                 dy = y - hy
                 if (dx * dx + dy * dy) ** 0.5 > near_m:
-                    return
-                self._pose_hold_until = 0.0
-                self._pose_hold_target = None
+                    self._pose_hold_until = 0.0
+                    self._pose_hold_target = None
             self._nav_pose = (x, y, yaw)
             if not self._pose_is_home((x, y, yaw)):
                 self._last_good_map_pose = (x, y, yaw)
@@ -1457,6 +1545,16 @@ class Ros2Backend(RobotBackend):
                 self._last_good_map_pose = (x, y, yaw)
 
     def get_nav_pose(self) -> dict[str, float] | None:
+        if self._pin_visual_dock_pose():
+            pass
+        elif self._is_nav_session_live():
+            tf_pose = self._lookup_tf_pose()
+            if tf_pose is not None and not self._spurious_home_tf(tf_pose):
+                x, y, yaw = tf_pose
+                with self._lock:
+                    self._nav_pose = (x, y, yaw)
+                    if not self._pose_is_home((x, y, yaw)):
+                        self._last_good_map_pose = (x, y, yaw)
         with self._lock:
             if self._nav_pose is None:
                 return None
@@ -1804,12 +1902,12 @@ class Ros2Backend(RobotBackend):
             goal.pose.pose.orientation.w = math.cos(float(yaw) / 2.0)
             return goal
 
-        # 잔여 goal 이 있을 때만 cancel (무조건 cancel→send 는 REJECT 레이스)
-        if self.is_navigating():
-            try:
-                self._cancel_nav_sync(timeout_sec=2.0)
-            except Exception:
-                pass
+        # 잔여 goal cancel — Nav2는 동시 goal을 거부하므로 항상 정리
+        try:
+            self._cancel_nav_sync(timeout_sec=2.0)
+        except Exception:
+            pass
+        time.sleep(0.1)
 
         if self._wait_usable_tf(1.5) is None:
             return {
@@ -1883,11 +1981,11 @@ class Ros2Backend(RobotBackend):
                 self._ensure_localization_for_drive()
             except Exception:
                 pass
-            if self.is_navigating():
-                try:
-                    self._cancel_nav_sync(timeout_sec=2.0)
-                except Exception:
-                    pass
+            try:
+                self._cancel_nav_sync(timeout_sec=2.0)
+            except Exception:
+                pass
+            time.sleep(0.15)
             if self._wait_usable_tf(1.0) is None:
                 return _finish(
                     {
@@ -2368,8 +2466,8 @@ class Ros2Backend(RobotBackend):
             return {"success": True, "message": "relative move: no movement", "movedM": 0.0}
         if speed <= 0.0 or speed > 0.08:
             return {"success": False, "message": "speedMps must be > 0 and <= 0.08"}
-        if abs(distance) > 0.20:
-            return {"success": False, "message": "relative move limited to 0.20m per call"}
+        if abs(distance) > 0.30:
+            return {"success": False, "message": "relative move limited to 0.30m per call"}
         if self.is_navigating():
             return {"success": False, "message": "navigation is active; relative move refused"}
 

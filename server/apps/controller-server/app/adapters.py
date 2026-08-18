@@ -128,6 +128,23 @@ class MockCartAdapter:
             "message": "mock aruco dock",
             "markerId": int(marker_id),
             "distanceM": float(standoff_m),
+            "approachTravelM": float(standoff_m),
+        }
+
+    def relative_move(
+        self,
+        device_code: str,
+        distance_m: float,
+        *,
+        speed_mps: float = 0.02,
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any]:
+        del device_code, speed_mps, timeout_sec
+        return {
+            "success": True,
+            "message": "mock relative move",
+            "movedM": abs(float(distance_m)),
+            "requestedM": float(distance_m),
         }
 
 
@@ -489,3 +506,32 @@ class PinkyHttpCartAdapter:
             result.get("message") or result.get("status") or "aruco_dock failed"
         )
         return result
+
+    def relative_move(
+        self,
+        device_code: str,
+        distance_m: float,
+        *,
+        speed_mps: float = 0.02,
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any]:
+        """POST /nav/relative_move — odom closed-loop micro motion (undock)."""
+        payload: dict[str, Any] = {
+            "distanceM": float(distance_m),
+            "speedMps": float(speed_mps),
+        }
+        if timeout_sec is not None:
+            payload["timeoutSec"] = float(timeout_sec)
+        timeout = float(timeout_sec) if timeout_sec is not None else max(
+            3.0, abs(float(distance_m)) / max(float(speed_mps), 0.01) + 2.0
+        )
+        try:
+            return self._post(
+                device_code,
+                "/nav/relative_move",
+                payload,
+                timeout=timeout + 5.0,
+                accept_http_error=True,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            return {"success": False, "message": str(exc)}
