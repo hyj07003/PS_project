@@ -48,6 +48,17 @@ class RobotBackend(ABC):
     @abstractmethod
     def drive(self, linear_x: float, angular_z: float) -> dict[str, Any]: ...
 
+    def relative_move(
+        self,
+        distance_m: float,
+        speed_mps: float = 0.02,
+        timeout_sec: float | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        del distance_m, speed_mps, timeout_sec, dry_run
+        return {"success": False, "message": "relative move not supported"}
+
     @abstractmethod
     def is_online(self) -> bool: ...
 

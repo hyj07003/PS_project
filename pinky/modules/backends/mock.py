@@ -144,6 +144,44 @@ class MockBackend(RobotBackend):
         self._cmd_vel = {"linearX": float(linear_x), "angularZ": float(angular_z)}
         return {"success": True, "message": "mock cmd_vel ok", "cmdVel": self._cmd_vel}
 
+    def relative_move(
+        self,
+        distance_m: float,
+        speed_mps: float = 0.02,
+        timeout_sec: float | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        del timeout_sec
+        distance = float(distance_m)
+        speed = abs(float(speed_mps))
+        if abs(distance) < 1e-6:
+            return {"success": True, "message": "mock relative move: no movement", "movedM": 0.0}
+        if speed <= 0.0:
+            return {"success": False, "message": "speedMps must be > 0"}
+        if self._is_navigating:
+            return {"success": False, "message": "navigation is active"}
+        if dry_run:
+            return {
+                "success": True,
+                "dryRun": True,
+                "message": "mock relative move precheck ok",
+                "requestedM": distance,
+                "speedMps": speed,
+            }
+        yaw = float(self._nav_pose["yaw"])
+        self._nav_pose["x"] += distance * math.cos(yaw)
+        self._nav_pose["y"] += distance * math.sin(yaw)
+        self._cmd_vel = {"linearX": 0.0, "angularZ": 0.0}
+        return {
+            "success": True,
+            "message": "mock relative move complete",
+            "requestedM": distance,
+            "movedM": abs(distance),
+            "speedMps": speed,
+            "pose": dict(self._nav_pose),
+        }
+
     def get_nav_pose(self) -> dict[str, float] | None:
         self._tick_nav()
         return dict(self._nav_pose)

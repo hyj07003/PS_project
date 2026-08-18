@@ -47,6 +47,10 @@ class Ros2Backend(RobotBackend):
         self._scan: LidarData | None = None
         self._imu: ImuData | None = None
         self._us: UltrasonicData | None = None
+        self._odom_pose: tuple[float, float, float] | None = None
+        self._odom_twist: tuple[float, float] | None = None
+        self._odom_stamp: float | None = None
+        self._motion_lock = threading.Lock()
         self._battery_source = "ros2"
         self._imu_source = "ros2"
         self._us_source = "ros2"
@@ -95,6 +99,7 @@ class Ros2Backend(RobotBackend):
             return
         try:
             from geometry_msgs.msg import Twist
+            from nav_msgs.msg import Odometry
             from rclpy.node import Node
             from sensor_msgs.msg import Imu, LaserScan, Range
             from std_msgs.msg import Float32, UInt16MultiArray
@@ -121,6 +126,7 @@ class Ros2Backend(RobotBackend):
             Float32, "battery/voltage", self._on_battery_voltage, 10
         )
         self._node.create_subscription(LaserScan, "scan", self._on_scan, 10)
+        self._node.create_subscription(Odometry, "odom", self._on_odom, 20)
         self._node.create_subscription(Imu, "imu_raw", self._on_imu, 10)
         self._node.create_subscription(Range, "us_sensor/range", self._on_us, 10)
         self._node.create_subscription(
@@ -1056,13 +1062,22 @@ class Ros2Backend(RobotBackend):
         wrapped = result_future.result()
         if wrapped is None:
             return {"success": False, "message": "no path planning result"}
-        if int(wrapped.status) != GoalStatus.STATUS_SUCCEEDED:
+
+        action_status = int(wrapped.status)
+        action_result = wrapped.result
+        error_code = int(getattr(action_result, "error_code", 0) or 0)
+        error_msg = str(getattr(action_result, "error_msg", "") or "")
+
+        if action_status != GoalStatus.STATUS_SUCCEEDED:
             return {
                 "success": False,
-                "message": f"path planning ended with status {int(wrapped.status)}",
+                "message": f"path planning ended with status {action_status}",
+                "actionStatus": action_status,
+                "errorCode": error_code,
+                "errorMsg": error_msg,
             }
 
-        path = self._path_msg_to_plan_dict(wrapped.result.path)
+        path = self._path_msg_to_plan_dict(action_result.path)
         if not path["poses"]:
             return {"success": False, "message": "planner returned empty path"}
         with self._lock:
@@ -1070,6 +1085,9 @@ class Ros2Backend(RobotBackend):
         return {
             "success": True,
             "message": "path computed without moving robot",
+            "actionStatus": action_status,
+            "errorCode": error_code,
+            "errorMsg": error_msg,
             "goal": {"x": float(x), "y": float(y), "yaw": float(yaw)},
             "path": path,
         }
@@ -1681,6 +1699,21 @@ class Ros2Backend(RobotBackend):
         with self._lock:
             self._scan = data
 
+    def _on_odom(self, msg) -> None:
+        pose = msg.pose.pose
+        yaw = self._quat_to_yaw(pose.orientation)
+        with self._lock:
+            self._odom_pose = (
+                float(pose.position.x),
+                float(pose.position.y),
+                float(yaw),
+            )
+            self._odom_twist = (
+                float(msg.twist.twist.linear.x),
+                float(msg.twist.twist.angular.z),
+            )
+            self._odom_stamp = time.time()
+
     def _on_imu(self, msg) -> None:
         data = ImuData(
             orientation={
@@ -1890,6 +1923,269 @@ class Ros2Backend(RobotBackend):
         req = Emotion.Request()
         req.emotion = emotion
         return self._call_service(self._set_emotion_cli, req)
+
+    @staticmethod
+    def _angle_error(current: float, reference: float) -> float:
+        return math.atan2(math.sin(current - reference), math.cos(current - reference))
+
+    def _publish_zero_velocity(self, repeats: int = 4, gap_sec: float = 0.04) -> None:
+        for _ in range(max(1, int(repeats))):
+            try:
+                self.drive(0.0, 0.0)
+            except Exception:
+                pass
+            if gap_sec > 0.0:
+                time.sleep(gap_sec)
+
+    def _wait_for_odom_stop(
+        self, timeout_sec: float = 0.8, linear_tol: float = 0.01, angular_tol: float = 0.08
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while time.monotonic() < deadline:
+            with self._lock:
+                twist = self._odom_twist
+                stamp = self._odom_stamp
+            if twist is not None and stamp is not None and time.time() - float(stamp) <= 0.5:
+                if abs(float(twist[0])) <= linear_tol and abs(float(twist[1])) <= angular_tol:
+                    return True
+            time.sleep(0.04)
+        return False
+
+    def _scan_clearance_base_x(
+        self,
+        direction: float,
+        corridor_half_width_m: float = 0.07,
+    ) -> tuple[float | None, str | None]:
+        """Nearest obstacle distance from base origin along +/- base X corridor."""
+        with self._lock:
+            scan = self._scan
+        if scan is None or scan.stamp is None:
+            return None, "scan unavailable"
+        age = time.time() - float(scan.stamp)
+        if age > 1.0:
+            return None, f"scan stale ({age:.2f}s)"
+        if self._tf_buffer is None or self._Time is None:
+            return None, "tf unavailable"
+        try:
+            trans = self._tf_buffer.lookup_transform(
+                "base_footprint", scan.frame_id or "rplidar_link", self._Time()
+            )
+        except Exception as exc:
+            return None, f"scan TF unavailable: {exc}"
+        t = trans.transform.translation
+        yaw = self._quat_to_yaw(trans.transform.rotation)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        sign = 1.0 if direction >= 0.0 else -1.0
+        nearest = math.inf
+        for i, raw_range in enumerate(scan.ranges):
+            r = float(raw_range)
+            if not math.isfinite(r) or r <= 0.0:
+                continue
+            if scan.range_min and r < float(scan.range_min):
+                continue
+            if scan.range_max and r > float(scan.range_max):
+                continue
+            angle = float(scan.angle_min) + i * float(scan.angle_increment)
+            sx = r * math.cos(angle)
+            sy_scan = r * math.sin(angle)
+            bx = float(t.x) + cy * sx - sy * sy_scan
+            by = float(t.y) + sy * sx + cy * sy_scan
+            forward = sign * bx
+            if forward <= 0.0 or abs(by) > float(corridor_half_width_m):
+                continue
+            nearest = min(nearest, forward)
+        return (nearest if math.isfinite(nearest) else math.inf), None
+
+    def relative_move(
+        self,
+        distance_m: float,
+        speed_mps: float = 0.02,
+        timeout_sec: float | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Closed-loop short translation using odom, with scan/TF safety checks.
+
+        This is intentionally limited to micro-motion used to leave/enter a known
+        docking pocket. It does not replace Nav2 for normal navigation.
+        """
+        distance = float(distance_m)
+        speed = abs(float(speed_mps))
+        if abs(distance) < 1e-4:
+            return {"success": True, "message": "relative move: no movement", "movedM": 0.0}
+        if speed <= 0.0 or speed > 0.08:
+            return {"success": False, "message": "speedMps must be > 0 and <= 0.08"}
+        if abs(distance) > 0.20:
+            return {"success": False, "message": "relative move limited to 0.20m per call"}
+        if self.is_navigating():
+            return {"success": False, "message": "navigation is active; relative move refused"}
+
+        readiness = self._fresh_navigation_readiness()
+        if (
+            readiness.get("ready") is not True
+            or readiness.get("tfValid") is not True
+            or readiness.get("scanFresh") is not True
+        ):
+            return {
+                "success": False,
+                "message": "navigation/TF/scan precheck failed",
+                "readiness": readiness,
+            }
+
+        with self._lock:
+            odom = self._odom_pose
+            odom_stamp = self._odom_stamp
+        odom_age = time.time() - float(odom_stamp) if odom_stamp is not None else math.inf
+        if odom is None or odom_age > 0.5:
+            return {"success": False, "message": f"odom unavailable/stale ({odom_age:.2f}s)"}
+
+        sign = 1.0 if distance > 0.0 else -1.0
+        corridor_half_width = 0.07
+        robot_half_length = 0.06
+        safety_margin = 0.03
+        clearance, clearance_error = self._scan_clearance_base_x(
+            sign, corridor_half_width
+        )
+        required_initial = robot_half_length + abs(distance) + safety_margin
+        if clearance_error is not None:
+            return {"success": False, "message": clearance_error}
+        if clearance is not None and clearance < required_initial:
+            return {
+                "success": False,
+                "message": "relative move blocked by scan",
+                "clearanceM": (clearance if clearance is not None and math.isfinite(clearance) else None),
+                "requiredClearanceM": required_initial,
+            }
+
+        if dry_run:
+            return {
+                "success": True,
+                "dryRun": True,
+                "message": "relative move safety precheck ok; no cmd_vel sent",
+                "requestedM": distance,
+                "speedMps": speed,
+                "odomAgeSec": odom_age,
+                "clearanceM": clearance,
+                "requiredClearanceM": required_initial,
+            }
+
+        if not self._motion_lock.acquire(blocking=False):
+            return {"success": False, "message": "another relative motion is active"}
+
+        start_x, start_y, start_yaw = odom
+        deadline = time.monotonic() + (
+            float(timeout_sec)
+            if timeout_sec is not None
+            else max(2.5, abs(distance) / speed + 2.0)
+        )
+        last_progress = 0.0
+        result: dict[str, Any] = {
+            "success": False,
+            "message": "relative move ended unexpectedly",
+            "movedM": 0.0,
+        }
+        stopped = False
+        try:
+            while True:
+                if time.monotonic() >= deadline:
+                    result = {
+                        "success": False,
+                        "message": "relative move timeout",
+                        "movedM": max(0.0, last_progress),
+                    }
+                    break
+                if self.is_navigating():
+                    result = {
+                        "success": False,
+                        "message": "navigation became active during relative move",
+                        "movedM": max(0.0, last_progress),
+                    }
+                    break
+                with self._lock:
+                    cur = self._odom_pose
+                    cur_stamp = self._odom_stamp
+                    visual_dock_active = self._visual_dock_active
+                if visual_dock_active:
+                    result = {
+                        "success": False,
+                        "message": "visual docking became active during relative move",
+                        "movedM": max(0.0, last_progress),
+                    }
+                    break
+                cur_age = (
+                    time.time() - float(cur_stamp) if cur_stamp is not None else math.inf
+                )
+                if cur is None or cur_age > 0.5:
+                    result = {
+                        "success": False,
+                        "message": f"odom became stale ({cur_age:.2f}s)",
+                        "movedM": max(0.0, last_progress),
+                    }
+                    break
+                dx, dy = cur[0] - start_x, cur[1] - start_y
+                forward = math.cos(start_yaw) * dx + math.sin(start_yaw) * dy
+                lateral = -math.sin(start_yaw) * dx + math.cos(start_yaw) * dy
+                progress = sign * forward
+                last_progress = progress
+                yaw_drift = abs(self._angle_error(cur[2], start_yaw))
+                if abs(lateral) > 0.035:
+                    result = {
+                        "success": False,
+                        "message": f"relative move lateral drift {lateral:.3f}m",
+                        "movedM": max(0.0, progress),
+                    }
+                    break
+                if yaw_drift > 0.18:
+                    result = {
+                        "success": False,
+                        "message": f"relative move yaw drift {yaw_drift:.3f}rad",
+                        "movedM": max(0.0, progress),
+                    }
+                    break
+                if progress >= abs(distance) - 0.003:
+                    result = {
+                        "success": True,
+                        "message": "relative move complete",
+                        "requestedM": distance,
+                        "movedM": max(0.0, progress),
+                        "lateralDriftM": lateral,
+                        "yawDriftRad": yaw_drift,
+                    }
+                    break
+
+                remaining = max(0.0, abs(distance) - progress)
+                clearance, clearance_error = self._scan_clearance_base_x(
+                    sign, corridor_half_width
+                )
+                if clearance_error is not None:
+                    result = {
+                        "success": False,
+                        "message": clearance_error,
+                        "movedM": max(0.0, progress),
+                    }
+                    break
+                required = robot_half_length + remaining + safety_margin
+                if clearance is not None and clearance < required:
+                    result = {
+                        "success": False,
+                        "message": "relative move obstacle detected",
+                        "movedM": max(0.0, progress),
+                        "clearanceM": clearance,
+                        "requiredClearanceM": required,
+                    }
+                    break
+                self.drive(sign * speed, 0.0)
+                time.sleep(0.05)
+        finally:
+            self._publish_zero_velocity()
+            stopped = self._wait_for_odom_stop()
+            self._motion_lock.release()
+
+        result["stopped"] = bool(stopped)
+        if result.get("success") and not stopped:
+            result["success"] = False
+            result["message"] = "relative move reached distance but odom stop was not confirmed"
+        return result
 
     def drive(self, linear_x: float, angular_z: float) -> dict[str, Any]:
         if self._cmd_vel_pub is None:
