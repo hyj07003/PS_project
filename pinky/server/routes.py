@@ -213,7 +213,10 @@ def nav_initialpose():
         return jsonify({"success": False, "message": "x,y required"}), 400
     yaw = float(body.get("yaw", 0.0))
     result = _robot().navigation.set_initial_pose(x, y, yaw)
-    status = 200 if result.get("success") else 502
+    if result.get("ignored"):
+        status = 200
+    else:
+        status = 200 if result.get("success") else 502
     return jsonify(result), status
 
 

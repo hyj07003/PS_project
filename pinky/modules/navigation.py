@@ -136,6 +136,7 @@ class NavigationModule:
                     pass
 
         get_lidar = getattr(self._backend, "get_lidar", None)
+        get_ultrasonic = getattr(self._backend, "get_ultrasonic", None)
 
         def _on_progress(info: dict[str, Any]) -> None:
             self._aruco_status = {
@@ -144,6 +145,8 @@ class NavigationModule:
                 "phaseLabel": info.get("phaseLabel"),
                 "markerId": info.get("markerId"),
                 "distanceM": info.get("distanceM"),
+                "distanceSource": info.get("distanceSource"),
+                "ultrasonicM": info.get("ultrasonicM"),
                 "centerErrorPx": info.get("centerErrorPx"),
                 "lateralM": info.get("lateralM"),
                 "yawErrRad": info.get("yawErrRad"),
@@ -157,6 +160,7 @@ class NavigationModule:
                 hold_pose=_hold_pose,
                 release_hold=_release_hold,
                 get_lidar=get_lidar if callable(get_lidar) else None,
+                get_ultrasonic=get_ultrasonic if callable(get_ultrasonic) else None,
                 on_progress=_on_progress,
                 standoff_m=standoff_m,
                 timeout_sec=timeout_sec,

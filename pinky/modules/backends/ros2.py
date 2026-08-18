@@ -1170,7 +1170,7 @@ class Ros2Backend(RobotBackend):
             return {"success": False, "message": "navigation not enabled"}
         # 작업/투어 중 S1/S2 initialpose 절대 금지 (ensure/boot/raw 공통)
         if self._pose_is_home((float(x), float(y), float(yaw))):
-            if not allow_home or self._should_block_home_seed():
+            if self._should_block_home_seed():
                 if self._node:
                     self._node.get_logger().warn(
                         f"refuse home initialpose ({float(x):.3f},{float(y):.3f}) "
@@ -1180,6 +1180,13 @@ class Ros2Backend(RobotBackend):
                 return {
                     "success": False,
                     "message": "home initialpose blocked during tour/work",
+                    "ignored": True,
+                    "pose": {"x": x, "y": y, "yaw": yaw},
+                }
+            if not allow_home:
+                return {
+                    "success": False,
+                    "message": "home initialpose requires allow_home",
                     "ignored": True,
                     "pose": {"x": x, "y": y, "yaw": yaw},
                 }
@@ -1296,7 +1303,11 @@ class Ros2Backend(RobotBackend):
                 self._localization_idle_frozen = False
             self._amcl_activate()
             result = self._publish_initial_pose_raw(
-                float(x), float(y), float(yaw), tight=True
+                float(x),
+                float(y),
+                float(yaw),
+                tight=True,
+                allow_home=self._pose_is_home((float(x), float(y), float(yaw))),
             )
             settle = float(os.environ.get("PINKY_LOCALIZE_SETTLE_SEC", "1.0"))
             if settle > 0:
@@ -1321,7 +1332,11 @@ class Ros2Backend(RobotBackend):
             return result
 
         result = self._publish_initial_pose_raw(
-            float(x), float(y), float(yaw), tight=True
+            float(x),
+            float(y),
+            float(yaw),
+            tight=True,
+            allow_home=self._pose_is_home((float(x), float(y), float(yaw))),
         )
         hold = float(os.environ.get("PINKY_POSE_HOLD_SEC", "12.0"))
         with self._lock:

@@ -19,6 +19,7 @@ from ..errors import ApiError
 from ..waypoints import (
     WAYPOINTS,
     aruco_marker_id_for_waypoint,
+    aruco_standoff_for_waypoint,
     get_waypoint,
     home_for_device,
     nearest_neighbor_order,
@@ -595,7 +596,7 @@ class OrdersService:
         marker_id = aruco_marker_id_for_waypoint(waypoint_id)
         if marker_id is None:
             return
-        standoff = float(os.environ.get("ARUCO_DOCK_STANDOFF_M", "0.12"))
+        standoff = aruco_standoff_for_waypoint(waypoint_id)
         timeout = float(os.environ.get("ARUCO_DOCK_TIMEOUT_SEC", "60"))
         attempts = max(1, int(os.environ.get("PICK_ARUCO_RETRIES", "2")))
         last_detail = "unknown"
@@ -606,6 +607,7 @@ class OrdersService:
             "FACE": "정면·자세 정렬 중",
             "SHIFT": "횡방향 위치 조정 중",
             "APPROACH": "접근·파킹 중",
+            "US_APPROACH": "초음파 접근 중",
             "ARRIVED": "도킹 완료",
             "TIMEOUT": "도킹 타임아웃",
             "NO_MARKER": "마커 미검출",

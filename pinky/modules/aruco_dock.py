@@ -5,10 +5,12 @@ Differential-drive flow:
   2) FACE    — rotate until marker is face-on (정면) and roughly centered
   3) SHIFT   — short wall-parallel steps (cap), then re-FACE / re-detect;
                 repeat until lateral (tx) and center are within tolerance
-  4) APPROACH — creep forward only after face+center+lateral; stop at standoff (~12cm)
+  4) APPROACH — creep forward only after face+center+lateral; stop at standoff (~7cm)
+  5) US_APPROACH — marker lost while close; finish with ultrasonic (2nd priority)
 
+거리 측정: 마커(1순위) → 초음파(2순위, APPROACH 중 마커 소실 시).
 도착(ARRIVED)은 거리만으로 판단하지 않음. 정자세(중앙·횡·정면)가 우선이고,
-정렬된 상태에서 standoff 이내일 때만 완료.
+정렬된 상태에서 standoff 이내일 때만 완료 (US_APPROACH는 자세 정렬 후만 진입).
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ CancelFn = Callable[[], Any]
 HoldFn = Callable[[], Any]
 ReleaseHoldFn = Callable[[], Any]
 LidarFn = Callable[[], Any]
+UltrasonicFn = Callable[[], Any]
 ProgressFn = Callable[[dict[str, Any]], Any]
 
 ARUCO_PHASE_LABELS_KO: dict[str, str] = {
@@ -37,6 +40,7 @@ ARUCO_PHASE_LABELS_KO: dict[str, str] = {
     "FACE": "정면·자세 정렬 중",
     "SHIFT": "횡방향 위치 조정 중",
     "APPROACH": "접근·파킹 중",
+    "US_APPROACH": "초음파 접근 중",
     "ARRIVED": "도킹 완료",
     "LOST": "마커 재탐색 중",
     "TIMEOUT": "도킹 타임아웃",
@@ -372,6 +376,40 @@ def _detect_marker(
     }
 
 
+def _read_ultrasonic_m(get_ultrasonic: UltrasonicFn | None) -> float | None:
+    """Front ultrasonic range (m), or None if unavailable."""
+    if get_ultrasonic is None:
+        return None
+    try:
+        data = get_ultrasonic()
+    except Exception:
+        return None
+    if data is None:
+        return None
+    r: float | None
+    if isinstance(data, dict):
+        raw = data.get("rangeM", data.get("range_m"))
+        r = float(raw) if raw is not None else None
+        rmin = float(data.get("minRange", data.get("min_range", 0.02)) or 0.02)
+        rmax = float(data.get("maxRange", data.get("max_range", 3.0)) or 3.0)
+    else:
+        r = getattr(data, "range_m", None)
+        rmin = float(getattr(data, "min_range", 0.02) or 0.02)
+        rmax = float(getattr(data, "max_range", 3.0) or 3.0)
+        if r is not None:
+            r = float(r)
+    if r is None or r <= 0 or math.isnan(r) or math.isinf(r):
+        return None
+    if r < rmin or r > rmax:
+        return None
+    return r
+
+
+def _us_fallback_enabled() -> bool:
+    raw = (os.environ.get("PINKY_ARUCO_US_FALLBACK") or "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
 def _front_wall_angle_rad(get_lidar: LidarFn | None) -> float | None:
     """Estimate wall angle (rad in base frame) from frontal lidar points. 0 = wall facing robot."""
     if get_lidar is None:
@@ -442,6 +480,7 @@ def run_aruco_dock(
     hold_pose: HoldFn | None = None,
     release_hold: ReleaseHoldFn | None = None,
     get_lidar: LidarFn | None = None,
+    get_ultrasonic: UltrasonicFn | None = None,
     on_progress: ProgressFn | None = None,
     standoff_m: float | None = None,
     timeout_sec: float | None = None,
@@ -451,7 +490,12 @@ def run_aruco_dock(
     standoff = float(
         standoff_m
         if standoff_m is not None
-        else _env_float("PINKY_ARUCO_DOCK_STANDOFF_M", 0.12)
+        else _env_float("PINKY_ARUCO_DOCK_STANDOFF_M", 0.07)
+    )
+    us_fallback = _us_fallback_enabled() and get_ultrasonic is not None
+    us_lost_marker_m = max(
+        standoff * 2.5,
+        _env_float("PINKY_ARUCO_US_LOST_MARKER_M", standoff + 0.25),
     )
     timeout = float(
         timeout_sec
@@ -606,6 +650,9 @@ def run_aruco_dock(
     shift_dir_last = 0.0  # 직전 횡이동 부호 (+1 CCW pivot / -1 CW)
     shift_stop_further = False  # 제로 통과·악화 시 추가 SHIFT 금지
     tx_samples: list[float] = []
+    us_fallback_active = False
+    pose_ready_before_approach = False
+    us_last: float | None = None
 
     def _search_yaw_rate() -> float:
         """Return ±search_w from paused wall-clock schedule (both sides)."""
@@ -736,6 +783,12 @@ def run_aruco_dock(
                     "yawErrRad": yaw_last,
                     "shiftIter": shift_iters,
                     "shiftMaxIters": shift_max_iters,
+                    "ultrasonicM": us_last,
+                    "distanceSource": (
+                        "ultrasonic"
+                        if phase == "US_APPROACH"
+                        else ("marker" if z_last is not None else None)
+                    ),
                 }
             )
         except Exception:
@@ -746,6 +799,69 @@ def run_aruco_dock(
         if remain <= 0.0:
             return 0.0
         return min(approach_v_max, max(0.012, approach_gain * remain))
+
+    def _can_us_fallback() -> bool:
+        """APPROACH 중 가까워져 마커가 안 보일 때만 초음파로 이어감."""
+        if not us_fallback or z_last is None:
+            return False
+        if phase not in ("APPROACH", "US_APPROACH"):
+            return False
+        if not pose_ready_before_approach and not us_fallback_active:
+            return False
+        return z_last <= us_lost_marker_m or us_fallback_active
+
+    def _run_us_approach() -> dict[str, Any] | None:
+        """초음파 거리로 standoff까지 전진. ARRIVED 시 result dict, 아니면 None."""
+        nonlocal phase, us_fallback_active, us_last, z_last
+        us = _read_ultrasonic_m(get_ultrasonic)
+        if us is not None:
+            us_last = us
+            z_last = us
+        phase = "US_APPROACH"
+        us_fallback_active = True
+        _report("US_APPROACH")
+        if us is None:
+            stop()
+            return None
+        if us <= standoff:
+            stop()
+            _report("ARRIVED", force=True)
+            if release_hold is None:
+                _rehold()
+            return {
+                "success": True,
+                "status": "ARRIVED",
+                "message": "aruco dock arrived (ultrasonic)",
+                "markerId": int(marker_id),
+                "distanceM": us,
+                "distanceSource": "ultrasonic",
+                "centerErrorPx": center_err,
+                "lateralM": tx_last,
+                "yawErrRad": yaw_last,
+                "phase": "ARRIVED",
+                "phaseLabel": phase_label_ko("ARRIVED"),
+            }
+        v_cmd = _approach_speed(us)
+        if v_cmd <= 0.0:
+            stop()
+            _report("ARRIVED", force=True)
+            if release_hold is None:
+                _rehold()
+            return {
+                "success": True,
+                "status": "ARRIVED",
+                "message": "aruco dock arrived (ultrasonic standoff)",
+                "markerId": int(marker_id),
+                "distanceM": us,
+                "distanceSource": "ultrasonic",
+                "centerErrorPx": center_err,
+                "lateralM": tx_last,
+                "yawErrRad": yaw_last,
+                "phase": "ARRIVED",
+                "phaseLabel": phase_label_ko("ARRIVED"),
+            }
+        drive(v_cmd, 0.0)
+        return None
 
     def _start_shift(tx: float) -> bool:
         """One micro wall-parallel step, then FACE re-detect. Returns False if should stop shifting."""
@@ -873,6 +989,9 @@ def run_aruco_dock(
                 continue
 
             if det is not None:
+                if phase == "US_APPROACH":
+                    phase = "APPROACH"
+                    us_fallback_active = False
                 z = float(det["distanceM"])
                 z_last = z
                 tx = float(det["tx"])
@@ -979,6 +1098,7 @@ def run_aruco_dock(
                             continue
                         # iter 한도·오버슈트 가드 — 자세 최대한 맞춘 뒤 APPROACH
                         phase = "APPROACH"
+                        pose_ready_before_approach = True
                         _report("APPROACH", force=True)
                         time.sleep(0.05)
                         continue
@@ -1011,6 +1131,7 @@ def run_aruco_dock(
                         # 오버슈트 가드(shift_stop_further)는 유지 — 같은 방향 재SHIFT 방지
                         if not shift_stop_further:
                             shift_tx_before = None
+                    pose_ready_before_approach = True
                     _report("APPROACH", force=True)
                     time.sleep(0.05)
                     continue
@@ -1028,6 +1149,7 @@ def run_aruco_dock(
                 if lat_ready and not shift_stop_further:
                     shift_iters = 0
                     shift_tx_before = None
+                pose_ready_before_approach = True
                 _report("APPROACH")
                 # 접근 중에도 자세 깨지면 전진 중단 → FACE
                 if not center_ok or (
@@ -1087,6 +1209,12 @@ def run_aruco_dock(
                 drive(v_cmd, yaw_trim)
             else:
                 stop()
+                if phase == "US_APPROACH" or _can_us_fallback():
+                    arrived = _run_us_approach()
+                    if arrived is not None:
+                        return arrived
+                    time.sleep(0.04)
+                    continue
                 if phase != "SEARCH":
                     _enter_search(fresh=False)
                 else:

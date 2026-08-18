@@ -117,7 +117,7 @@ class MockCartAdapter:
         self,
         device_code: str,
         marker_id: int,
-        standoff_m: float = 0.12,
+        standoff_m: float = 0.07,
         timeout_sec: float = 45.0,
     ) -> dict[str, Any]:
         del device_code, timeout_sec
@@ -457,7 +457,7 @@ class PinkyHttpCartAdapter:
         self,
         device_code: str,
         marker_id: int,
-        standoff_m: float = 0.12,
+        standoff_m: float = 0.07,
         timeout_sec: float = 45.0,
     ) -> dict[str, Any]:
         """POST /nav/aruco_dock — blocking visual approach to marker."""
