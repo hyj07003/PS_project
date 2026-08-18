@@ -127,7 +127,7 @@ class Ros2Backend(RobotBackend):
             UInt16MultiArray, "ir_sensor/range", self._on_ir, 10
         )
 
-        self._cmd_vel_pub = self._node.create_publisher(Twist, "cmd_vel_nav", 10)
+        self._cmd_vel_pub = self._node.create_publisher(Twist, "cmd_vel", 10)
 
         try:
             from pinky_interfaces.srv import Emotion, SetBrightness, SetLed
