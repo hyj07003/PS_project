@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import time
 
 from flask import Flask, jsonify
 from flask_cors import CORS
 
+from .adapters import OmxHttpStationAdapter, parse_omx_url
 from .config import load_env
 from .db import migrate, open_database
 from .errors import ApiError
@@ -16,6 +19,8 @@ from .services.orders import OrdersService
 from .services.products import ProductsService
 from .services.robot import RobotService
 from .services.users import UsersService
+
+logger = logging.getLogger(__name__)
 
 
 def create_app() -> Flask:
@@ -42,6 +47,34 @@ def create_app() -> Flask:
         "orders": orders,
         "robot": robot,
     }
+
+    omx_url = parse_omx_url()
+    adapter_mode = os.environ.get("ADAPTER_MODE", "").strip().lower()
+    if omx_url and adapter_mode != "mock":
+        logger.info("OMX remote station configured: %s", omx_url)
+
+        def _omx_startup_check() -> None:
+            time.sleep(1.0)
+            port = orders.station_port
+            if isinstance(port, OmxHttpStationAdapter):
+                reachable = port.is_reachable()
+                if reachable:
+                    logger.info("OMX health OK at %s", omx_url)
+                else:
+                    logger.warning(
+                        "OMX not reachable at %s — picks will use "
+                        "unreachable-override until server is up",
+                        omx_url,
+                    )
+
+        threading.Thread(target=_omx_startup_check, daemon=True).start()
+    elif omx_url:
+        logger.info(
+            "OMX_URL=%s but ADAPTER_MODE=mock — using MockStationAdapter",
+            omx_url,
+        )
+    else:
+        logger.info("OMX_URL not set — using MockStationAdapter for shelf picks")
 
     # Resume queue after restart
     try:

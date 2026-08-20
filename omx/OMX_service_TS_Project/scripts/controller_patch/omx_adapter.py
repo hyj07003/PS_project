@@ -4,7 +4,7 @@
 MockStationAdapter 와 같은 인터페이스를 유지하되, 수량과 인터럽트를 다룬다.
 
 환경변수
-    OMX_URL=http://127.0.0.1:8080        없으면 Mock 으로 동작
+    OMX_URL=http://192.168.129.50:8080   # OMX/로봇팔 PC LAN IP (관제 PC와 다름)
     OMX_POLL_SEC=0.5                     진행 상태 폴링 주기
     ADAPTER_MODE=mock                    기존 규약 그대로
 

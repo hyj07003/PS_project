@@ -520,7 +520,8 @@ pnpm dev:web          # Next.js :3000
 | `PINKY_URL`            | BFF/Controller → 1번 Pinky (`cart-1`)                         |
 | `PINKY_URL_2`          | (선택) 2번 Pinky (`cart-2`)                                    |
 | `PINKY_ROBOTS`         | (선택) `cart-1=url1,cart-2=url2` — 다대 등록 시 우선              |
-| `OMX_URL`              | OMX 로봇팔 서버 URL (예: `http://127.0.0.1:8080`)                 |
+| `OMX_URL`              | OMX 로봇팔 PC URL (예: `http://192.168.129.50:8080`, **관제 PC와 다른 머신**) |
+| `OMX_CONNECT_TIMEOUT_SEC` | OMX HTTP 연결 타임아웃 초 (기본 `5`, LAN/원격)                    |
 | `OMX_POLL_SEC`         | OMX `/pick/state` 폴링 주기 초 (기본 `0.5`)                        |
 | `OMX_PICK_TIMEOUT_SEC` | OMX 픽업 1회 타임아웃 초 (기본 `90`)                               |
 | `PICK_DWELL_SEC`       | C/P/S1/S2 도착 후 대기 초 (기본 `3`)                              |
@@ -596,8 +597,37 @@ netsh advfirewall firewall add rule name="SmartShop API 4000" dir=in action=allo
 | Next cross-origin 경고                 | `allowedDevOrigins`에 LAN 허용              |
 
 
----
+### OMX 로봇팔 (별도 PC)
 
+OMX 서버는 **로봇팔·카메라가 연결된 PC**에서 구동하고, 관제 PC는 HTTP로 픽업만 요청한다.
+
+| PC | 역할 | 포트 |
+|---|---|---|
+| 관제 PC | controller-server, web | 4100, 4000, 3000 |
+| OMX PC | `python -m omx_yolo.server` | 8080 (기본 `0.0.0.0` bind) |
+
+**OMX PC**
+
+```bash
+cd omx/OMX_service_TS_Project
+cp .env.example .env   # OMX_HOST=0.0.0.0, OMX_PORT=8080
+POLICY=/path/to/checkpoint ./scripts/start_server.sh
+# 기동 로그에 "관제 PC .env 예: OMX_URL=http://192.168.x.x:8080" 출력
+```
+
+**관제 PC** (`server/.env`)
+
+```env
+# ADAPTER_MODE=mock  ← 주석 처리 또는 삭제
+OMX_URL=http://192.168.129.50:8080   # OMX PC LAN IP
+OMX_CONNECT_TIMEOUT_SEC=5
+```
+
+**방화벽 (OMX PC)**: TCP 8080을 관제 PC(또는 같은 서브넷)에서 허용.
+
+OMX PC 브라우저 모니터: `http://<OMX PC IP>:8080/view`
+
+---
 
 
 ## 9. 데모 계정·시드 데이터

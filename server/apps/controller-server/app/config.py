@@ -39,3 +39,16 @@ def get_host() -> str:
 
 def get_port() -> int:
     return int(os.environ.get("CONTROLLER_PORT", "4100"))
+
+
+def get_omx_url() -> str | None:
+    raw = (os.environ.get("OMX_URL") or "").strip().rstrip("/")
+    if not raw:
+        return None
+    if not raw.startswith(("http://", "https://")):
+        raw = f"http://{raw}"
+    return raw
+
+
+def get_omx_connect_timeout() -> float:
+    return float(os.environ.get("OMX_CONNECT_TIMEOUT_SEC", "5"))

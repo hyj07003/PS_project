@@ -10,6 +10,7 @@ import { useAuth } from "@/lib/auth-context";
 const emptyForm: CreateProductInput = {
   categoryId: 1,
   name: "",
+  slug: "",
   description: "",
   price: 0,
   stock: 10,
@@ -88,6 +89,7 @@ export default function AdminProductsPage() {
     const zoom = (form.imageZoomUrl || "").trim();
     const payload: CreateProductInput = {
       ...form,
+      slug: (form.slug || "").trim() || undefined,
       imageFullUrl: full || zoom || "",
       // 확대 미지정·플레이스홀더 잔존 시 전체 이미지 사용
       imageZoomUrl:
@@ -173,6 +175,18 @@ export default function AdminProductsPage() {
             onChange={(e) => setForm({ ...form, name: e.target.value })}
             required
           />
+        </label>
+        <label>
+          slug (웨이포인트 매칭용)
+          <input
+            value={form.slug || ""}
+            onChange={(e) => setForm({ ...form, slug: e.target.value })}
+            placeholder="예: cake, roll-cake, milk…"
+          />
+          <span className="muted" style={{ fontSize: "0.85rem" }}>
+            W1~W6 매핑: cake, roll-cake, milk, biscuit, ice-cream, sandwich.
+            비우면 상품명으로 자동 생성됩니다.
+          </span>
         </label>
         <label>
           카테고리
@@ -327,6 +341,7 @@ export default function AdminProductsPage() {
           <tr>
             <th>ID</th>
             <th>이름</th>
+            <th>slug</th>
             <th>가격</th>
             <th>히어로</th>
             <th>활성</th>
@@ -338,6 +353,9 @@ export default function AdminProductsPage() {
             <tr key={p.id}>
               <td>{p.id}</td>
               <td>{p.name}</td>
+              <td>
+                <code style={{ fontSize: "0.85rem" }}>{p.slug}</code>
+              </td>
               <td>{formatPriceKrw(p.price)}</td>
               <td>{p.isFeatured ? "Y" : "-"}</td>
               <td>{p.isActive ? "Y" : "N"}</td>

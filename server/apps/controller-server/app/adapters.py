@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Literal
+
+from .config import get_omx_connect_timeout, get_omx_url
+
+logger = logging.getLogger(__name__)
 
 ORDER_FLOW = [
     "CREATED",
@@ -62,8 +67,8 @@ def parse_pinky_robot_urls() -> dict[str, str]:
 
 
 def parse_omx_url() -> str | None:
-    raw = (os.environ.get("OMX_URL") or "").strip().rstrip("/")
-    return raw or None
+    """OMX 로봇팔 PC URL (관제 PC와 다른 머신일 수 있음)."""
+    return get_omx_url()
 
 
 class MockCartAdapter:
@@ -239,8 +244,19 @@ class OmxHttpStationAdapter:
             else os.environ.get("OMX_POLL_SEC", "0.5")
         )
         self.pick_timeout_sec = float(os.environ.get("OMX_PICK_TIMEOUT_SEC", "90"))
+        self.connect_timeout = get_omx_connect_timeout()
         self.last_error: str | None = None
         self.last_state: dict[str, Any] = {}
+        if self.url:
+            logger.info(
+                "OMX adapter: %s (connect_timeout=%.1fs, poll=%.2fs)",
+                self.url,
+                self.connect_timeout,
+                self.poll_sec,
+            )
+
+    def _request_timeout(self, timeout: float) -> float:
+        return max(float(timeout), self.connect_timeout)
 
     def _post(self, path: str, body: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
         if not self.url:
@@ -252,7 +268,9 @@ class OmxHttpStationAdapter:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as res:
+            with urllib.request.urlopen(
+                req, timeout=self._request_timeout(timeout)
+            ) as res:
                 return json.loads(res.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
@@ -269,16 +287,19 @@ class OmxHttpStationAdapter:
         if not self.url:
             raise RuntimeError("OMX_URL is not configured")
         req = urllib.request.Request(f"{self.url}{path}", method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as res:
+        with urllib.request.urlopen(
+            req, timeout=self._request_timeout(timeout)
+        ) as res:
             return json.loads(res.read().decode("utf-8"))
 
     def is_reachable(self) -> bool:
         if not self.url:
             return False
         try:
-            health = self._get("/health", timeout=2.0)
+            health = self._get("/health", timeout=min(3.0, self.connect_timeout))
             return bool(health.get("robotConnected", False))
-        except Exception:
+        except Exception as exc:
+            logger.debug("OMX unreachable at %s: %s", self.url, exc)
             return False
 
     def supported_slugs(self) -> list[str]:

@@ -47,6 +47,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -68,6 +70,35 @@ BOXES = ("box1", "box2")
 SHELF_CAPACITY = 3
 
 
+def _cors_allow_origin() -> str:
+    """LAN/원격 관제·브라우저에서 접근할 때 CORS. 기본 * (인증 없음)."""
+    return (os.environ.get("OMX_ALLOW_ORIGINS") or "*").strip() or "*"
+
+
+def _list_lan_urls(port: int) -> list[str]:
+    """관제 .env 의 OMX_URL 설정용 LAN 주소 목록."""
+    seen: set[str] = set()
+    urls: list[str] = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and ip not in seen:
+                seen.add(ip)
+                urls.append(f"http://{ip}:{port}")
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip.startswith("127."):
+                continue
+            if ip not in seen:
+                seen.add(ip)
+                urls.append(f"http://{ip}:{port}")
+    except OSError:
+        pass
+    return urls
 
 
 class ArmController:
@@ -587,11 +618,23 @@ def make_handler(ctrl: ArmController):
         def log_message(self, fmt, *args):           # 기본 stderr 로그 억제
             logger.info("%s - %s", self.address_string(), fmt % args)
 
+        def _add_cors_headers(self) -> None:
+            origin = _cors_allow_origin()
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+        def do_OPTIONS(self):                        # noqa: N802
+            self.send_response(204)
+            self._add_cors_headers()
+            self.end_headers()
+
         def _send(self, code: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self._add_cors_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -605,6 +648,7 @@ def make_handler(ctrl: ArmController):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self._add_cors_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -749,8 +793,16 @@ def make_handler(ctrl: ArmController):
 def main() -> None:
     p = argparse.ArgumentParser(description="OMX 픽업 서버")
     p.add_argument("--policy", required=True, help="정책 체크포인트 절대 경로")
-    p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("OMX_PORT", "8080")),
+    )
+    p.add_argument(
+        "--host",
+        default=os.environ.get("OMX_HOST", "0.0.0.0"),
+        help="bind 주소. LAN에서 관제 PC가 접속하려면 0.0.0.0 (기본)",
+    )
     p.add_argument("--robot-port", default="/dev/omx_follower")
     p.add_argument("--robot-id", default="omx_follower_arm")
     p.add_argument("--top", default="/dev/omx_cam_top")
@@ -766,8 +818,19 @@ def main() -> None:
     ctrl = ArmController(a.policy, a.robot_port, a.robot_id, a.top, a.hand,
                          a.weights, annotate=not a.no_annotate)
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(ctrl))
-    logger.info("서버 시작 http://%s:%d  (주석 %s)",
-                a.host, a.port, "켬" if not a.no_annotate else "끔")
+    logger.info(
+        "서버 시작 http://%s:%d  (주석 %s, CORS=%s)",
+        a.host,
+        a.port,
+        "켬" if not a.no_annotate else "끔",
+        _cors_allow_origin(),
+    )
+    lan_urls = _list_lan_urls(a.port)
+    if lan_urls:
+        logger.info("관제 PC .env 예: OMX_URL=%s", lan_urls[0])
+        for url in lan_urls[1:]:
+            logger.info("  (추가 LAN) %s", url)
+    logger.info("방화벽: TCP %d 허용 필요 (관제 PC → 이 PC)", a.port)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
