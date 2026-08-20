@@ -132,6 +132,15 @@ def _kill_nav2_stacks() -> None:
         "nav2_container",
         "component_container_isolated",
         "bringup_launch.xml",
+        "amcl --ros-args",
+        "map_server --ros-args",
+        "bt_navigator",
+        "controller_server",
+        "planner_server",
+        "behavior_server",
+        "waypoint_follower",
+        "velocity_smoother",
+        "collision_monitor",
     )
     for pat in patterns:
         try:
@@ -145,6 +154,30 @@ def _kill_nav2_stacks() -> None:
         except Exception as exc:
             logger.warning("pkill %s failed: %s", pat, exc)
     time.sleep(2.0)
+
+
+def _kill_stale_pro_stack() -> None:
+    """Kill leftover bringup+Nav2 from a previous run.py that did not atexit."""
+    logger.warning("killing leftover pinky_pro / Nav2 processes from a previous run")
+    patterns = (
+        "pinky_bringup",
+        "bringup_robot.launch.xml",
+        "sllidar_ros2",
+        "battery_publisher",
+    )
+    _kill_nav2_stacks()
+    for pat in patterns:
+        try:
+            subprocess.run(
+                ["pkill", "-f", pat],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception as exc:
+            logger.warning("pkill %s failed: %s", pat, exc)
+    time.sleep(1.5)
 
 
 class ProStackLauncher:
@@ -171,6 +204,7 @@ class ProStackLauncher:
 
         dup = _count_nav2_duplicates()
         replaced_dup = False
+        relaunch_bringup = True
         if _has_nav2_duplicates(dup):
             if _truthy("PINKY_NAV2_REPLACE_DUPLICATES", "1"):
                 logger.error(
@@ -179,6 +213,7 @@ class ProStackLauncher:
                 )
                 _kill_nav2_stacks()
                 replaced_dup = True
+                relaunch_bringup = False
                 dup = _count_nav2_duplicates()
                 if _has_nav2_duplicates(dup):
                     logger.error(
@@ -199,13 +234,23 @@ class ProStackLauncher:
                 return
 
         if _nav2_already_running() and not replaced_dup:
+            if _truthy("PINKY_NAV2_KEEP_EXISTING", "0"):
+                logger.warning(
+                    "Nav2/amcl already running — skip auto-launch "
+                    "(PINKY_NAV2_KEEP_EXISTING=1). counts=%s",
+                    dup or _count_nav2_duplicates(),
+                )
+                self._started = True
+                return
             logger.warning(
-                "Nav2/amcl already running — skip auto-launch "
-                "(PINKY_AUTO_LAUNCH would create duplicates). counts=%s",
+                "Nav2/amcl already running (likely leftover from previous run.py) "
+                "— replacing stale stack. counts=%s",
                 dup or _count_nav2_duplicates(),
             )
-            self._started = True
-            return
+            _kill_stale_pro_stack()
+            dup = _count_nav2_duplicates()
+            replaced_dup = True
+            relaunch_bringup = True
 
         map_yaml = resolve_map_yaml()
         logger.info("auto-launch pinky_pro | map=%s", map_yaml)
@@ -232,7 +277,7 @@ class ProStackLauncher:
 
         # 중복 정리 후에는 bringup(모터)이 남아 있을 수 있음 → Nav2만 재기동
         cmds: list[tuple[str, list[str]]] = []
-        if not replaced_dup:
+        if relaunch_bringup:
             cmds.append(
                 (
                     "bringup",
@@ -320,9 +365,6 @@ class ProStackLauncher:
         )
 
     def stop(self) -> None:
-        if not self._procs:
-            self._started = False
-            return
         logger.info("stopping pinky_pro launch subprocesses...")
         for proc in self._procs:
             try:
@@ -347,6 +389,9 @@ class ProStackLauncher:
                     except Exception:
                         pass
         self._procs.clear()
+        # start_new_session=True 라 Ctrl+C/SSH 끊김 때 고아가 남음 — 패턴으로 한 번 더 정리
+        if should_auto_launch_pro() and not _truthy("PINKY_NAV2_KEEP_EXISTING", "0"):
+            _kill_stale_pro_stack()
         self._started = False
         logger.info("pinky_pro launches stopped")
 

@@ -40,6 +40,47 @@ import {
   resolvePinkyUrl,
 } from "./pinky-client";
 
+function parseNavPath(raw: unknown): { x: number; y: number }[] {
+  if (!raw || typeof raw !== "object") return [];
+  const obj = raw as Record<string, unknown>;
+  let poses: unknown = obj.poses;
+  if (!Array.isArray(poses) && Array.isArray(obj.path)) {
+    poses = obj.path;
+  }
+  if (!Array.isArray(poses) && obj.path && typeof obj.path === "object") {
+    poses = (obj.path as { poses?: unknown }).poses;
+  }
+  if (!Array.isArray(poses)) return [];
+  const out: { x: number; y: number }[] = [];
+  for (const item of poses) {
+    if (!item || typeof item !== "object") continue;
+    const x = (item as { x?: unknown }).x;
+    const y = (item as { y?: unknown }).y;
+    if (typeof x === "number" && typeof y === "number" && Number.isFinite(x) && Number.isFinite(y)) {
+      out.push({ x, y });
+    }
+  }
+  return out;
+}
+
+function asNavPose(raw: unknown): { x: number; y: number; yaw: number } | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as { x?: unknown; y?: unknown; yaw?: unknown };
+  if (
+    typeof o.x !== "number" ||
+    typeof o.y !== "number" ||
+    !Number.isFinite(o.x) ||
+    !Number.isFinite(o.y)
+  ) {
+    return null;
+  }
+  return {
+    x: o.x,
+    y: o.y,
+    yaw: typeof o.yaw === "number" && Number.isFinite(o.yaw) ? o.yaw : 0,
+  };
+}
+
 function wrapError(err: unknown): never {
   const e = err as Error & { status?: number };
   throw new HttpException(e.message || "upstream error", e.status || 502);
@@ -368,10 +409,11 @@ export class AppController {
         }
 
         try {
-          const [health, sensors, navRaw] = await Promise.all([
+          const [health, sensors, navRaw, pathRaw] = await Promise.all([
             pinkyJson("/health", undefined, t.url),
             pinkyJson("/sensors", undefined, t.url),
             pinkyJson("/nav/state", undefined, t.url).catch(() => null),
+            pinkyJson("/nav/path", undefined, t.url).catch(() => null),
           ]);
           const home = homePoseForDevice(t.id);
           const navObj =
@@ -416,7 +458,10 @@ export class AppController {
           ]);
           const assignmentObj =
             assignment && typeof assignment === "object"
-              ? (assignment as { status?: string })
+              ? (assignment as {
+                  status?: string;
+                  currentWaypointPose?: unknown;
+                })
               : null;
           const hasActiveAssignment = Boolean(
             assignmentObj?.status && activeStatuses.has(assignmentObj.status),
@@ -432,11 +477,58 @@ export class AppController {
           });
           // 실제 로봇 pose 우선 — mismatch만으로 모니터를 홈으로 덮지 않음
           const pose = homeFix.synced ? home : livePose || home;
+          const actionState = String(
+            (navObj?.navigationAction as { state?: unknown } | undefined)?.state || "",
+          ).toUpperCase();
+          const navigating = Boolean(
+            navObj?.navigating ||
+              actionState === "ACCEPTED" ||
+              actionState === "EXECUTING" ||
+              actionState === "CANCELING",
+          );
+          const pathFromState = parseNavPath(navObj);
+          const pathPoints = parseNavPath(pathRaw);
+          let path =
+            navigating && pathPoints.length > 1
+              ? pathPoints
+              : navigating
+                ? pathFromState
+                : [];
+          const navGoal = navigating ? asNavPose(navObj?.goal) : null;
+          const assignmentGoal = hasActiveAssignment
+            ? asNavPose(assignmentObj?.currentWaypointPose)
+            : null;
+          const goal = navGoal || assignmentGoal;
+          if (
+            navigating &&
+            path.length < 2 &&
+            pose &&
+            goal &&
+            Number.isFinite(pose.x) &&
+            Number.isFinite(goal.x)
+          ) {
+            const sameXy =
+              Math.hypot(goal.x - pose.x, goal.y - pose.y) < 0.05;
+            path = sameXy
+              ? [
+                  { x: pose.x, y: pose.y },
+                  {
+                    x: pose.x + 0.35 * Math.cos(goal.yaw),
+                    y: pose.y + 0.35 * Math.sin(goal.yaw),
+                  },
+                ]
+              : [
+                  { x: pose.x, y: pose.y },
+                  { x: goal.x, y: goal.y },
+                ];
+          }
           const nav = {
             ...(navObj || {}),
             pose,
             mapId: (navObj?.mapId as string | null | undefined) ?? null,
-            navigating: Boolean(navObj?.navigating),
+            navigating,
+            path,
+            goal,
             expectedHome: home,
             deviceCodeMismatch: homeFix.mismatch,
             homeSynced: homeFix.synced,
@@ -530,6 +622,16 @@ export class AppController {
       res.setHeader("Content-Type", contentType);
       res.setHeader("Cache-Control", "public, max-age=60");
       res.send(buffer);
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  @Get("admin/robot/nav/path")
+  @UseGuards(AdminGuard)
+  async robotNavPath(@Query("robot") robot?: string) {
+    try {
+      return await pinkyJson("/nav/path", undefined, resolvePinkyUrl(robot));
     } catch (err) {
       wrapError(err);
     }

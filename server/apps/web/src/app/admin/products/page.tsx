@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { Category, CreateProductInput, Product } from "@smartshop/shared";
 import { formatPriceKrw } from "@smartshop/shared";
-import { api, getApiUrl, getToken } from "@/lib/api";
+import { api, getApiUrl, getToken, resolveMediaUrl } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 
 const emptyForm: CreateProductInput = {
@@ -141,8 +141,15 @@ export default function AdminProductsPage() {
 
   const remove = async (id: number) => {
     if (!confirm("삭제할까요?")) return;
-    await api(`/admin/products/${id}`, { method: "DELETE" });
-    await load();
+    setError(null);
+    setMessage(null);
+    try {
+      await api(`/admin/products/${id}`, { method: "DELETE" });
+      setMessage("삭제했습니다.");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "삭제 실패");
+    }
   };
 
   if (loading || !user || user.role !== "admin") {
@@ -241,6 +248,19 @@ export default function AdminProductsPage() {
           <span className="muted" style={{ fontSize: "0.85rem" }}>
             이미지가 하나면 확대 이미지로도 자동 사용됩니다.
           </span>
+          {form.imageFullUrl || form.imageZoomUrl ? (
+            <img
+              src={resolveMediaUrl(form.imageFullUrl || form.imageZoomUrl)}
+              alt="미리보기"
+              style={{
+                marginTop: "0.5rem",
+                maxWidth: 220,
+                maxHeight: 160,
+                objectFit: "contain",
+                background: "#f4f4f4",
+              }}
+            />
+          ) : null}
         </label>
         <label>
           확대 이미지 URL (비우면 전체 이미지 사용)

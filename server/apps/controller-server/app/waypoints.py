@@ -27,9 +27,9 @@ WAYPOINTS: dict[str, Waypoint] = {
     "S2": Waypoint(
         id="S2",
         label="cart-2 대기",
-        x=0.04742698442363813,
+        x=0.009931882239292611,
         y=-0.20226078567130157,
-        yaw=-0.0,
+        yaw=0.0,
     ),
     "W1": Waypoint(
         id="W1",
@@ -47,28 +47,28 @@ WAYPOINTS: dict[str, Waypoint] = {
     ),
     "W3": Waypoint(
         id="W3",
-        label="샌드위치",
+        label="우유",
         x=0.6507310400275261,
         y=-2.094829182972384,
         yaw=-1.5863988018711392,
     ),
     "W4": Waypoint(
         id="W4",
-        label="아이스크림",
+        label="비스킷",
         x=0.9105411110542923,
-        y=-1.5031533209001975,
+        y=-1.7831533209001975,
         yaw=-0.0,
     ),
     "W5": Waypoint(
         id="W5",
-        label="우유",
+        label="아이스크림",
         x=0.46365843764447773,
         y=-1.0666614320651615,
         yaw=-1.5770314553459353,
     ),
     "W6": Waypoint(
         id="W6",
-        label="콜라",
+        label="샌드위치",
         x=0.8402836518740733,
         y=-0.9553571393194527,
         yaw=0.0,
@@ -87,16 +87,27 @@ WAYPOINTS: dict[str, Waypoint] = {
         y=0.38716129241689257,
         yaw=3.135292688148418,
     ),
+    "W7": Waypoint(
+        id="W7",
+        label="충돌 대기",
+        x=0.090,
+        y=-0.498,
+        yaw=0.0,
+    ),
 }
+
+STAGING_WAYPOINT_ID = "W7"
+
+ZONE_OCCUPIABLE_IDS = frozenset({"W1", "W2", "W3", "W4", "W5", "W6", "C", "P"})
 
 # product slug → shelf waypoint
 SLUG_TO_WAYPOINT: dict[str, str] = {
     "cake": "W1",
     "roll-cake": "W2",
-    "sandwich": "W3",
-    "ice-cream": "W4",
-    "milk": "W5",
-    "cola": "W6",
+    "milk": "W3",
+    "biscuit": "W4",
+    "ice-cream": "W5",
+    "sandwich": "W6",
 }
 
 DEVICE_HOME: dict[str, str] = {
@@ -136,6 +147,52 @@ def nearest_neighbor_order(
     waypoint_ids: list[str],
 ) -> list[Waypoint]:
     """Greedy NN tour over shelf waypoints."""
+    return _nn_order_ids(start, waypoint_ids, defer_ids=set())
+
+
+def waypoint_zone_radius_m(waypoint_id: str | None = None) -> float:
+    del waypoint_id
+    return float(os.environ.get("TRAFFIC_ZONE_RADIUS_M", "0.45"))
+
+
+def waypoint_zone_center(waypoint_id: str) -> tuple[float, float]:
+    """Zone center by waypoint id (W6/C share XY but separate zone keys)."""
+    wp = get_waypoint(waypoint_id.strip().upper())
+    return (float(wp.x), float(wp.y))
+
+
+def is_zone_occupiable(waypoint_id: str) -> bool:
+    return (waypoint_id or "").strip().upper() in ZONE_OCCUPIABLE_IDS
+
+
+def staging_waypoint_id() -> str:
+    raw = (os.environ.get("TRAFFIC_STAGING_WAYPOINT") or STAGING_WAYPOINT_ID).strip().upper()
+    return raw if raw in WAYPOINTS else STAGING_WAYPOINT_ID
+
+
+def conflict_aware_tour_order(
+    start: Waypoint,
+    waypoint_ids: list[str],
+    defer_ids: set[str] | frozenset[str] | None = None,
+) -> list[Waypoint]:
+    """NN tour visiting non-deferred shelves first, deferred at the tail."""
+    defer = {d.strip().upper() for d in (defer_ids or set())}
+    preferred = [i for i in waypoint_ids if i not in defer]
+    deferred = [i for i in waypoint_ids if i in defer]
+    ordered = _nn_order_ids(start, preferred, defer_ids=set())
+    if deferred:
+        tail_start = ordered[-1] if ordered else start
+        ordered.extend(_nn_order_ids(tail_start, deferred, defer_ids=set()))
+    return ordered
+
+
+def _nn_order_ids(
+    start: Waypoint,
+    waypoint_ids: list[str],
+    *,
+    defer_ids: set[str],
+) -> list[Waypoint]:
+    del defer_ids
     remaining = [WAYPOINTS[i] for i in waypoint_ids if i in WAYPOINTS]
     ordered: list[Waypoint] = []
     cx, cy = start.x, start.y
@@ -197,15 +254,25 @@ def aruco_standoff_for_waypoint(waypoint_id: str) -> float:
 
 
 def shelf_undock_after_aruco(waypoint_id: str) -> bool:
-    """W1–W6 선반 도킹 후 접근 전진분만큼 후진할지."""
+    """W*/P 아루코 도킹 후 후진할지. 계산대(C)·대기장소(S*)는 후진하지 않음."""
     wid = (waypoint_id or "").strip().upper()
-    if not wid.startswith("W") or len(wid) != 2:
+    if not wid or wid.startswith("S") or wid == "C":
         return False
-    try:
-        n = int(wid[1:])
-    except ValueError:
-        return False
-    if n < 1 or n > 6:
+    if aruco_marker_id_for_waypoint(wid) is None:
         return False
     raw = (os.environ.get("PICK_SHELF_UNDOCK_AFTER_ARUCO") or "1").strip().lower()
     return raw not in ("0", "false", "off", "no")
+
+
+def shelf_undock_distance_m(
+    waypoint_id: str, approach_travel_m: float | None
+) -> float:
+    """후진 목표 거리 = 접근 직전 마커까지 거리 (측정값이 이 값에 도달하면 정지)."""
+    if not shelf_undock_after_aruco(waypoint_id):
+        return 0.0
+    try:
+        marker_m = max(0.0, float(approach_travel_m or 0.0))
+    except (TypeError, ValueError):
+        marker_m = 0.0
+    max_m = float(os.environ.get("PICK_SHELF_UNDOCK_MAX_M", "0.80"))
+    return min(marker_m, max_m)

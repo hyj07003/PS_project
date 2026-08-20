@@ -55,8 +55,10 @@ class RobotBackend(ABC):
         timeout_sec: float | None = None,
         *,
         dry_run: bool = False,
+        bypass_collision: bool = False,
+        ignore_scan: bool = False,
     ) -> dict[str, Any]:
-        del distance_m, speed_mps, timeout_sec, dry_run
+        del distance_m, speed_mps, timeout_sec, dry_run, bypass_collision, ignore_scan
         return {"success": False, "message": "relative move not supported"}
 
     @abstractmethod
@@ -92,8 +94,11 @@ class RobotBackend(ABC):
         yaw: float = 0.0,
         timeout_sec: float = 10.0,
         planner_id: str = "",
+        *,
+        ensure_localization: bool = True,
+        persist: bool = False,
     ) -> dict[str, Any]:
-        del x, y, yaw, timeout_sec, planner_id
+        del x, y, yaw, timeout_sec, planner_id, ensure_localization, persist
         return {"success": False, "message": "path planning not supported"}
 
     def cancel_navigation(self, *, freeze: bool = True) -> dict[str, Any]:
@@ -105,6 +110,17 @@ class RobotBackend(ABC):
             "localizationMode": "active",
             "amclIdleFreeze": False,
         }
+
+    def get_navigation_readiness(self) -> dict[str, Any]:
+        return {
+            "ready": False,
+            "tfValid": False,
+            "scanFresh": False,
+            "failures": ["navigation not supported"],
+        }
+
+    def get_navigation_action(self) -> dict[str, Any]:
+        return {"state": "UNKNOWN", "goalId": None}
 
     def get_nav_plan(self) -> dict[str, Any]:
         return {

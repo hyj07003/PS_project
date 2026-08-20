@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from flask import Blueprint, current_app, jsonify, request, Response
+from typing import Any
 
 bp = Blueprint("api", __name__)
 
@@ -48,6 +49,7 @@ def index():
                 "POST /nav/stop",
                 "POST /nav/relative_move",
                 "POST /nav/aruco_dock",
+                "POST /nav/aruco_undock",
                 "POST /actuators/led",
                 "POST /actuators/lcd",
             ],
@@ -173,12 +175,20 @@ def nav_state():
 @bp.get("/nav/path")
 def nav_path():
     """Compat alias for tools expecting /nav/path (same cache as GET /nav/plan)."""
-    path = _robot().navigation.get_path()
-    if path is None:
-        return jsonify(
-            {"success": False, "message": "no path received yet", "path": None}
-        )
-    return jsonify({"success": True, "path": path})
+    path = _robot().navigation.get_path() or {
+        "frameId": "map",
+        "count": 0,
+        "poses": [],
+    }
+    poses = path.get("poses") if isinstance(path, dict) else None
+    ok = bool(poses)
+    return jsonify(
+        {
+            "success": ok,
+            "message": None if ok else "no path received yet",
+            "path": path,
+        }
+    )
 
 
 @bp.get("/nav/plan")
@@ -258,7 +268,10 @@ def nav_goal_wait():
 
 @bp.post("/nav/stop")
 def nav_stop():
-    result = _robot().navigation.cancel()
+    body = request.get_json(silent=True) or {}
+    freeze_raw = body.get("freeze", True)
+    freeze = str(freeze_raw).strip().lower() not in ("0", "false", "no", "off")
+    result = _robot().navigation.cancel(freeze=freeze)
     status = 200 if result.get("success") else 502
     return jsonify(result), status
 
@@ -278,8 +291,17 @@ def nav_relative_move():
     except (TypeError, ValueError):
         return jsonify({"success": False, "message": "invalid speedMps/timeoutSec"}), 400
     dry_run = bool(body.get("dryRun", body.get("dry_run", False)))
+    bypass_collision = bool(
+        body.get("bypassCollision", body.get("bypass_collision", False))
+    )
+    ignore_scan = bool(body.get("ignoreScan", body.get("ignore_scan", False)))
     result = _robot().navigation.relative_move(
-        distance_m, speed_mps, timeout_sec, dry_run=dry_run
+        distance_m,
+        speed_mps,
+        timeout_sec,
+        dry_run=dry_run,
+        bypass_collision=bypass_collision,
+        ignore_scan=ignore_scan,
     )
     status = 200 if result.get("success") else 409
     return jsonify(result), status
@@ -303,12 +325,66 @@ def nav_aruco_dock():
         timeout_sec = float(timeout) if timeout is not None else None
     except (TypeError, ValueError):
         return jsonify({"success": False, "status": "FAILED", "message": "invalid timeoutSec"}), 400
-    result = _robot().navigation.aruco_dock(
-        marker_id,
-        standoff_m=standoff_m,
-        timeout_sec=timeout_sec,
-    )
+    try:
+        result = _robot().navigation.aruco_dock(
+            marker_id,
+            standoff_m=standoff_m,
+            timeout_sec=timeout_sec,
+        )
+    except Exception as exc:
+        return jsonify(
+            {
+                "success": False,
+                "status": "FAILED",
+                "message": f"aruco_dock exception: {exc}",
+            }
+        ), 502
     status = 200 if result.get("success") else 502
+    return jsonify(result), status
+
+
+@bp.post("/nav/aruco_undock")
+def nav_aruco_undock():
+    """Reverse until marker/ultrasonic range reaches pre-approach target."""
+    body = request.get_json(silent=True) or {}
+    try:
+        marker_id = int(body.get("markerId", body.get("marker_id")))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "markerId required"}), 400
+    try:
+        target_range_m = float(
+            body.get("targetRangeM", body.get("target_range_m"))
+        )
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "targetRangeM required"}), 400
+    timeout = body.get("timeoutSec", body.get("timeout_sec"))
+    speed = body.get("speedMps", body.get("speed_mps"))
+    max_travel = body.get("maxTravelM", body.get("max_travel_m"))
+    kwargs: dict[str, Any] = {}
+    try:
+        if timeout is not None:
+            kwargs["timeout_sec"] = float(timeout)
+        if speed is not None:
+            kwargs["speed_mps"] = float(speed)
+        if max_travel is not None:
+            kwargs["max_travel_m"] = float(max_travel)
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "invalid undock params"}), 400
+    try:
+        result = _robot().navigation.aruco_undock(
+            marker_id,
+            target_range_m,
+            **kwargs,
+        )
+    except Exception as exc:
+        return jsonify(
+            {
+                "success": False,
+                "status": "FAILED",
+                "message": f"aruco_undock exception: {exc}",
+            }
+        ), 502
+    status = 200 if result.get("success") else 409
     return jsonify(result), status
 
 
@@ -380,6 +456,10 @@ def cmd_navigate():
 def cmd_assign():
     body = request.get_json(silent=True) or {}
     robot = _robot()
+    try:
+        robot.navigation.prepare_new_job()
+    except Exception:
+        pass
     robot.lcd.set_emotion("hello")
     robot.led.fill(0, 255, 0)
     return jsonify(

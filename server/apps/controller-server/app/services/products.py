@@ -202,6 +202,19 @@ class ProductsService:
 
     def remove(self, product_id: int) -> dict[str, bool]:
         self.get_by_id(product_id)
+        order_refs = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM order_items WHERE product_id = ?",
+            (product_id,),
+        ).fetchone()["n"]
+        if order_refs:
+            raise ApiError(
+                409,
+                "주문 내역이 있는 상품은 삭제할 수 없습니다. 비활성화해 주세요.",
+            )
+        self.conn.execute(
+            "DELETE FROM cart_items WHERE product_id = ?",
+            (product_id,),
+        )
         self.conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
         self.conn.commit()
         return {"ok": True}

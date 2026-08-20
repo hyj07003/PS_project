@@ -37,34 +37,34 @@ PRODUCTS = [
     },
     {
         "code": "ready",
-        "name": "샌드위치",
-        "slug": "sandwich",
-        "description": "매장 데모 — 샌드위치 매대(W3).",
-        "price": 5500,
-        "featured": 1,
-    },
-    {
-        "code": "snack",
-        "name": "아이스크림",
-        "slug": "ice-cream",
-        "description": "매장 데모 — 아이스크림 매대(W4).",
-        "price": 3500,
-        "featured": 1,
-    },
-    {
-        "code": "dairy",
         "name": "우유",
         "slug": "milk",
-        "description": "매장 데모 — 우유 매대(W5).",
+        "description": "매장 데모 — 우유 매대(W3).",
         "price": 2800,
         "featured": 1,
     },
     {
+        "code": "snack",
+        "name": "비스킷",
+        "slug": "biscuit",
+        "description": "매장 데모 — 비스킷 매대(W4).",
+        "price": 3000,
+        "featured": 1,
+    },
+    {
+        "code": "dairy",
+        "name": "아이스크림",
+        "slug": "ice-cream",
+        "description": "매장 데모 — 아이스크림 매대(W5).",
+        "price": 3500,
+        "featured": 1,
+    },
+    {
         "code": "beverage",
-        "name": "콜라",
-        "slug": "cola",
-        "description": "매장 데모 — 콜라 매대(W6).",
-        "price": 2000,
+        "name": "샌드위치",
+        "slug": "sandwich",
+        "description": "매장 데모 — 샌드위치 매대(W6).",
+        "price": 5500,
         "featured": 1,
     },
 ]
@@ -140,14 +140,17 @@ def ensure_demo_catalog(conn) -> None:
         )
 
     _insert_demo_products(conn, admin_id, ts)
-    # Hide legacy catalog SKUs so demo storefront is clear
-    placeholders = ",".join("?" for _ in DEMO_SLUGS)
-    conn.execute(
-        f"UPDATE products SET is_active = 0, updated_at = ? WHERE slug NOT IN ({placeholders})",
-        (ts, *DEMO_SLUGS),
-    )
     _ensure_devices(conn)
     conn.commit()
+
+
+def _is_custom_image(url: str | None) -> bool:
+    text = (url or "").strip()
+    if not text:
+        return False
+    if "placehold.co" in text.lower():
+        return False
+    return True
 
 
 def _insert_demo_products(conn, admin_id: int | None, ts: str) -> None:
@@ -156,10 +159,26 @@ def _insert_demo_products(conn, admin_id: int | None, ts: str) -> None:
 
     for p in PRODUCTS:
         existing = conn.execute(
-            "SELECT id FROM products WHERE slug = ?",
+            "SELECT id, image_full_url, image_zoom_url FROM products WHERE slug = ?",
             (p["slug"],),
         ).fetchone()
+        default_full = placeholder(p["name"], "full")
+        default_zoom = placeholder(f"{p['name']}+", "zoom")
         if existing:
+            full = (
+                existing["image_full_url"]
+                if _is_custom_image(existing["image_full_url"])
+                else default_full
+            )
+            zoom = (
+                existing["image_zoom_url"]
+                if _is_custom_image(existing["image_zoom_url"])
+                else (
+                    full
+                    if _is_custom_image(full)
+                    else default_zoom
+                )
+            )
             conn.execute(
                 """
                 UPDATE products SET
@@ -174,8 +193,8 @@ def _insert_demo_products(conn, admin_id: int | None, ts: str) -> None:
                     p["name"],
                     p["description"],
                     p["price"],
-                    placeholder(p["name"], "full"),
-                    placeholder(f"{p['name']}+", "zoom"),
+                    full,
+                    zoom,
                     p["featured"],
                     ts,
                     p["slug"],

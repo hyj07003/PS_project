@@ -42,6 +42,7 @@ class MockBackend(RobotBackend):
         self._nav_goal: dict[str, float] | None = None
         self._is_navigating = False
         self._nav_goal_t0 = 0.0
+        self._last_nav_succeeded = False
 
     def start(self) -> None:
         self._started = True
@@ -151,8 +152,10 @@ class MockBackend(RobotBackend):
         timeout_sec: float | None = None,
         *,
         dry_run: bool = False,
+        bypass_collision: bool = False,
+        ignore_scan: bool = False,
     ) -> dict[str, Any]:
-        del timeout_sec
+        del timeout_sec, bypass_collision, ignore_scan
         distance = float(distance_m)
         speed = abs(float(speed_mps))
         if abs(distance) < 1e-6:
@@ -186,6 +189,18 @@ class MockBackend(RobotBackend):
         self._tick_nav()
         return dict(self._nav_pose)
 
+    def get_odom_pose(self) -> tuple[float, float, float] | None:
+        self._tick_nav()
+        p = self._nav_pose
+        return (float(p["x"]), float(p["y"]), float(p["yaw"]))
+
+    def get_active_nav_goal(self) -> dict[str, float] | None:
+        self._tick_nav()
+        if not self._nav_goal:
+            return None
+        g = self._nav_goal
+        return {"x": float(g["x"]), "y": float(g["y"]), "yaw": float(g["yaw"])}
+
     def is_navigating(self) -> bool:
         self._tick_nav()
         return self._is_navigating
@@ -206,6 +221,21 @@ class MockBackend(RobotBackend):
             "localizationMode": "idle",
             "amclIdleFreeze": True,
         }
+
+    def get_navigation_readiness(self) -> dict[str, Any]:
+        return {
+            "ready": True,
+            "tfValid": True,
+            "scanFresh": True,
+            "failures": [],
+        }
+
+    def get_navigation_action(self) -> dict[str, Any]:
+        if self._is_navigating:
+            return {"state": "EXECUTING", "goalId": "mock"}
+        if self._nav_goal is None and self._last_nav_succeeded:
+            return {"state": "SUCCEEDED", "goalId": "mock"}
+        return {"state": "UNKNOWN", "goalId": None}
 
     def get_nav_plan(self) -> dict[str, Any]:
         self._tick_nav()
@@ -264,6 +294,7 @@ class MockBackend(RobotBackend):
         }
 
     def navigate_to(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
+        self._last_nav_succeeded = False
         self._nav_goal = {"x": float(x), "y": float(y), "yaw": float(yaw)}
         self._nav_goal_t0 = time.time()
         self._is_navigating = True
@@ -324,6 +355,7 @@ class MockBackend(RobotBackend):
             self._nav_pose = dict(g)
             self._is_navigating = False
             self._nav_goal = None
+            self._last_nav_succeeded = True
 
     def get_actuator_state(self) -> dict[str, Any]:
         return {

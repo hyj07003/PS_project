@@ -20,8 +20,11 @@ export type MapRobotOverlay = {
   label: string;
   color: string;
   pose?: NavPose | null;
+  goal?: NavPose | null;
   navigating?: boolean;
+  showPath?: boolean;
   lidarPoints?: LidarPoint[];
+  path?: { x: number; y: number }[];
 };
 
 type DragMode = "pose" | "goal";
@@ -86,6 +89,102 @@ function drawRobotMarker(
   ctx.fillText(label, sx + 6, sy - 4);
 }
 
+function drawGoalHeading(
+  ctx: CanvasRenderingContext2D,
+  sx: number,
+  sy: number,
+  yaw: number,
+  color: string,
+) {
+  const len = 14;
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(-yaw - Math.PI / 2);
+  ctx.strokeStyle = color;
+  ctx.fillStyle = `${color}33`;
+  ctx.lineWidth = 1.6;
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  ctx.arc(0, 0, 7, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(0, -len);
+  ctx.lineTo(-5, -2);
+  ctx.lineTo(5, -2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function pathSpanM(points: { x: number; y: number }[]): number {
+  if (points.length < 2) return 0;
+  let max = 0;
+  const a = points[0];
+  for (let i = 1; i < points.length; i += 1) {
+    max = Math.max(
+      max,
+      Math.hypot(points[i].x - a.x, points[i].y - a.y),
+    );
+  }
+  return max;
+}
+
+function drawNavPath(
+  ctx: CanvasRenderingContext2D,
+  meta: MapMeta,
+  toScreen: (col: number, row: number) => { sx: number; sy: number },
+  points: { x: number; y: number }[],
+  color: string,
+) {
+  if (points.length < 2) return;
+  const screen: { sx: number; sy: number }[] = [];
+  for (const p of points) {
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+    const { col, row } = worldToPixel(meta, p.x, p.y);
+    screen.push(toScreen(col, row));
+  }
+  if (screen.length < 2) return;
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.4;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.globalAlpha = 0.88;
+  ctx.beginPath();
+  ctx.moveTo(screen[0].sx, screen[0].sy);
+  for (let i = 1; i < screen.length; i += 1) {
+    ctx.lineTo(screen[i].sx, screen[i].sy);
+  }
+  ctx.stroke();
+
+  const goal = screen[screen.length - 1];
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(goal.sx, goal.sy, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function extractPathPoints(raw: unknown): { x: number; y: number }[] {
+  if (!raw || typeof raw !== "object") return [];
+  const obj = raw as {
+    path?: { poses?: { x: number; y: number }[] } | { x: number; y: number }[];
+    poses?: { x: number; y: number }[];
+  };
+  const nested = Array.isArray(obj.path) ? obj.path : obj.path?.poses;
+  const poses = nested || obj.poses || [];
+  return poses.filter(
+    (p) => p && Number.isFinite(p.x) && Number.isFinite(p.y),
+  );
+}
+
 const MAP_VIEW_HEIGHT = 600;
 
 /**
@@ -112,6 +211,9 @@ export function OccupancyNavMap({
   const [status, setStatus] = useState<string | null>(null);
   const [lastGoal, setLastGoal] = useState<NavPose | null>(null);
   const [busy, setBusy] = useState(false);
+  const [livePaths, setLivePaths] = useState<Record<string, { x: number; y: number }[]>>(
+    {},
+  );
   const dragRef = useRef<{
     active: boolean;
     mode: DragMode;
@@ -175,6 +277,51 @@ export function OccupancyNavMap({
     };
   }, [mapQ, mapRobotId]);
 
+  const robotsRef = useRef(robots);
+  robotsRef.current = robots;
+  const robotIdsKey = robots
+    .map((r) => r.id)
+    .sort()
+    .join(",");
+
+  useEffect(() => {
+    if (!robotIdsKey) {
+      setLivePaths({});
+      return;
+    }
+    let cancelled = false;
+    const pull = async () => {
+      const targets = robotsRef.current;
+      const entries = await Promise.all(
+        targets.map(async (r) => {
+          try {
+            const raw = await api<unknown>(
+              `/admin/robot/nav/path?robot=${encodeURIComponent(r.id)}`,
+            );
+            const points = extractPathPoints(raw);
+            return [r.id, points.length > 1 ? points : []] as const;
+          } catch {
+            return [r.id, []] as const;
+          }
+        }),
+      );
+      if (cancelled) return;
+      setLivePaths((prev) => {
+        const next: Record<string, { x: number; y: number }[]> = {};
+        for (const [id, points] of entries) {
+          next[id] = points.length > 1 ? points : [];
+        }
+        return next;
+      });
+    };
+    void pull();
+    const id = window.setInterval(() => void pull(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [robotIdsKey]);
+
   const redraw = useCallback(() => {
     const canvas = canvasRef.current;
     const viewport = viewportRef.current;
@@ -231,6 +378,47 @@ export function OccupancyNavMap({
     }
 
     for (const robot of robots) {
+      if (!robot.showPath && !robot.navigating) {
+        continue;
+      }
+      const live = livePaths[robot.id];
+      let path =
+        (live && live.length > 1 && live) ||
+        (robot.path && robot.path.length > 1 ? robot.path : undefined);
+      if (path && pathSpanM(path) < 0.04) {
+        path = undefined;
+      }
+      if (
+        (robot.showPath || robot.navigating) &&
+        (!path || path.length < 2) &&
+        robot.pose &&
+        robot.goal &&
+        Number.isFinite(robot.goal.x) &&
+        Number.isFinite(robot.goal.y)
+      ) {
+        const dx = robot.goal.x - robot.pose.x;
+        const dy = robot.goal.y - robot.pose.y;
+        if (Math.hypot(dx, dy) < 0.05 && Number.isFinite(robot.goal.yaw)) {
+          path = [
+            { x: robot.pose.x, y: robot.pose.y },
+            {
+              x: robot.pose.x + 0.35 * Math.cos(robot.goal.yaw),
+              y: robot.pose.y + 0.35 * Math.sin(robot.goal.yaw),
+            },
+          ];
+        } else {
+          path = [
+            { x: robot.pose.x, y: robot.pose.y },
+            { x: robot.goal.x, y: robot.goal.y },
+          ];
+        }
+      }
+      if (path && path.length > 1) {
+        drawNavPath(ctx, meta, toScreen, path, robot.color);
+      }
+    }
+
+    for (const robot of robots) {
       if (!robot.pose) continue;
       const { col, row } = worldToPixel(
         meta,
@@ -248,6 +436,16 @@ export function OccupancyNavMap({
         Boolean(robot.navigating),
         robot.label,
       );
+      if (
+        robot.goal &&
+        Number.isFinite(robot.goal.x) &&
+        Number.isFinite(robot.goal.y) &&
+        Number.isFinite(robot.goal.yaw)
+      ) {
+        const g = worldToPixel(meta, robot.goal.x, robot.goal.y);
+        const gs = toScreen(g.col, g.row);
+        drawGoalHeading(ctx, gs.sx, gs.sy, robot.goal.yaw, robot.color);
+      }
       if (isControl) {
         ctx.strokeStyle = robot.color;
         ctx.lineWidth = 1.5;
@@ -313,7 +511,8 @@ export function OccupancyNavMap({
       availH - 8,
     );
     ctx.fillText("좌: pose · 우: goal (선택 로봇)", 8, availH - 22);
-  }, [meta, robots, controlRobot, controlRobotId]);
+    ctx.fillText("실선: 할당 로봇 주행 경로", 8, availH - 36);
+  }, [meta, robots, controlRobot, controlRobotId, livePaths]);
 
   useEffect(() => {
     redraw();
@@ -365,11 +564,15 @@ export function OccupancyNavMap({
     setStatus(null);
     try {
       if (mode === "pose") {
-        const res = await api<{ success?: boolean; message?: string }>(
+        const res = await api<{
+          success?: boolean;
+          message?: string;
+          ignored?: boolean;
+        }>(
           `/admin/robot/nav/initialpose${controlQ}`,
           { method: "POST", body: JSON.stringify(body) },
         );
-        if (!res.success) {
+        if (!res.success || res.ignored) {
           setStatus(res.message || "initialpose 실패");
         } else {
           setStatus(

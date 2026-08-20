@@ -35,6 +35,7 @@ LidarFn = Callable[[], Any]
 UltrasonicFn = Callable[[], Any]
 ProgressFn = Callable[[dict[str, Any]], Any]
 OdomFn = Callable[[], tuple[float, float, float] | None]  # () -> (x, y, yaw) or None
+ShouldCancelFn = Callable[[], bool]
 
 ARUCO_PHASE_LABELS_KO: dict[str, str] = {
     "SEARCH": "마커 탐색 중",
@@ -43,10 +44,12 @@ ARUCO_PHASE_LABELS_KO: dict[str, str] = {
     "APPROACH": "접근·파킹 중",
     "US_APPROACH": "초음파 접근 중",
     "ARRIVED": "도킹 완료",
+    "UNDOCK": "후진·거리 복귀 중",
     "LOST": "마커 재탐색 중",
     "TIMEOUT": "도킹 타임아웃",
     "NO_MARKER": "마커 미검출",
     "FAILED": "도킹 실패",
+    "CANCELED": "도킹 중단",
 }
 
 
@@ -487,8 +490,9 @@ def run_aruco_dock(
     standoff_m: float | None = None,
     timeout_sec: float | None = None,
     mock: bool = False,
+    should_cancel: ShouldCancelFn | None = None,
 ) -> dict[str, Any]:
-    """Blocking visual dock. Stops Nav2 once, freezes pose, then cmd_vel servo."""
+    """Blocking visual dock. Stops Nav2 once, then cmd_vel servo with AMCL still on."""
     standoff = float(
         standoff_m
         if standoff_m is not None
@@ -600,7 +604,7 @@ def run_aruco_dock(
             pass
         time.sleep(0.15)
 
-    # Pin AMCL/monitor pose for the whole dock — cmd_vel must not jump map pose
+    # Keep AMCL running; only block S1/S2 teleport while cmd_vel is in control.
     if hold_pose is not None:
         try:
             hold_pose()
@@ -656,43 +660,29 @@ def run_aruco_dock(
     us_fallback_active = False
     pose_ready_before_approach = False
     us_last: float | None = None
-    approach_travel_m = 0.0
-    approach_odom_start: tuple[float, float] | None = None
-    loop_dt = 0.04
+    pre_approach_marker_m: float | None = None
 
-    def _snap_approach_odom() -> None:
-        """Record odom position when APPROACH begins."""
-        nonlocal approach_odom_start
-        if approach_odom_start is not None:
+    def _capture_pre_approach_range() -> None:
+        """접근 시작 직전 마커(또는 초음파) 거리를 한 번만 저장. 후진 거리로 쓴다."""
+        nonlocal pre_approach_marker_m
+        if pre_approach_marker_m is not None:
             return
-        if get_odom is not None:
-            pose = get_odom()
-            if pose is not None:
-                approach_odom_start = (pose[0], pose[1])
+        rng = z_last if z_last is not None else us_last
+        if rng is not None and float(rng) > 0.0:
+            pre_approach_marker_m = float(rng)
 
-    def _odom_approach_distance() -> float | None:
-        """Euclidean distance from approach start using odom."""
-        if approach_odom_start is None or get_odom is None:
-            return None
-        pose = get_odom()
-        if pose is None:
-            return None
-        dx = pose[0] - approach_odom_start[0]
-        dy = pose[1] - approach_odom_start[1]
-        return math.sqrt(dx * dx + dy * dy)
-
-    def _final_approach_travel() -> float:
-        """Return best estimate of approach distance: odom if available, else cmd_vel estimate."""
-        odom_d = _odom_approach_distance()
-        if odom_d is not None and odom_d > 1e-4:
-            return odom_d
-        return approach_travel_m
+    def _undock_distance_m() -> float:
+        _capture_pre_approach_range()
+        if pre_approach_marker_m is not None:
+            return max(0.0, float(pre_approach_marker_m))
+        rng = z_last if z_last is not None else us_last
+        if rng is not None and float(rng) > 0.0:
+            return float(rng)
+        return 0.0
 
     def _cmd_vel(linear_x: float, angular_z: float) -> Any:
-        nonlocal approach_travel_m
         if phase in ("APPROACH", "US_APPROACH") and float(linear_x) > 0.0:
-            _snap_approach_odom()
-            approach_travel_m += float(linear_x) * loop_dt
+            _capture_pre_approach_range()
         return drive(linear_x, angular_z)
 
     def _search_yaw_rate() -> float:
@@ -805,6 +795,8 @@ def run_aruco_dock(
     def _report(phase_name: str, *, force: bool = False) -> None:
         nonlocal last_status, last_progress_t
         last_status = phase_name
+        if phase_name in ("APPROACH", "US_APPROACH", "ARRIVED"):
+            _capture_pre_approach_range()
         if on_progress is None:
             return
         now = time.time()
@@ -881,7 +873,7 @@ def run_aruco_dock(
                 "yawErrRad": yaw_last,
                 "phase": "ARRIVED",
                 "phaseLabel": phase_label_ko("ARRIVED"),
-                "approachTravelM": _final_approach_travel(),
+                "approachTravelM": _undock_distance_m(),
             }
         v_cmd = _approach_speed(us)
         if v_cmd <= 0.0:
@@ -901,7 +893,7 @@ def run_aruco_dock(
                 "yawErrRad": yaw_last,
                 "phase": "ARRIVED",
                 "phaseLabel": phase_label_ko("ARRIVED"),
-                "approachTravelM": _final_approach_travel(),
+                "approachTravelM": _undock_distance_m(),
             }
         _cmd_vel(v_cmd, 0.0)
         return None
@@ -975,6 +967,28 @@ def run_aruco_dock(
 
     try:
         while time.time() < deadline:
+            if should_cancel is not None:
+                try:
+                    stop_now = bool(should_cancel())
+                except Exception:
+                    stop_now = False
+                if stop_now:
+                    stop()
+                    _report("CANCELED", force=True)
+                    return {
+                        "success": False,
+                        "status": "CANCELED",
+                        "message": "aruco dock interrupted by stop/new job",
+                        "markerId": int(marker_id),
+                        "distanceM": z_last,
+                        "centerErrorPx": center_err,
+                        "lateralM": tx_last,
+                        "yawErrRad": yaw_last,
+                        "phase": "CANCELED",
+                        "phaseLabel": phase_label_ko("CANCELED"),
+                    }
+            if phase in ("APPROACH", "US_APPROACH"):
+                _capture_pre_approach_range()
             ok, frame = source.read()
             if not ok or frame is None:
                 time.sleep(0.05)
@@ -1091,7 +1105,7 @@ def run_aruco_dock(
                         "yawErrRad": yaw_err,
                         "phase": "ARRIVED",
                         "phaseLabel": phase_label_ko("ARRIVED"),
-                        "approachTravelM": _final_approach_travel(),
+                        "approachTravelM": _undock_distance_m(),
                     }
 
                 # 가깝더라도 정자세 미달이면 FACE/SHIFT 우선 (거리 도착보다 자세 우선)
@@ -1172,7 +1186,7 @@ def run_aruco_dock(
                             "yawErrRad": yaw_err,
                             "phase": "ARRIVED",
                             "phaseLabel": phase_label_ko("ARRIVED"),
-                            "approachTravelM": _final_approach_travel(),
+                            "approachTravelM": _undock_distance_m(),
                         }
                     phase = "APPROACH"
                     if lat_ready:
@@ -1240,7 +1254,7 @@ def run_aruco_dock(
                         "yawErrRad": yaw_err,
                         "phase": "ARRIVED",
                         "phaseLabel": phase_label_ko("ARRIVED"),
-                        "approachTravelM": _final_approach_travel(),
+                        "approachTravelM": _undock_distance_m(),
                     }
                 # 접근 중 횡오차 커지면 다시 micro-SHIFT (한도·오버슈트 가드 내)
                 if (
@@ -1304,6 +1318,312 @@ def run_aruco_dock(
                         "centerErrorPx": center_err,
                         "lateralM": tx_last,
                         "yawErrRad": yaw_last,
+                    }
+                )
+            except Exception:
+                pass
+        if release_hold is not None:
+            try:
+                release_hold()
+            except Exception:
+                pass
+        try:
+            source.release()
+        except Exception:
+            pass
+
+
+def run_aruco_undock(
+    marker_id: int,
+    target_range_m: float,
+    drive: DriveFn,
+    *,
+    hold_pose: HoldFn | None = None,
+    release_hold: ReleaseHoldFn | None = None,
+    get_ultrasonic: UltrasonicFn | None = None,
+    get_odom: OdomFn | None = None,
+    on_progress: ProgressFn | None = None,
+    should_cancel: ShouldCancelFn | None = None,
+    speed_mps: float | None = None,
+    timeout_sec: float | None = None,
+    max_travel_m: float | None = None,
+    range_tol_m: float | None = None,
+    mock: bool = False,
+) -> dict[str, Any]:
+    """Reverse slowly until marker/ultrasonic range reaches target_range_m (pre-approach)."""
+    target = max(0.0, float(target_range_m))
+    speed = abs(float(speed_mps if speed_mps is not None else _env_float("PICK_SHELF_UNDOCK_SPEED_MPS", 0.02)))
+    timeout = float(
+        timeout_sec
+        if timeout_sec is not None
+        else _env_float("PINKY_ARUCO_UNDOCK_TIMEOUT_SEC", 30.0)
+    )
+    max_travel = float(
+        max_travel_m
+        if max_travel_m is not None
+        else _env_float("PICK_SHELF_UNDOCK_MAX_M", 0.80)
+    )
+    tol = float(
+        range_tol_m
+        if range_tol_m is not None
+        else _env_float("PINKY_ARUCO_UNDOCK_RANGE_TOL_M", 0.015)
+    )
+    marker_len = _env_float("PINKY_ARUCO_MARKER_LENGTH_M", 0.037)
+    width = _env_int("PINKY_CAMERA_WIDTH", 640)
+    height = _env_int("PINKY_CAMERA_HEIGHT", 480)
+    device_raw = (os.environ.get("PINKY_CAMERA_DEVICE") or "/dev/video0").strip()
+
+    if mock:
+        return {
+            "success": True,
+            "status": "UNDOCKED",
+            "message": "mock aruco undock",
+            "markerId": int(marker_id),
+            "targetRangeM": target,
+            "distanceM": target,
+            "movedM": 0.08,
+        }
+
+    if target <= 0.0:
+        return {
+            "success": True,
+            "status": "UNDOCKED",
+            "message": "undock skipped (zero target)",
+            "markerId": int(marker_id),
+            "targetRangeM": target,
+            "distanceM": None,
+            "movedM": 0.0,
+        }
+
+    try:
+        camera_matrix, dist_coeffs = load_camera_calib(image_size=(width, height))
+    except Exception as exc:
+        return {
+            "success": False,
+            "status": "FAILED",
+            "message": f"calib load failed: {exc}",
+            "markerId": int(marker_id),
+            "targetRangeM": target,
+        }
+
+    try:
+        import cv2
+    except ImportError as exc:
+        return {
+            "success": False,
+            "status": "FAILED",
+            "message": f"opencv missing: {exc}",
+            "markerId": int(marker_id),
+            "targetRangeM": target,
+        }
+
+    try:
+        dict_name = os.environ.get("PINKY_ARUCO_DICT", "DICT_5X5_50")
+        dictionary = cv2.aruco.getPredefinedDictionary(_aruco_dict_id(dict_name))
+    except Exception as exc:
+        return {
+            "success": False,
+            "status": "FAILED",
+            "message": f"aruco dict: {exc}",
+            "markerId": int(marker_id),
+            "targetRangeM": target,
+        }
+
+    if hold_pose is not None:
+        try:
+            hold_pose()
+        except Exception:
+            pass
+
+    from .camera_source import open_frame_source
+
+    source = open_frame_source(device_raw, width, height, quiet=True)
+    if source is None:
+        return {
+            "success": False,
+            "status": "FAILED",
+            "message": f"camera open failed (device={device_raw})",
+            "markerId": int(marker_id),
+            "targetRangeM": target,
+        }
+
+    deadline = time.time() + max(1.0, timeout)
+    last_range: float | None = None
+    last_source: str | None = None
+    last_progress_t = 0.0
+    odom_start: tuple[float, float, float] | None = None
+    if get_odom is not None:
+        try:
+            odom_start = get_odom()
+        except Exception:
+            odom_start = None
+
+    def stop() -> None:
+        try:
+            drive(0.0, 0.0)
+        except Exception:
+            pass
+
+    def _odom_travel() -> float:
+        if odom_start is None or get_odom is None:
+            return 0.0
+        try:
+            cur = get_odom()
+        except Exception:
+            return 0.0
+        if cur is None:
+            return 0.0
+        sx, sy, _ = odom_start
+        cx, cy, _ = cur
+        return float(math.hypot(cx - sx, cy - sy))
+
+    def _read_range(frame_bgr) -> tuple[float | None, str | None]:
+        det = _detect_marker(
+            frame_bgr,
+            marker_id,
+            dictionary,
+            camera_matrix,
+            dist_coeffs,
+            marker_len,
+        )
+        if det is not None:
+            z = float(det.get("distanceM", det.get("tz", 0.0)))
+            if z > 0.0:
+                return z, "marker"
+        us = _read_ultrasonic_m(get_ultrasonic)
+        if us is not None:
+            return float(us), "ultrasonic"
+        return None, None
+
+    def _report(*, force: bool = False) -> None:
+        nonlocal last_progress_t
+        if on_progress is None:
+            return
+        now = time.time()
+        if not force and (now - last_progress_t) < 0.35:
+            return
+        last_progress_t = now
+        try:
+            on_progress(
+                {
+                    "active": True,
+                    "phase": "UNDOCK",
+                    "phaseLabel": phase_label_ko("UNDOCK"),
+                    "markerId": int(marker_id),
+                    "distanceM": last_range,
+                    "targetRangeM": target,
+                    "distanceSource": last_source,
+                    "movedM": _odom_travel(),
+                }
+            )
+        except Exception:
+            pass
+
+    try:
+        stop()
+        _report(force=True)
+        while time.time() < deadline:
+            if should_cancel is not None:
+                try:
+                    if should_cancel():
+                        stop()
+                        return {
+                            "success": False,
+                            "status": "CANCELED",
+                            "message": "aruco undock canceled",
+                            "markerId": int(marker_id),
+                            "targetRangeM": target,
+                            "distanceM": last_range,
+                            "movedM": _odom_travel(),
+                        }
+                except Exception:
+                    pass
+
+            ok, frame = source.read()
+            rng: float | None = None
+            src: str | None = None
+            if ok and frame is not None:
+                rng, src = _read_range(frame)
+            if rng is None:
+                us = _read_ultrasonic_m(get_ultrasonic)
+                if us is not None:
+                    rng, src = float(us), "ultrasonic"
+
+            if rng is not None:
+                last_range = rng
+                last_source = src
+                _report()
+                if float(rng) + tol >= target:
+                    stop()
+                    return {
+                        "success": True,
+                        "status": "UNDOCKED",
+                        "message": "aruco undock at target range",
+                        "markerId": int(marker_id),
+                        "targetRangeM": target,
+                        "distanceM": float(rng),
+                        "distanceSource": src,
+                        "movedM": _odom_travel(),
+                    }
+
+            traveled = _odom_travel()
+            if traveled >= max_travel:
+                stop()
+                return {
+                    "success": False,
+                    "status": "MAX_TRAVEL",
+                    "message": f"undock max travel {max_travel:.3f}m reached",
+                    "markerId": int(marker_id),
+                    "targetRangeM": target,
+                    "distanceM": last_range,
+                    "movedM": traveled,
+                }
+
+            gap = target - (last_range if last_range is not None else 0.0)
+            if last_range is not None and gap <= 0.0:
+                stop()
+                return {
+                    "success": True,
+                    "status": "UNDOCKED",
+                    "message": "aruco undock at target range",
+                    "markerId": int(marker_id),
+                    "targetRangeM": target,
+                    "distanceM": last_range,
+                    "distanceSource": last_source,
+                    "movedM": traveled,
+                }
+
+            v_cmd = speed
+            if last_range is not None and gap > 0.0:
+                v_cmd = min(speed, max(0.01, 0.45 * gap))
+            try:
+                drive(-v_cmd, 0.0)
+            except TypeError:
+                drive(-v_cmd, 0.0)
+            time.sleep(0.04)
+
+        stop()
+        return {
+            "success": False,
+            "status": "TIMEOUT",
+            "message": "aruco undock timeout",
+            "markerId": int(marker_id),
+            "targetRangeM": target,
+            "distanceM": last_range,
+            "movedM": _odom_travel(),
+        }
+    finally:
+        stop()
+        if on_progress is not None:
+            try:
+                on_progress(
+                    {
+                        "active": False,
+                        "phase": "UNDOCK",
+                        "phaseLabel": phase_label_ko("UNDOCK"),
+                        "markerId": int(marker_id),
+                        "distanceM": last_range,
+                        "targetRangeM": target,
                     }
                 )
             except Exception:

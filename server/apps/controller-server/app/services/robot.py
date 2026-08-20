@@ -4,6 +4,7 @@ from typing import Any
 
 from ..db import now_iso
 from ..errors import ApiError
+from ..waypoints import get_waypoint
 
 ACTIVE_STATUSES = ("ASSIGNED", "PICKING", "CHECKOUT", "PACKING", "RETURNING")
 
@@ -264,7 +265,7 @@ class RobotService:
 
     @staticmethod
     def _map_mission(row: dict[str, Any]) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "id": row["id"],
             "orderId": row["order_id"],
             "deviceId": row["device_id"],
@@ -274,3 +275,15 @@ class RobotService:
             "currentWaypoint": row.get("current_waypoint"),
             "currentWaypointLabel": row.get("current_waypoint_label"),
         }
+        wid = row.get("current_waypoint")
+        if wid:
+            try:
+                wp = get_waypoint(str(wid))
+                out["currentWaypointPose"] = {
+                    "x": wp.x,
+                    "y": wp.y,
+                    "yaw": wp.yaw,
+                }
+            except KeyError:
+                pass
+        return out

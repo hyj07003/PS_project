@@ -235,6 +235,11 @@ def patch_device(code: str):
     return jsonify(_robot().patch_device(code, status))
 
 
+@bp.get("/traffic/state")
+def traffic_state():
+    return jsonify(_orders().traffic.snapshot())
+
+
 @bp.post("/robot/telemetry")
 def post_telemetry():
     body = request.get_json(silent=True) or {}

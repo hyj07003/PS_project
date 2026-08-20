@@ -6,7 +6,7 @@ import os
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 ORDER_FLOW = [
     "CREATED",
@@ -61,6 +61,11 @@ def parse_pinky_robot_urls() -> dict[str, str]:
     return out
 
 
+def parse_omx_url() -> str | None:
+    raw = (os.environ.get("OMX_URL") or "").strip().rstrip("/")
+    return raw or None
+
+
 class MockCartAdapter:
     """Local demo without Pinky HTTP — simulate travel delay."""
 
@@ -102,15 +107,53 @@ class MockCartAdapter:
                 "active": False,
                 "phase": None,
                 "phaseLabel": None,
-            }
+            },
+            "nav2Readiness": {
+                "ready": True,
+                "tfValid": True,
+                "scanFresh": True,
+                "failures": [],
+            },
+            "navigationAction": {"state": "UNKNOWN", "goalId": None},
+        }
+
+    def get_nav_state_full(self, device_code: str) -> dict[str, Any]:
+        return self.get_nav_state(device_code)
+
+    def plan_pose(
+        self,
+        device_code: str,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 10.0,
+    ) -> dict[str, Any]:
+        del device_code, timeout_sec
+        return {
+            "success": True,
+            "path": {
+                "poses": [
+                    {"x": 0.0, "y": 0.0},
+                    {"x": float(x), "y": float(y)},
+                ],
+            },
+        }
+
+    def get_active_path(self, device_code: str) -> dict[str, Any]:
+        del device_code
+        return {
+            "success": True,
+            "path": {
+                "poses": [{"x": 0.0, "y": 0.0}, {"x": 0.5, "y": 0.0}],
+            },
         }
 
     def is_reachable(self, device_code: str) -> bool:
         del device_code
         return True
 
-    def stop_nav(self, device_code: str) -> dict[str, Any]:
-        del device_code
+    def stop_nav(self, device_code: str, *, freeze: bool = True) -> dict[str, Any]:
+        del device_code, freeze
         return {"success": True, "message": "mock stop"}
 
     def aruco_dock(
@@ -131,6 +174,27 @@ class MockCartAdapter:
             "approachTravelM": float(standoff_m),
         }
 
+    def aruco_undock(
+        self,
+        device_code: str,
+        marker_id: int,
+        target_range_m: float,
+        *,
+        timeout_sec: float = 30.0,
+        speed_mps: float = 0.02,
+        max_travel_m: float | None = None,
+    ) -> dict[str, Any]:
+        del device_code
+        return {
+            "success": True,
+            "status": "UNDOCKED",
+            "message": "mock aruco undock",
+            "markerId": int(marker_id),
+            "targetRangeM": float(target_range_m),
+            "distanceM": float(target_range_m),
+            "movedM": 0.08,
+        }
+
     def relative_move(
         self,
         device_code: str,
@@ -138,8 +202,10 @@ class MockCartAdapter:
         *,
         speed_mps: float = 0.02,
         timeout_sec: float | None = None,
+        bypass_collision: bool = False,
+        ignore_scan: bool = False,
     ) -> dict[str, Any]:
-        del device_code, speed_mps, timeout_sec
+        del device_code, speed_mps, timeout_sec, bypass_collision, ignore_scan
         return {
             "success": True,
             "message": "mock relative move",
@@ -160,6 +226,142 @@ class MockStationAdapter:
     def pack(self, order_id: int = 0) -> Literal["DONE", "FAILED"]:
         del order_id
         return "DONE"
+
+
+class OmxHttpStationAdapter:
+    """HTTP adapter for OMX robot arm pick API."""
+
+    def __init__(self, url: str | None = None, poll_sec: float | None = None) -> None:
+        self.url = url if url is not None else parse_omx_url()
+        self.poll_sec = float(
+            poll_sec
+            if poll_sec is not None
+            else os.environ.get("OMX_POLL_SEC", "0.5")
+        )
+        self.pick_timeout_sec = float(os.environ.get("OMX_PICK_TIMEOUT_SEC", "90"))
+        self.last_error: str | None = None
+        self.last_state: dict[str, Any] = {}
+
+    def _post(self, path: str, body: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
+        if not self.url:
+            raise RuntimeError("OMX_URL is not configured")
+        req = urllib.request.Request(
+            f"{self.url}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                return json.loads(res.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                payload = {"success": False, "message": raw[:200] or str(exc)}
+            if isinstance(payload, dict):
+                payload.setdefault("httpStatus", exc.code)
+                return payload
+            return {"success": False, "message": str(exc), "httpStatus": exc.code}
+
+    def _get(self, path: str, timeout: float = 5.0) -> dict[str, Any]:
+        if not self.url:
+            raise RuntimeError("OMX_URL is not configured")
+        req = urllib.request.Request(f"{self.url}{path}", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            return json.loads(res.read().decode("utf-8"))
+
+    def is_reachable(self) -> bool:
+        if not self.url:
+            return False
+        try:
+            health = self._get("/health", timeout=2.0)
+            return bool(health.get("robotConnected", False))
+        except Exception:
+            return False
+
+    def supported_slugs(self) -> list[str]:
+        try:
+            return list(self._get("/products", timeout=3.0).get("slugs") or [])
+        except Exception:
+            return []
+
+    def pick(
+        self,
+        *,
+        device_code: str,
+        slug: str,
+        quantity: int,
+        order_id: int,
+        timeout_sec: float | None = None,
+        should_abort: Callable[[], bool] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+        force_success_on_unreachable: bool = False,
+    ) -> Literal["DONE", "FAILED", "ABORTED"]:
+        self.last_error = None
+        self.last_state = {}
+        try:
+            started = self._post(
+                "/pick",
+                {
+                    "orderId": int(order_id),
+                    "deviceCode": device_code,
+                    "slug": slug,
+                    "quantity": int(quantity),
+                    "timeoutSec": float(timeout_sec or self.pick_timeout_sec),
+                },
+                timeout=15.0,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            self.last_error = f"omx request failed: {exc}"
+            return "DONE" if force_success_on_unreachable else "FAILED"
+        except Exception as exc:
+            self.last_error = f"omx request failed: {exc}"
+            return "DONE" if force_success_on_unreachable else "FAILED"
+
+        if not started.get("success"):
+            self.last_error = str(started.get("message") or "omx pick rejected")
+            if int(started.get("httpStatus") or 0) <= 0 and force_success_on_unreachable:
+                return "DONE"
+            return "FAILED"
+
+        effective_timeout = float(timeout_sec or self.pick_timeout_sec)
+        deadline = time.time() + max(5.0, effective_timeout * max(1, int(quantity)))
+        stop_sent = False
+        last_done = -1
+        while time.time() < deadline:
+            time.sleep(max(0.2, self.poll_sec))
+            try:
+                state = self._get("/pick/state", timeout=3.0)
+            except Exception as exc:
+                self.last_error = f"omx state polling failed: {exc}"
+                return "DONE" if force_success_on_unreachable else "FAILED"
+            self.last_state = state
+            done = int(state.get("done") or 0)
+            total = int(state.get("total") or quantity)
+            if on_progress and done != last_done:
+                on_progress(done, total)
+                last_done = done
+            if should_abort and should_abort() and not stop_sent:
+                stop_sent = True
+                try:
+                    self._post("/pick/stop", {"mode": "afterCurrent"}, timeout=5.0)
+                except Exception:
+                    pass
+            status = str(state.get("status") or "")
+            if status in ("DONE", "FAILED", "ABORTED"):
+                if status in ("FAILED", "ABORTED"):
+                    self.last_error = str(state.get("message") or status)
+                return status  # type: ignore[return-value]
+        self.last_error = "omx pick timeout"
+        return "DONE" if force_success_on_unreachable else "FAILED"
+
+    def stop(self, mode: str = "afterCurrent") -> dict[str, Any]:
+        try:
+            return self._post("/pick/stop", {"mode": mode}, timeout=5.0)
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}
 
 
 class MockAiAdapter:
@@ -216,7 +418,12 @@ class PinkyHttpCartAdapter:
                 try:
                     payload = json.loads(raw) if raw else {}
                 except json.JSONDecodeError:
-                    payload = {"success": False, "message": raw[:200] or str(exc)}
+                    low = (raw or "").lower()
+                    if "<html" in low or "<!doctype" in low:
+                        msg = f"pinky HTTP {exc.code} Internal Server Error"
+                    else:
+                        msg = (raw[:200] if raw else "") or str(exc)
+                    payload = {"success": False, "message": msg}
                 if isinstance(payload, dict):
                     payload.setdefault("httpStatus", exc.code)
                     return payload
@@ -449,6 +656,39 @@ class PinkyHttpCartAdapter:
         except Exception:
             return {}
 
+    def get_nav_state_full(self, device_code: str) -> dict[str, Any]:
+        return self.get_nav_state(device_code)
+
+    def plan_pose(
+        self,
+        device_code: str,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        timeout_sec: float = 10.0,
+    ) -> dict[str, Any]:
+        try:
+            return self._post(
+                device_code,
+                "/nav/plan",
+                {
+                    "x": float(x),
+                    "y": float(y),
+                    "yaw": float(yaw),
+                    "timeoutSec": float(timeout_sec),
+                },
+                timeout=float(timeout_sec) + 5.0,
+                accept_http_error=True,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            return {"success": False, "message": str(exc)}
+
+    def get_active_path(self, device_code: str) -> dict[str, Any]:
+        try:
+            return self._get(device_code, "/nav/path", timeout=2.5)
+        except Exception:
+            return {"success": False, "path": None}
+
     def is_reachable(self, device_code: str) -> bool:
         if self._base(device_code) is None:
             return False
@@ -458,12 +698,12 @@ class PinkyHttpCartAdapter:
         except Exception:
             return False
 
-    def stop_nav(self, device_code: str) -> dict[str, Any]:
+    def stop_nav(self, device_code: str, *, freeze: bool = True) -> dict[str, Any]:
         try:
             return self._post(
                 device_code,
                 "/nav/stop",
-                {},
+                {"freeze": bool(freeze)},
                 timeout=5.0,
                 accept_http_error=True,
             )
@@ -507,6 +747,37 @@ class PinkyHttpCartAdapter:
         )
         return result
 
+    def aruco_undock(
+        self,
+        device_code: str,
+        marker_id: int,
+        target_range_m: float,
+        *,
+        timeout_sec: float = 30.0,
+        speed_mps: float = 0.02,
+        max_travel_m: float | None = None,
+    ) -> dict[str, Any]:
+        """POST /nav/aruco_undock — reverse until range reaches target."""
+        timeout = max(1.0, float(timeout_sec))
+        payload: dict[str, Any] = {
+            "markerId": int(marker_id),
+            "targetRangeM": float(target_range_m),
+            "timeoutSec": timeout,
+            "speedMps": float(speed_mps),
+        }
+        if max_travel_m is not None:
+            payload["maxTravelM"] = float(max_travel_m)
+        try:
+            return self._post(
+                device_code,
+                "/nav/aruco_undock",
+                payload,
+                timeout=timeout + 15.0,
+                accept_http_error=True,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            return {"success": False, "message": str(exc)}
+
     def relative_move(
         self,
         device_code: str,
@@ -514,11 +785,15 @@ class PinkyHttpCartAdapter:
         *,
         speed_mps: float = 0.02,
         timeout_sec: float | None = None,
+        bypass_collision: bool = False,
+        ignore_scan: bool = False,
     ) -> dict[str, Any]:
         """POST /nav/relative_move — odom closed-loop micro motion (undock)."""
         payload: dict[str, Any] = {
             "distanceM": float(distance_m),
             "speedMps": float(speed_mps),
+            "bypassCollision": bool(bypass_collision),
+            "ignoreScan": bool(ignore_scan),
         }
         if timeout_sec is not None:
             payload["timeoutSec"] = float(timeout_sec)

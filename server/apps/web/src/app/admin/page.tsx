@@ -55,8 +55,10 @@ type Snapshot = {
 
 type NavState = {
   pose?: { x: number; y: number; yaw: number } | null;
+  goal?: { x: number; y: number; yaw: number } | null;
   navigating?: boolean;
   mapId?: string | null;
+  path?: { x: number; y: number }[];
 };
 
 type Device = {
@@ -73,6 +75,7 @@ type OrderAssignment = {
   status: string;
   currentWaypoint?: string | null;
   currentWaypointLabel?: string | null;
+  currentWaypointPose?: { x: number; y: number; yaw: number } | null;
   order?: {
     id: number;
     status: string;
@@ -409,14 +412,38 @@ export default function AdminRobotPage() {
 
   const mapOverlays = useMemo(
     () =>
-      robots.map((r, i) => ({
-        id: r.id,
-        label: r.label,
-        color: robotColor(r.id, i),
-        pose: r.nav?.pose || r.sensors?.pose || null,
-        navigating: Boolean(r.nav?.navigating || r.sensors?.navigating),
-        lidarPoints: r.sensors?.lidar?.points || [],
-      })),
+      robots.map((r, i) => {
+        const activeStatuses = new Set([
+          "ASSIGNED",
+          "PICKING",
+          "CHECKOUT",
+          "PACKING",
+          "RETURNING",
+        ]);
+        const navigating = Boolean(r.nav?.navigating || r.sensors?.navigating);
+        const hasActiveAssignment = Boolean(
+          r.assignment?.status && activeStatuses.has(r.assignment.status),
+        );
+        return {
+          id: r.id,
+          label: r.label,
+          color: robotColor(r.id, i),
+          pose: r.nav?.pose || r.sensors?.pose || null,
+          goal:
+            navigating || hasActiveAssignment
+              ? r.nav?.goal || r.assignment?.currentWaypointPose || null
+              : null,
+          navigating,
+          showPath: navigating || hasActiveAssignment,
+          lidarPoints: r.sensors?.lidar?.points || [],
+          path:
+            navigating || hasActiveAssignment
+              ? Array.isArray(r.nav?.path)
+                ? r.nav.path
+                : []
+              : [],
+        };
+      }),
     [robots],
   );
 
@@ -495,7 +522,7 @@ export default function AdminRobotPage() {
             <div className="monitor-card monitor-map-card">
               <h3>맵 · 네비게이션</h3>
               <p className="muted" style={{ marginTop: 0, fontSize: "0.85rem" }}>
-                두 카트 pose를 한 맵에 표시합니다. 드롭다운으로 조종할 로봇을 고른 뒤
+                두 카트 pose와 주행 경로를 한 맵에 표시합니다. 드롭다운으로 조종할 로봇을 고른 뒤
                 좌드래그(pose) · 우드래그(goal)로 제어하세요.
               </p>
               <div className="map-robot-legend">

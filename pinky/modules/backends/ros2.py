@@ -82,11 +82,13 @@ class Ros2Backend(RobotBackend):
         # ArUco visual dock: pin pose at dock site; block idle-freeze / home reseed
         self._visual_dock_active = False
         self._visual_dock_pose: tuple[float, float, float] | None = None
+        self._visual_dock_odom: tuple[float, float, float] | None = None
         # 부트 홈 initialpose 루프 / 대기장소 강제 시드 차단
         self._boot_home_cancel = threading.Event()
         self._home_seed_locked_out = False
         # 웨이포인트 투어 중(홈 goal 도착 전까지) S1/S2 시드·TF 수용 금지
         self._tour_active = False
+        self._motion_epoch = 0
         self._active_nav_goal: tuple[float, float, float] | None = None
         self._last_waypoint_pose: tuple[float, float, float] | None = None
         self._last_home_correct_t = 0.0
@@ -99,6 +101,8 @@ class Ros2Backend(RobotBackend):
         self._nav_enabled = True
         self._Time = None
         self._GoalStatus = None
+        self._navigation_action_state = "UNKNOWN"
+        self._navigation_goal_id: str | None = None
 
     def start(self) -> None:
         if self._started:
@@ -250,15 +254,32 @@ class Ros2Backend(RobotBackend):
         except ImportError:
             Path = None  # type: ignore
         if Path is not None:
-            plan_qos = QoSProfile(
+            # Nav2 Jazzy planner_server publishes /plan only if subscription_count > 0.
+            # Match both latched (transient local) and live (volatile) publishers.
+            # /received_global_plan is the controller remaining-path (map frame only).
+            plan_qos_tl = QoSProfile(
                 history=QoSHistoryPolicy.KEEP_LAST,
                 depth=1,
                 reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
             )
-            self._node.create_subscription(
-                Path, "plan", self._on_global_plan, plan_qos
+            plan_qos_vol = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=5,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
             )
-            self._node.get_logger().info("Subscribed to /plan (global path)")
+            for topic, qos in (
+                ("/plan", plan_qos_tl),
+                ("/plan", plan_qos_vol),
+                ("/received_global_plan", plan_qos_vol),
+            ):
+                self._node.create_subscription(
+                    Path, topic, self._on_global_plan, qos
+                )
+            self._node.get_logger().info(
+                "Subscribed to /plan and /received_global_plan (global path)"
+            )
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(
@@ -402,7 +423,7 @@ class Ros2Backend(RobotBackend):
         from ..home_poses import home_pose_for_device
 
         hx, hy, _ = home_pose_for_device()
-        near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.35"))
+        near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.15"))
         dx = float(pose[0]) - hx
         dy = float(pose[1]) - hy
         return (dx * dx + dy * dy) ** 0.5 <= near_m
@@ -454,8 +475,13 @@ class Ros2Backend(RobotBackend):
         # 홈 복귀 goal 이면 teleport 검사만 (정상 도착 허용)
         if self._goal_is_home():
             return self._is_home_teleport(tf_pose, last_good)
-        # 비홈 goal / 투어: last_good 과 0.5m+ 떨어진 홈 TF 만 거부 (근처 통과 허용)
-        if not (self._tour_active or self._home_seed_locked_out or self._is_navigating):
+        # 비홈 goal / 투어 / ArUco: last_good 과 0.5m+ 떨어진 홈 TF 만 거부 (근처 통과 허용)
+        if not (
+            self._tour_active
+            or self._home_seed_locked_out
+            or self._is_navigating
+            or self._visual_dock_active
+        ):
             return False
         return self._is_home_teleport(tf_pose, last_good)
 
@@ -466,14 +492,26 @@ class Ros2Backend(RobotBackend):
             self._pose_hold_until = 0.0
             self._pose_hold_target = None
         if self._pose_is_home(pose):
+            self._seed_monitor_path(float(x), float(y), float(yaw))
             return
         lg = self._last_good_map_pose
         if self._tour_active or (lg is not None and not self._pose_is_home(lg)):
             self._mark_tour_active("non-home goal")
+        self._seed_monitor_path(float(x), float(y), float(yaw))
 
     def _on_nav_goal_succeeded(self, x: float, y: float, yaw: float) -> None:
-        pose = (float(x), float(y), float(yaw))
-        if self._pose_is_home(pose):
+        # Keep the live heading. Writing goal yaw into _nav_pose made W6→C
+        # look aligned while the chassis was still facing the shelf.
+        live = self._lookup_tf_pose()
+        if live is not None and not self._spurious_home_tf(live):
+            dist = math.hypot(float(live[0]) - float(x), float(live[1]) - float(y))
+            if dist <= 0.40:
+                pose = (float(live[0]), float(live[1]), float(live[2]))
+            else:
+                pose = (float(x), float(y), float(yaw))
+        else:
+            pose = (float(x), float(y), float(yaw))
+        if self._pose_is_home((float(x), float(y), float(yaw))):
             with self._lock:
                 self._nav_pose = pose
                 self._last_good_map_pose = pose
@@ -484,6 +522,14 @@ class Ros2Backend(RobotBackend):
             self._last_good_map_pose = pose
             self._last_waypoint_pose = pose
         self._lock_out_home_seed("waypoint arrived")
+        with self._lock:
+            self._active_nav_goal = None
+        self._clear_nav_display_cache()
+
+    def _clear_nav_display_cache(self) -> None:
+        """Drop cached monitor path so idle robots do not keep showing old routes."""
+        with self._lock:
+            self._nav_plan = None
 
     def _mark_tour_active(self, reason: str = "") -> None:
         already = self._tour_active
@@ -495,25 +541,38 @@ class Ros2Backend(RobotBackend):
     def _clear_tour_lock(self, reason: str = "") -> None:
         self._tour_active = False
         self._active_nav_goal = None
+        self._clear_nav_display_cache()
         lg = self._last_good_map_pose
         pose = self._nav_pose
-        at_home = (lg is not None and self._pose_is_home(lg)) or (
-            pose is not None and self._pose_is_home(pose)
-        )
-        if at_home:
+        # last_good 이 매대면 TF 가 홈으로 점프해도 홈 시드 잠금 유지
+        if lg is not None:
+            truly_home = self._pose_is_home(lg)
+        else:
+            truly_home = pose is not None and self._pose_is_home(pose)
+        if truly_home:
             self._home_seed_locked_out = False
             self._boot_home_cancel.clear()
+        elif lg is not None and not self._pose_is_home(lg):
+            self._home_seed_locked_out = True
         if self._node:
             self._node.get_logger().info(
                 f"tour lock off{(': ' + reason) if reason else ''}"
             )
 
+    def _bump_motion_epoch(self) -> int:
+        with self._lock:
+            self._motion_epoch += 1
+            return self._motion_epoch
+
+    def _motion_epoch_now(self) -> int:
+        with self._lock:
+            return int(self._motion_epoch)
+
+    def motion_interrupted(self, epoch: int) -> bool:
+        return self._motion_epoch_now() != int(epoch)
+
     def _correct_home_jump(self) -> None:
         """AMCL/TF 가 홈으로 점프하면 last_good(웨이포인트) 으로 즉시 되돌림."""
-        with self._lock:
-            if self._visual_dock_active:
-                self._pin_visual_dock_pose()
-                return
         now = time.time()
         if now - self._last_home_correct_t < 1.0:
             return
@@ -527,13 +586,14 @@ class Ros2Backend(RobotBackend):
                 f"correct home jump → {'ignore TF' if driving else 'reseed'} "
                 f"({src[0]:.3f},{src[1]:.3f})"
             )
-        # 주행 중 initialpose 재발행은 AMCL/Nav2 와 싸워 pose 가 고정됨 → TF 만 무시
-        if driving:
-            return
-
         with self._lock:
             self._nav_pose = src
             self._last_good_map_pose = src
+            if self._visual_dock_active:
+                self._visual_dock_pose = src
+        # Nav2 주행 중 initialpose 재발행은 AMCL/Nav2 와 싸워 pose 가 고정됨 → TF 만 무시
+        if driving:
+            return
 
         def _pub() -> None:
             try:
@@ -546,11 +606,11 @@ class Ros2Backend(RobotBackend):
         threading.Thread(target=_pub, daemon=True).start()
 
     def _maybe_correct_amcl_home_jump(self) -> None:
-        with self._lock:
-            if self._visual_dock_active:
-                self._pin_visual_dock_pose()
-                return
-        if not (self._tour_active or self._home_seed_locked_out):
+        if not (
+            self._tour_active
+            or self._home_seed_locked_out
+            or self._visual_dock_active
+        ):
             return
         if self._non_home_seed_source() is None:
             return
@@ -658,7 +718,7 @@ class Ros2Backend(RobotBackend):
                 self._boot_home_cancel.set()
 
     def begin_visual_dock_hold(self) -> bool:
-        """Pin monitor pose at current TF for ArUco cmd_vel dock (never fall back to S1/S2)."""
+        """ArUco cmd_vel 구간: AMCL 유지, S1/S2 점프만 차단."""
         self._invalidate_pending_freeze()
         with self._lock:
             last_good = self._last_good_map_pose
@@ -679,47 +739,105 @@ class Ros2Backend(RobotBackend):
         if pose is None:
             if self._node:
                 self._node.get_logger().warn(
-                    "visual dock hold: no pose at all — cannot pin"
+                    "visual dock hold: no pose at all — cannot guard home jump"
                 )
             return False
         with self._lock:
             self._visual_dock_active = True
             self._visual_dock_pose = pose
+            self._visual_dock_odom = self._odom_pose
             self._nav_pose = pose
             if not self._pose_is_home(pose):
                 self._last_good_map_pose = pose
             self._home_seed_locked_out = True
-            self._pose_hold_target = pose
-            self._pose_hold_until = time.time() + 86400.0 * 365
-            self._localization_idle_frozen = True
+            self._localization_idle_frozen = False
+            self._pose_hold_until = 0.0
+            self._pose_hold_target = None
         self._boot_home_cancel.set()
-        if self._amcl_idle_freeze_enabled():
-            self._amcl_deactivate()
+        try:
+            self._amcl_activate()
+        except Exception:
+            pass
         if self._node:
             self._node.get_logger().info(
-                f"visual dock hold → ({pose[0]:.4f},{pose[1]:.4f},yaw={pose[2]:.3f})"
+                f"visual dock hold (AMCL on, block home jump) → "
+                f"({pose[0]:.4f},{pose[1]:.4f},yaw={pose[2]:.3f})"
             )
         return True
 
     def end_visual_dock_hold(self) -> None:
-        """Release dock hold; keep last dock pose for next Nav2 ensure (not home)."""
+        """Release dock guard; keep AMCL. Reseed only if TF jumped home."""
+        tf_now = self._lookup_tf_pose()
         with self._lock:
-            pose = self._visual_dock_pose or self._nav_pose
+            last_good = self._last_good_map_pose
+            fallback = self._visual_dock_pose or self._nav_pose
             self._visual_dock_active = False
             self._visual_dock_pose = None
+            self._visual_dock_odom = None
             self._localization_idle_frozen = False
             self._pose_hold_until = 0.0
             self._pose_hold_target = None
+        pose = fallback
+        if tf_now is not None and not self._spurious_home_tf(tf_now, last_good):
+            pose = tf_now
+        elif self._spurious_home_tf(tf_now, last_good):
+            pose = last_good or fallback
+            if self._node and tf_now is not None:
+                self._node.get_logger().warn(
+                    f"visual dock end: TF still at home ({tf_now[0]:.3f},{tf_now[1]:.3f}) "
+                    "— reseed last_good"
+                )
+        with self._lock:
             if pose is not None:
                 self._nav_pose = pose
                 if not self._pose_is_home(pose):
                     self._last_good_map_pose = pose
+                    self._last_waypoint_pose = pose
         self._invalidate_pending_freeze()
+        try:
+            self._amcl_activate()
+        except Exception:
+            pass
+        if pose is not None and not self._pose_is_home(pose):
+            if tf_now is None or self._spurious_home_tf(tf_now, last_good):
+                try:
+                    self._publish_initial_pose_raw(
+                        pose[0], pose[1], pose[2], tight=True, allow_home=False
+                    )
+                except Exception as exc:
+                    if self._node:
+                        self._node.get_logger().warn(
+                            f"visual dock hold: AMCL reseed failed: {exc}"
+                        )
         if self._node and pose is not None:
             self._node.get_logger().info(
                 f"visual dock hold released → keep pose "
                 f"({pose[0]:.4f},{pose[1]:.4f},yaw={pose[2]:.3f})"
             )
+
+    @staticmethod
+    def _shift_map_pose_by_odom(
+        map_start: tuple[float, float, float],
+        odom_start: tuple[float, float, float],
+        odom_now: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        dx = float(odom_now[0]) - float(odom_start[0])
+        dy = float(odom_now[1]) - float(odom_start[1])
+        c = math.cos(-float(odom_start[2]))
+        s = math.sin(-float(odom_start[2]))
+        local_x = c * dx - s * dy
+        local_y = s * dx + c * dy
+        yaw0 = float(map_start[2])
+        cm = math.cos(yaw0)
+        sm = math.sin(yaw0)
+        mx = float(map_start[0]) + cm * local_x - sm * local_y
+        my = float(map_start[1]) + sm * local_x + cm * local_y
+        myaw = yaw0 + (float(odom_now[2]) - float(odom_start[2]))
+        while myaw > math.pi:
+            myaw -= 2.0 * math.pi
+        while myaw < -math.pi:
+            myaw += 2.0 * math.pi
+        return (mx, my, myaw)
 
     def _is_nav_session_live(self) -> bool:
         """Nav2 goal 세션 중에만 TF 를 실시간 반영."""
@@ -736,25 +854,35 @@ class Ros2Backend(RobotBackend):
             )
 
     def _pin_visual_dock_pose(self) -> bool:
-        """아루코 도킹 중 모니터 pose 를 선반 위치에 고정."""
+        """아루코 구간: AMCL TF를 따르되 S1/S2 점프는 버리고 last_good 유지."""
         with self._lock:
             if not self._visual_dock_active:
                 return False
-            pose = self._visual_dock_pose or self._nav_pose
-            if pose is None:
-                lg = self._last_good_map_pose
-                wp = self._last_waypoint_pose
-                for alt in (lg, wp):
-                    if alt is not None:
-                        pose = alt
-                        self._visual_dock_pose = alt
-                        break
-            if pose is None:
-                return False
+            last_good = self._last_good_map_pose
+            fallback = self._visual_dock_pose or self._nav_pose or last_good
+        tf_pose = self._lookup_tf_pose()
+        if tf_pose is not None and not self._spurious_home_tf(tf_pose, last_good):
+            with self._lock:
+                self._nav_pose = tf_pose
+                self._visual_dock_pose = tf_pose
+                if not self._pose_is_home(tf_pose):
+                    self._last_good_map_pose = tf_pose
+            return True
+        if self._spurious_home_tf(tf_pose, last_good):
+            self._correct_home_jump()
+        pose = fallback
+        if pose is not None and self._pose_is_home(pose):
+            src = self._non_home_seed_source()
+            if src is not None:
+                pose = src
+        if pose is None:
+            return True
+        with self._lock:
             self._nav_pose = pose
             if not self._pose_is_home(pose):
+                self._visual_dock_pose = pose
                 self._last_good_map_pose = pose
-            return True
+        return True
 
     def _freeze_localization_idle(
         self, pose: tuple[float, float, float] | None = None
@@ -763,13 +891,10 @@ class Ros2Backend(RobotBackend):
         if self._is_driving():
             if self._node:
                 self._node.get_logger().info(
-                    "idle freeze skipped (nav/tour active)"
+                    "idle freeze skipped (nav/tour/dock active)"
                 )
             return
-        if self._visual_dock_active:
-            with self._lock:
-                pose = self._visual_dock_pose or self._nav_pose
-        elif pose is None:
+        if pose is None:
             pose = self._lookup_tf_pose()
             if pose is None:
                 with self._lock:
@@ -862,6 +987,7 @@ class Ros2Backend(RobotBackend):
             self._nav_session_active = False
             self._nav_session_saw_active = False
             self._is_navigating = False
+        self._clear_nav_display_cache()
 
     def _schedule_idle_freeze(self, sid: int, delay_sec: float = 0.8) -> None:
         def _run() -> None:
@@ -919,8 +1045,8 @@ class Ros2Backend(RobotBackend):
         block_home = (
             tour_or_work or away_from_home or self._should_block_home_seed()
         )
-        if block_home and self._goal_is_home():
-            block_home = False
+        # 홈 *목표* 라도 AMCL 을 S1/S2 에 시드하면 안 된다.
+        # (계산대에 있는데 pose 만 대기로 점프 → 복귀가 already-at-goal 로 끝남)
         seed: tuple[float, float, float] | None = None
         if x is not None and y is not None:
             seed = (float(x), float(y), float(yaw if yaw is not None else 0.0))
@@ -1102,26 +1228,37 @@ class Ros2Backend(RobotBackend):
             return False
 
         x, y, yaw = seed[0], seed[1], seed[2]
-        # 투어 중 홈 시드면 마지막 웨이포인트로 교체 후 AMCL 교정
-        if block_home and self._pose_is_home((x, y, yaw)):
+        # 계산대/선반 last_good 인데 시드만 S1/S2 이면 점프 — 실제 위치로 교정.
+        # 대기장소에 실제로 있으면(새 작업 출발·복귀) 홈 시드를 허용해야 Nav2 가 ABORT 하지 않음.
+        if self._pose_is_home((x, y, yaw)):
             repl = self._non_home_seed_source()
-            if repl is None:
+            if repl is not None and self._is_home_teleport((x, y, yaw), repl):
                 if self._node:
-                    self._node.get_logger().error(
-                        f"ensure localization → refused home seed during tour/work "
-                        f"({x:.3f},{y:.3f})"
+                    self._node.get_logger().warn(
+                        f"ensure localization → replace home seed "
+                        f"({x:.3f},{y:.3f}) with ({repl[0]:.3f},{repl[1]:.3f})"
                     )
-                return False
-            if self._node:
-                self._node.get_logger().warn(
-                    f"ensure localization → replace home seed "
-                    f"({x:.3f},{y:.3f}) with ({repl[0]:.3f},{repl[1]:.3f})"
-                )
-            x, y, yaw = repl
-            seed = repl
-            self._correct_home_jump()
+                x, y, yaw = repl[0], repl[1], repl[2]
+                seed = (x, y, yaw)
+                self._correct_home_jump()
+            elif block_home and repl is None and not self._goal_is_home():
+                # 잠금만 남고 실제 위치는 대기장소 — 출발 허용
+                if self._node:
+                    self._node.get_logger().info(
+                        f"ensure localization → allow wait-spot seed "
+                        f"({x:.3f},{y:.3f}) for departure"
+                    )
+                with self._lock:
+                    self._home_seed_locked_out = False
+                    self._last_good_map_pose = (x, y, yaw)
+                    self._nav_pose = (x, y, yaw)
+                self._boot_home_cancel.clear()
 
-        allow_home = (not block_home) and self._pose_is_home((x, y, yaw))
+        allow_home = self._pose_is_home((x, y, yaw)) and (
+            not block_home
+            or self._goal_is_home()
+            or self._non_home_seed_source() is None
+        )
         pub = self._publish_initial_pose_raw(
             float(x), float(y), float(yaw), tight=True, allow_home=allow_home
         )
@@ -1176,6 +1313,15 @@ class Ros2Backend(RobotBackend):
             "localizationMode": "idle" if frozen else "active",
             "amclIdleFreeze": self._amcl_idle_freeze_enabled(),
         }
+
+    def get_navigation_readiness(self) -> dict[str, Any]:
+        return self._fresh_navigation_readiness()
+
+    def get_navigation_action(self) -> dict[str, Any]:
+        with self._lock:
+            state = self._navigation_action_state
+            goal_id = self._navigation_goal_id
+        return {"state": state, "goalId": goal_id}
 
     def _seed_home_pose_for_monitor(self) -> None:
         """AMCL/TF 대기 중에도 모니터링 현재좌표가 S1/S2로 보이게 시드.
@@ -1235,7 +1381,7 @@ class Ros2Backend(RobotBackend):
         x, y, yaw = home_pose_for_device()
         attempts = max(1, int(os.environ.get("PINKY_INITIAL_POSE_RETRIES", "6")))
         gap = float(os.environ.get("PINKY_INITIAL_POSE_RETRY_GAP_SEC", "2.0"))
-        near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.35"))
+        near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.15"))
 
         with self._lock:
             self._localization_idle_frozen = False
@@ -1308,13 +1454,85 @@ class Ros2Backend(RobotBackend):
 
     def _on_global_plan(self, msg) -> None:
         """Cache Nav2 /plan (nav_msgs/Path) for GET /nav/plan."""
+        frame = str(getattr(msg.header, "frame_id", "") or "").strip().lstrip("/")
+        if frame and frame not in ("map",):
+            return
         path = self._path_msg_to_plan_dict(msg)
+        if not path.get("poses"):
+            return
         with self._lock:
             self._nav_plan = path
+        if self._node:
+            self._node.get_logger().debug(
+                f"cached nav path {path.get('pointCount', 0)} pts frame={frame or 'map'}"
+            )
+
+    def _seed_monitor_path(self, x: float, y: float, yaw: float) -> None:
+        """Guarantee a drawable path as soon as a Nav2 goal is remembered."""
+        start = self._lookup_tf_pose()
+        if start is None:
+            with self._lock:
+                start = self._nav_pose
+        if start is None:
+            self._refresh_plan_async(x, y, yaw)
+            return
+        with self._lock:
+            existing = self._nav_plan
+            poses = (existing or {}).get("poses") or []
+            if len(poses) > 2:
+                last = poses[-1]
+                try:
+                    if math.hypot(float(last["x"]) - x, float(last["y"]) - y) < 0.20:
+                        return
+                except (KeyError, TypeError, ValueError):
+                    pass
+            dx = float(x) - float(start[0])
+            dy = float(y) - float(start[1])
+            if math.hypot(dx, dy) < 0.05:
+                # Same XY, different yaw (W6→C): a 2-point path would be invisible.
+                hx = float(start[0]) + 0.35 * math.cos(float(yaw))
+                hy = float(start[1]) + 0.35 * math.sin(float(yaw))
+                end = {"x": hx, "y": hy, "yaw": float(yaw)}
+            else:
+                end = {"x": float(x), "y": float(y), "yaw": float(yaw)}
+            self._nav_plan = {
+                "ok": True,
+                "frameId": "map",
+                "stampSec": time.time(),
+                "pointCount": 2,
+                "poses": [
+                    {
+                        "x": float(start[0]),
+                        "y": float(start[1]),
+                        "yaw": float(start[2]),
+                    },
+                    end,
+                ],
+            }
+        self._refresh_plan_async(x, y, yaw)
+
+    def _refresh_plan_async(self, x: float, y: float, yaw: float) -> None:
+        def _run() -> None:
+            time.sleep(0.8)
+            with self._lock:
+                poses = (self._nav_plan or {}).get("poses") or []
+            if len(poses) > 2:
+                return
+            try:
+                self.compute_path_to(
+                    x, y, yaw, timeout_sec=4.0, ensure_localization=False, persist=True
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True, name="nav-plan-cache").start()
 
     def get_nav_plan(self) -> dict[str, Any]:
         with self._lock:
-            if self._nav_plan is not None:
+            navigating = bool(
+                self._is_navigating or self._nav_session_active
+            )
+            if self._nav_plan is not None and navigating:
                 plan = dict(self._nav_plan)
                 plan["poses"] = [dict(p) for p in self._nav_plan.get("poses") or []]
                 return plan
@@ -1371,6 +1589,9 @@ class Ros2Backend(RobotBackend):
         yaw: float = 0.0,
         timeout_sec: float = 10.0,
         planner_id: str = "",
+        *,
+        ensure_localization: bool = True,
+        persist: bool = False,
     ) -> dict[str, Any]:
         if not self._nav_enabled or self._plan_client is None:
             return {"success": False, "message": "navigation not enabled"}
@@ -1378,13 +1599,14 @@ class Ros2Backend(RobotBackend):
         from action_msgs.msg import GoalStatus
         from nav2_msgs.action import ComputePathToPose
 
-        try:
-            self._ensure_localization_for_drive()
-        except Exception as exc:
-            return {
-                "success": False,
-                "message": f"localization ensure failed: {exc}",
-            }
+        if ensure_localization:
+            try:
+                self._ensure_localization_for_drive()
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "message": f"localization ensure failed: {exc}",
+                }
 
         if not self._plan_client.wait_for_server(timeout_sec=2.0):
             return {
@@ -1440,8 +1662,9 @@ class Ros2Backend(RobotBackend):
         path = self._path_msg_to_plan_dict(action_result.path)
         if not path["poses"]:
             return {"success": False, "message": "planner returned empty path"}
-        with self._lock:
-            self._nav_plan = path
+        if persist:
+            with self._lock:
+                self._nav_plan = path
         return {
             "success": True,
             "message": "path computed without moving robot",
@@ -1464,9 +1687,32 @@ class Ros2Backend(RobotBackend):
             self._GoalStatus.STATUS_EXECUTING,
             self._GoalStatus.STATUS_CANCELING,
         )
+        status_labels = {
+            self._GoalStatus.STATUS_UNKNOWN: "UNKNOWN",
+            self._GoalStatus.STATUS_ACCEPTED: "ACCEPTED",
+            self._GoalStatus.STATUS_EXECUTING: "EXECUTING",
+            self._GoalStatus.STATUS_CANCELING: "CANCELING",
+            self._GoalStatus.STATUS_SUCCEEDED: "SUCCEEDED",
+            self._GoalStatus.STATUS_CANCELED: "CANCELED",
+            self._GoalStatus.STATUS_ABORTED: "ABORTED",
+        }
         # Empty status_list is common between updates — keep previous navigating state.
         if not msg.status_list:
             return
+        latest = msg.status_list[-1]
+        with self._lock:
+            self._navigation_action_state = status_labels.get(
+                int(latest.status), "UNKNOWN"
+            )
+            try:
+                goal_id = latest.goal_info.goal_id
+                self._navigation_goal_id = (
+                    "".join(f"{b:02x}" for b in goal_id.uuid)
+                    if goal_id is not None
+                    else None
+                )
+            except Exception:
+                self._navigation_goal_id = None
         navigating = any(s.status in active for s in msg.status_list)
         with self._lock:
             if self._nav_session_active:
@@ -1502,7 +1748,7 @@ class Ros2Backend(RobotBackend):
             return
         live_tf = self._is_nav_session_live()
         with self._lock:
-            # Nav2 주행 중에만 idle freeze 무시; 아루코 도킹은 visual_dock_pose 고정
+            # Nav2 주행 중에만 idle freeze 무시; 아루코는 _pin_visual_dock_pose 가 처리
             if self._localization_idle_frozen and not live_tf:
                 return
             last_good = self._last_good_map_pose
@@ -1530,7 +1776,7 @@ class Ros2Backend(RobotBackend):
                 self._pose_hold_target = None
             elif self._pose_hold_until > now and self._pose_hold_target is not None:
                 hx, hy, _hyaw = self._pose_hold_target
-                near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.35"))
+                near_m = float(os.environ.get("PINKY_HOME_POSE_NEAR_M", "0.15"))
                 dx = x - hx
                 dy = y - hy
                 if (dx * dx + dy * dy) ** 0.5 > near_m:
@@ -1561,6 +1807,19 @@ class Ros2Backend(RobotBackend):
             x, y, yaw = self._nav_pose
             return {"x": x, "y": y, "yaw": yaw}
 
+    def get_odom_pose(self) -> tuple[float, float, float] | None:
+        with self._lock:
+            return self._odom_pose
+
+    def get_active_nav_goal(self) -> dict[str, float] | None:
+        with self._lock:
+            if not (self._is_navigating or self._nav_session_active):
+                return None
+            g = self._active_nav_goal
+        if g is None:
+            return None
+        return {"x": float(g[0]), "y": float(g[1]), "yaw": float(g[2])}
+
     def is_navigating(self) -> bool:
         with self._lock:
             return self._is_navigating
@@ -1574,6 +1833,7 @@ class Ros2Backend(RobotBackend):
         tight: bool = False,
         allow_home: bool = False,
         force: bool = False,
+        operator: bool = False,
     ) -> dict[str, Any]:
         if not self._nav_enabled or self._initial_pose_pub is None:
             return {"success": False, "message": "navigation not enabled"}
@@ -1582,9 +1842,14 @@ class Ros2Backend(RobotBackend):
         # 홈 가드는 투어/작업 중이면 force 여부와 관계없이 차단.
         # last_good 이 웨이포인트인데 홈 좌표를 넣으려는 경우도 차단 (TF 점프 재시드 방지).
         home_req = self._pose_is_home((float(x), float(y), float(yaw)))
-        if home_req and (
-            self._should_block_home_seed()
-            or self._is_home_teleport((float(x), float(y), float(yaw)), last_good)
+        if (
+            home_req
+            and not operator
+            and not allow_home
+            and (
+                self._should_block_home_seed()
+                or self._is_home_teleport((float(x), float(y), float(yaw)), last_good)
+            )
         ):
             if self._node:
                 self._node.get_logger().warn(
@@ -1631,7 +1896,7 @@ class Ros2Backend(RobotBackend):
         }
 
     def set_initial_pose(self, x: float, y: float, yaw: float = 0.0) -> dict[str, Any]:
-        """관리자/RViz 수동 pose. 홈 시드 가드를 우회하고 지정 좌표를 항상 적용."""
+        """관리자 수동 pose. 실패 후 대기여도 투어 잠금을 풀고 지정 좌표를 적용한다."""
         if not self._nav_enabled or self._initial_pose_pub is None:
             self._setup_navigation()
         if not self._nav_enabled or self._initial_pose_pub is None:
@@ -1640,81 +1905,26 @@ class Ros2Backend(RobotBackend):
                 "message": "navigation not enabled (PINKY_NAV=0 또는 Nav2/tf2 import 실패)",
             }
 
-        with self._lock:
-            if self._visual_dock_active:
-                return {
-                    "success": True,
-                    "message": "ignored initialpose during visual dock",
-                    "ignored": True,
-                }
-
-        # 작업/투어 중 S1/S2 수동 시드도 거부 (force 우회 금지)
-        if self._pose_is_home((float(x), float(y), float(yaw))) and self._should_block_home_seed():
-            with self._lock:
-                cur = self._nav_pose or self._last_good_map_pose
-            if self._node:
-                self._node.get_logger().warn(
-                    f"ignore home initialpose ({float(x):.3f},{float(y):.3f}) "
-                    "— tour/work lockout"
-                )
-            return {
-                "success": True,
-                "message": "ignored home initialpose (tour/work)",
-                "ignored": True,
-                "pose": (
-                    {"x": cur[0], "y": cur[1], "yaw": cur[2]}
-                    if cur is not None
-                    else {"x": x, "y": y, "yaw": yaw}
-                ),
-            }
-
-        with self._lock:
-            was_frozen = self._localization_idle_frozen
-            navigating = self._is_navigating
-            session_active = self._nav_session_active
-
-        # 대기 중 수동 pose: activate → publish → settle → 포즈 hold.
-        # 즉시 AMCL deactivate 하지 않음(곧 주행 시 ensure 가 살아 있는 AMCL 사용).
-        # 유예 후 lifecycle freeze.
-        if self._amcl_idle_freeze_enabled() and (
-            was_frozen or (not navigating and not session_active)
-        ):
-            with self._lock:
-                self._localization_idle_frozen = False
+        if self._visual_dock_active:
             try:
-                self._amcl_activate()
-            except Exception as exc:
-                if self._node:
-                    self._node.get_logger().warn(f"AMCL activate for initialpose: {exc}")
-            result = self._publish_initial_pose_raw(
-                float(x),
-                float(y),
-                float(yaw),
-                tight=True,
-                allow_home=True,
-                force=True,
-            )
-            settle = float(os.environ.get("PINKY_LOCALIZE_SETTLE_SEC", "1.0"))
-            if settle > 0:
-                time.sleep(min(settle, 1.5))
-            delay = float(os.environ.get("PINKY_AMCL_IDLE_FREEZE_DELAY_SEC", "45.0"))
-            hold = max(
-                float(os.environ.get("PINKY_POSE_HOLD_SEC", "12.0")),
-                delay + 1.0 if delay > 0 else 12.0,
-            )
-            with self._lock:
-                self._nav_pose = (float(x), float(y), float(yaw))
-                self._pose_hold_target = (float(x), float(y), float(yaw))
-                self._pose_hold_until = time.time() + hold
-                self._nav_session_id += 1
-                freeze_sid = self._nav_session_id
-                self._nav_session_active = False
-                self._nav_session_saw_active = False
-            if delay <= 0:
-                self._freeze_localization_idle((float(x), float(y), float(yaw)))
-            else:
-                self._schedule_idle_freeze(freeze_sid, delay)
-            return result
+                self.end_visual_dock_hold()
+            except Exception:
+                pass
+        if self._is_navigating or self._nav_session_active:
+            try:
+                self._cancel_nav_sync(timeout_sec=1.5)
+            except Exception:
+                pass
+        self._clear_tour_lock("operator initialpose")
+
+        pose = (float(x), float(y), float(yaw))
+        with self._lock:
+            self._localization_idle_frozen = False
+        try:
+            self._amcl_activate()
+        except Exception as exc:
+            if self._node:
+                self._node.get_logger().warn(f"AMCL activate for initialpose: {exc}")
 
         result = self._publish_initial_pose_raw(
             float(x),
@@ -1723,12 +1933,44 @@ class Ros2Backend(RobotBackend):
             tight=True,
             allow_home=True,
             force=True,
+            operator=True,
         )
-        hold = float(os.environ.get("PINKY_POSE_HOLD_SEC", "12.0"))
+        settle = float(os.environ.get("PINKY_LOCALIZE_SETTLE_SEC", "1.0"))
+        if settle > 0:
+            time.sleep(min(settle, 1.5))
+
+        delay = float(os.environ.get("PINKY_AMCL_IDLE_FREEZE_DELAY_SEC", "45.0"))
+        hold = max(
+            float(os.environ.get("PINKY_POSE_HOLD_SEC", "12.0")),
+            delay + 1.0 if delay > 0 else 12.0,
+        )
         with self._lock:
-            self._nav_pose = (float(x), float(y), float(yaw))
-            self._pose_hold_target = (float(x), float(y), float(yaw))
-            self._pose_hold_until = time.time() + max(1.0, hold)
+            self._nav_pose = pose
+            self._last_good_map_pose = pose
+            self._last_waypoint_pose = pose
+            self._pose_hold_target = pose
+            self._pose_hold_until = time.time() + hold
+            self._nav_session_id += 1
+            freeze_sid = self._nav_session_id
+            self._nav_session_active = False
+            self._nav_session_saw_active = False
+            self._is_navigating = False
+        if self._pose_is_home(pose):
+            with self._lock:
+                self._home_seed_locked_out = False
+            self._boot_home_cancel.clear()
+        else:
+            self._lock_out_home_seed("operator non-home pose")
+
+        if self._amcl_idle_freeze_enabled():
+            if delay <= 0:
+                self._freeze_localization_idle(pose)
+            else:
+                self._schedule_idle_freeze(freeze_sid, delay)
+        if self._node:
+            self._node.get_logger().info(
+                f"operator initialpose ({pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f})"
+            )
         return result
 
     def navigate_to(
@@ -1902,12 +2144,55 @@ class Ros2Backend(RobotBackend):
             goal.pose.pose.orientation.w = math.cos(float(yaw) / 2.0)
             return goal
 
-        # 잔여 goal cancel — Nav2는 동시 goal을 거부하므로 항상 정리
+        pose_now = self._lookup_tf_pose()
+        if pose_now is None:
+            with self._lock:
+                pose_now = self._nav_pose
+        if pose_now is not None and self._spurious_home_tf(pose_now):
+            with self._lock:
+                pose_now = self._last_good_map_pose or self._nav_pose
+        arrive_m = float(os.environ.get("PINKY_GOAL_ARRIVE_M", "0.12"))
+        arrive_yaw = float(os.environ.get("PINKY_GOAL_ARRIVE_YAW_RAD", "0.12"))
+        motion_epoch = self._motion_epoch_now()
+        if pose_now is not None:
+            dist = math.hypot(float(pose_now[0]) - float(x), float(pose_now[1]) - float(y))
+            yaw_err = abs(self._angle_error(float(pose_now[2]), float(yaw)))
+            fake_home = False
+            if dist <= arrive_m and self._pose_is_home((float(x), float(y), float(yaw))):
+                with self._lock:
+                    lg = self._last_good_map_pose
+                fake_home = lg is not None and not self._pose_is_home(lg)
+            if dist <= arrive_m and yaw_err <= arrive_yaw and not fake_home:
+                self._on_nav_goal_succeeded(x, y, yaw)
+                return {
+                    "success": True,
+                    "status": "SUCCEEDED",
+                    "message": (
+                        f"already at goal dist={dist:.3f}m yawErr={yaw_err:.3f}rad"
+                    ),
+                    "goal": {"x": x, "y": y, "yaw": yaw},
+                }
+            if dist <= arrive_m and yaw_err > arrive_yaw and not fake_home:
+                if self._node:
+                    self._node.get_logger().info(
+                        f"same XY but yaw err={yaw_err:.3f}rad "
+                        f"(need {float(yaw):.3f}, have {float(pose_now[2]):.3f}) "
+                        "— rotate in place (skip Nav2)"
+                    )
+                return self._rotate_in_place_to_yaw(
+                    x,
+                    y,
+                    yaw,
+                    timeout_sec=max(3.0, deadline - time.time()),
+                    arrive_yaw=arrive_yaw,
+                )
+
+        # 잔여 goal cancel — Nav2는 이전 goal이 남아 있으면 새 goal 을 REJECT
         try:
             self._cancel_nav_sync(timeout_sec=2.0)
         except Exception:
             pass
-        time.sleep(0.1)
+        self._wait_nav_action_idle(3.0)
 
         if self._wait_usable_tf(1.5) is None:
             return {
@@ -1920,11 +2205,12 @@ class Ros2Backend(RobotBackend):
             }
 
         sid = self._start_nav_session()
-        send_future = self._nav_client.send_goal_async(_build_goal())
 
         def _finish(payload: dict[str, Any]) -> dict[str, Any]:
             if payload.get("success"):
                 self._on_nav_goal_succeeded(x, y, yaw)
+            elif payload.get("status") in ("CANCELED", "INTERRUPTED"):
+                self._clear_tour_lock("nav interrupted")
             self._end_nav_session(sid)
             # 투어 연속 goal 사이 AMCL 유지: 유예를 길게 (다음 ensure 가 오면 취소)
             # dwell(기본 3s) + 다음 goal 준비보다 충분히 커야 중간단위 freeze 가 안 남
@@ -1961,69 +2247,72 @@ class Ros2Backend(RobotBackend):
                     self._node.get_logger().warn(f"goal accept error: {exc}")
                 return None
 
-        goal_handle = _wait_accept(send_future)
-        if goal_handle is None and not send_future.done():
-            return _finish(
-                {
-                    "success": False,
-                    "status": "TIMEOUT",
-                    "message": "goal accept timeout",
-                }
-            )
-
-        if goal_handle is None or not getattr(goal_handle, "accepted", False):
-            # 한 번 더: TF 재확인 + (필요 시) cancel 후 재전송
+        max_accept = max(1, int(os.environ.get("PINKY_NAV_ACCEPT_RETRIES", "5")))
+        goal_handle = None
+        for attempt in range(1, max_accept + 1):
+            if self.motion_interrupted(motion_epoch):
+                return _finish(
+                    {
+                        "success": False,
+                        "status": "INTERRUPTED",
+                        "message": "nav interrupted by stop/new job",
+                    }
+                )
+            if time.time() > deadline:
+                break
+            send_future = self._nav_client.send_goal_async(_build_goal())
+            goal_handle = _wait_accept(send_future)
+            if goal_handle is not None and getattr(goal_handle, "accepted", False):
+                break
+            with self._lock:
+                action_state = self._navigation_action_state
             if self._node:
                 self._node.get_logger().warn(
-                    "NavigateToPose rejected — re-ensure TF and retry once"
+                    f"NavigateToPose rejected try {attempt}/{max_accept} "
+                    f"action_state={action_state}"
                 )
-            try:
-                self._ensure_localization_for_drive()
-            except Exception:
-                pass
             try:
                 self._cancel_nav_sync(timeout_sec=2.0)
             except Exception:
                 pass
-            time.sleep(0.15)
-            if self._wait_usable_tf(1.0) is None:
-                return _finish(
-                    {
-                        "success": False,
-                        "status": "NO_TF",
-                        "message": (
-                            "goal rejected and still no map→base_footprint TF"
-                        ),
-                    }
-                )
-            if time.time() > deadline:
-                return _finish(
-                    {
-                        "success": False,
-                        "status": "REJECTED",
-                        "message": (
-                            "goal rejected (Nav2). Check: map→base_footprint TF, "
-                            "bt_navigator robot_base_frame, single Nav2 instance"
-                        ),
-                    }
-                )
-            send_future = self._nav_client.send_goal_async(_build_goal())
-            goal_handle = _wait_accept(send_future)
-            if goal_handle is None or not getattr(goal_handle, "accepted", False):
-                return _finish(
-                    {
-                        "success": False,
-                        "status": "REJECTED",
-                        "message": (
-                            "goal rejected (Nav2). Check: map→base_footprint TF, "
-                            "bt_navigator robot_base_frame=base_footprint, "
-                            "single Nav2 instance (no duplicate launch)"
-                        ),
-                    }
-                )
+            self._wait_nav_action_idle(2.5)
+            time.sleep(min(0.8, 0.2 * attempt))
+            if attempt < max_accept:
+                try:
+                    self._ensure_localization_for_drive()
+                except Exception:
+                    pass
+            goal_handle = None
+
+        if goal_handle is None or not getattr(goal_handle, "accepted", False):
+            with self._lock:
+                action_state = self._navigation_action_state
+            return _finish(
+                {
+                    "success": False,
+                    "status": "REJECTED",
+                    "message": (
+                        f"goal rejected (Nav2) action_state={action_state}. "
+                        "Wait for previous goal to finish canceling; "
+                        "check bt_navigator is active and a single Nav2 instance"
+                    ),
+                }
+            )
 
         result_future = goal_handle.get_result_async()
         while not result_future.done():
+            if self.motion_interrupted(motion_epoch):
+                try:
+                    self._cancel_nav_sync(timeout_sec=1.5)
+                except Exception:
+                    pass
+                return _finish(
+                    {
+                        "success": False,
+                        "status": "INTERRUPTED",
+                        "message": "nav interrupted by stop/new job",
+                    }
+                )
             if time.time() > deadline:
                 try:
                     self.cancel_navigation(freeze=False)
@@ -2049,14 +2338,84 @@ class Ros2Backend(RobotBackend):
             )
         status = int(wrapped.status)
         ok = status == GoalStatus.STATUS_SUCCEEDED
+        status_name = {
+            GoalStatus.STATUS_SUCCEEDED: "SUCCEEDED",
+            GoalStatus.STATUS_CANCELED: "CANCELED",
+            GoalStatus.STATUS_ABORTED: "ABORTED",
+        }.get(status, f"STATUS_{status}")
+        action_result = getattr(wrapped, "result", None)
+        error_code = int(getattr(action_result, "error_code", 0) or 0)
+        error_msg = str(getattr(action_result, "error_msg", "") or "")
+        if ok:
+            message = "arrived"
+        else:
+            message = f"nav ended with status {status} ({status_name})"
+            if error_code or error_msg:
+                extra = " ".join(
+                    part
+                    for part in (f"error_code={error_code}" if error_code else "", error_msg)
+                    if part
+                )
+                message = f"{message} {extra}".strip()
+
+        pose_after = self._lookup_tf_pose()
+        if pose_after is None:
+            with self._lock:
+                pose_after = self._nav_pose
+        dist_after = None
+        yaw_err_after = None
+        if pose_after is not None:
+            dist_after = math.hypot(
+                float(pose_after[0]) - float(x), float(pose_after[1]) - float(y)
+            )
+            yaw_err_after = abs(self._angle_error(float(pose_after[2]), float(yaw)))
+        # Nav2 often SUCCEEDED/ABORTED at the same XY without rotating.
+        if (
+            dist_after is not None
+            and yaw_err_after is not None
+            and dist_after <= arrive_m * 1.5
+            and yaw_err_after > arrive_yaw
+        ):
+            if self._node:
+                self._node.get_logger().info(
+                    f"Nav2 {status_name} at XY but yaw err={yaw_err_after:.3f}rad "
+                    "— rotate in place"
+                )
+            self._end_nav_session(sid)
+            return self._rotate_in_place_to_yaw(
+                x,
+                y,
+                yaw,
+                timeout_sec=max(3.0, deadline - time.time()),
+                arrive_yaw=arrive_yaw,
+            )
+
         return _finish(
             {
                 "success": ok,
-                "status": "SUCCEEDED" if ok else f"STATUS_{status}",
-                "message": "arrived" if ok else f"nav ended with status {status}",
+                "status": status_name,
+                "message": message,
+                "errorCode": error_code,
+                "errorMsg": error_msg,
                 "goal": {"x": x, "y": y, "yaw": yaw},
             }
         )
+
+    def _nav_action_busy(self) -> bool:
+        with self._lock:
+            state = (self._navigation_action_state or "").upper()
+        return state in ("ACCEPTED", "EXECUTING", "CANCELING")
+
+    def _wait_nav_action_idle(self, timeout_sec: float = 3.0) -> bool:
+        """Wait until bt_navigator is ready to accept a new NavigateToPose."""
+        deadline = time.time() + max(0.2, float(timeout_sec))
+        while time.time() < deadline:
+            if not self._nav_action_busy():
+                time.sleep(0.2)
+                if not self._nav_action_busy():
+                    return True
+            time.sleep(0.05)
+        return not self._nav_action_busy()
 
     def _cancel_nav_sync(self, timeout_sec: float = 2.0) -> dict[str, Any]:
         """Cancel NavigateToPose and wait briefly for the cancel service response."""
@@ -2079,9 +2438,19 @@ class Ros2Backend(RobotBackend):
         return {"success": True, "message": "cancel requested"}
 
     def cancel_navigation(self, *, freeze: bool = True) -> dict[str, Any]:
+        self._bump_motion_epoch()
+        try:
+            self.end_visual_dock_hold()
+        except Exception:
+            pass
+        try:
+            self.drive(0.0, 0.0)
+        except Exception:
+            pass
         if not self._nav_enabled or self._cancel_client is None:
             self._end_nav_session()
             if freeze:
+                self._clear_tour_lock("nav stop")
                 try:
                     self._freeze_localization_idle()
                 except Exception:
@@ -2089,6 +2458,7 @@ class Ros2Backend(RobotBackend):
             return {"success": False, "message": "navigation not enabled"}
         result = self._cancel_nav_sync(timeout_sec=2.0)
         if freeze:
+            self._clear_tour_lock("nav stop")
             self._invalidate_pending_freeze()
             try:
                 self._freeze_localization_idle()
@@ -2359,6 +2729,132 @@ class Ros2Backend(RobotBackend):
     def _angle_error(current: float, reference: float) -> float:
         return math.atan2(math.sin(current - reference), math.cos(current - reference))
 
+    def _rotate_in_place_to_yaw(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        timeout_sec: float,
+        arrive_yaw: float,
+    ) -> dict[str, Any]:
+        """Turn in place when XY is already at the goal (W6→C). Nav2 skips this."""
+        self._remember_nav_goal(x, y, yaw)
+        try:
+            self._cancel_nav_sync(timeout_sec=1.5)
+        except Exception:
+            pass
+        self._wait_nav_action_idle(2.0)
+
+        if not self._motion_lock.acquire(blocking=False):
+            return {
+                "success": False,
+                "status": "BUSY",
+                "message": "another relative motion is active",
+                "goal": {"x": x, "y": y, "yaw": yaw},
+            }
+
+        sid = self._start_nav_session()
+        max_rate = float(os.environ.get("PINKY_INPLACE_YAW_RATE", "0.45"))
+        min_rate = float(os.environ.get("PINKY_INPLACE_YAW_MIN_RATE", "0.18"))
+        deadline = time.time() + max(3.0, float(timeout_sec))
+        start_map = self._lookup_tf_pose()
+        if start_map is None:
+            with self._lock:
+                start_map = self._nav_pose
+        with self._lock:
+            start_odom = self._odom_pose
+
+        def _current_pose() -> tuple[float, float, float] | None:
+            # Close the loop on odom — AMCL/TF often does not update during a
+            # same-XY spin, so TF-only control would keep turning past the goal.
+            with self._lock:
+                odom = self._odom_pose
+            if start_map is not None and start_odom is not None and odom is not None:
+                dyaw = self._angle_error(float(odom[2]), float(start_odom[2]))
+                heading = float(start_map[2]) + dyaw
+                heading = math.atan2(math.sin(heading), math.cos(heading))
+                return (float(start_map[0]), float(start_map[1]), heading)
+            tf_pose = self._lookup_tf_pose()
+            if tf_pose is not None and not self._spurious_home_tf(tf_pose):
+                return tf_pose
+            with self._lock:
+                return self._nav_pose
+
+        last_err = None
+        ok = False
+        try:
+            while time.time() < deadline:
+                pose = _current_pose()
+                if pose is None:
+                    time.sleep(0.05)
+                    continue
+                err = self._angle_error(float(yaw), float(pose[2]))
+                last_err = err
+                with self._lock:
+                    self._nav_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+                if abs(err) <= arrive_yaw:
+                    ok = True
+                    break
+                rate = max(-max_rate, min(max_rate, err * 1.6))
+                if abs(rate) < min_rate:
+                    rate = min_rate if rate >= 0.0 else -min_rate
+                self.drive(0.0, rate, bypass_collision=True)
+                time.sleep(0.05)
+            self.drive(0.0, 0.0, bypass_collision=True)
+            time.sleep(0.12)
+            pose = _current_pose()
+            if pose is not None:
+                last_err = self._angle_error(float(yaw), float(pose[2]))
+                if abs(last_err) <= arrive_yaw * 1.25:
+                    ok = True
+                    with self._lock:
+                        self._nav_pose = (
+                            float(pose[0]),
+                            float(pose[1]),
+                            float(pose[2]),
+                        )
+        finally:
+            try:
+                self.drive(0.0, 0.0, bypass_collision=True)
+            except Exception:
+                pass
+            self._end_nav_session(sid)
+            self._motion_lock.release()
+
+        if ok:
+            pose = _current_pose()
+            if pose is None:
+                pose = (float(x), float(y), float(yaw))
+            with self._lock:
+                self._nav_pose = pose
+                self._last_good_map_pose = pose
+                self._last_waypoint_pose = pose
+            self._lock_out_home_seed("in-place yaw aligned")
+            err_abs = 0.0 if last_err is None else abs(last_err)
+            if self._node:
+                self._node.get_logger().info(
+                    f"in-place yaw aligned err={err_abs:.3f}rad "
+                    f"goal=({x:.3f},{y:.3f},{yaw:.3f})"
+                )
+            return {
+                "success": True,
+                "status": "SUCCEEDED",
+                "message": f"rotated in place yawErr={err_abs:.3f}rad",
+                "goal": {"x": x, "y": y, "yaw": yaw},
+            }
+        err_txt = "unknown" if last_err is None else f"{abs(last_err):.3f}rad"
+        if self._node:
+            self._node.get_logger().warn(
+                f"in-place yaw timeout remaining={err_txt} "
+                f"goal=({x:.3f},{y:.3f},{yaw:.3f})"
+            )
+        return {
+            "success": False,
+            "status": "TIMEOUT",
+            "message": f"in-place yaw timeout remaining={err_txt}",
+            "goal": {"x": x, "y": y, "yaw": yaw},
+        }
+
     def _fresh_navigation_readiness(self) -> dict[str, Any]:
         failures: list[str] = []
         tf_valid = self._lookup_tf_pose() is not None
@@ -2447,6 +2943,55 @@ class Ros2Backend(RobotBackend):
             nearest = min(nearest, forward)
         return (nearest if math.isfinite(nearest) else math.inf), None
 
+    def _open_loop_translate(
+        self,
+        distance_m: float,
+        speed_mps: float,
+        timeout_sec: float | None,
+        *,
+        bypass_collision: bool = True,
+        hold_lock: bool = False,
+    ) -> dict[str, Any]:
+        """Timed cmd_vel translate when odom is missing (abort undock)."""
+        distance = float(distance_m)
+        speed = abs(float(speed_mps))
+        if abs(distance) < 1e-4 or speed <= 0.0:
+            return {"success": True, "movedM": 0.0, "message": "open-loop none"}
+        sign = 1.0 if distance > 0.0 else -1.0
+        duration = abs(distance) / max(speed, 0.01)
+        if timeout_sec is not None:
+            duration = min(duration, max(0.2, float(timeout_sec)))
+        got_lock = False
+        if not hold_lock:
+            got_lock = bool(self._motion_lock.acquire(timeout=2.5))
+            if not got_lock:
+                return {
+                    "success": False,
+                    "movedM": 0.0,
+                    "message": "another relative motion is active",
+                }
+        start_epoch = self._motion_epoch_now()
+        t0 = time.monotonic()
+        try:
+            while time.monotonic() - t0 < duration:
+                if self.motion_interrupted(start_epoch):
+                    break
+                self.drive(sign * speed, 0.0, bypass_collision=bypass_collision)
+                time.sleep(0.05)
+        finally:
+            try:
+                self.drive(0.0, 0.0, bypass_collision=bypass_collision)
+            except Exception:
+                pass
+            if got_lock:
+                self._motion_lock.release()
+        moved = speed * min(duration, max(0.0, time.monotonic() - t0))
+        return {
+            "success": True,
+            "movedM": moved,
+            "message": f"open-loop translate {moved:.3f}m",
+        }
+
     def relative_move(
         self,
         distance_m: float,
@@ -2454,11 +2999,13 @@ class Ros2Backend(RobotBackend):
         timeout_sec: float | None = None,
         *,
         dry_run: bool = False,
+        bypass_collision: bool = False,
+        ignore_scan: bool = False,
     ) -> dict[str, Any]:
-        """Closed-loop short translation using odom, with scan/TF safety checks.
+        """Closed-loop short translation using odom.
 
-        This is intentionally limited to micro-motion used to leave/enter a known
-        docking pocket. It does not replace Nav2 for normal navigation.
+        Undock (reverse out of a wall pocket) should pass bypass_collision and
+        ignore_scan — inflation/side walls otherwise freeze the robot in place.
         """
         distance = float(distance_m)
         speed = abs(float(speed_mps))
@@ -2468,45 +3015,69 @@ class Ros2Backend(RobotBackend):
             return {"success": False, "message": "speedMps must be > 0 and <= 0.08"}
         if abs(distance) > 0.30:
             return {"success": False, "message": "relative move limited to 0.30m per call"}
-        if self.is_navigating():
+        if self.is_navigating() and not bypass_collision:
             return {"success": False, "message": "navigation is active; relative move refused"}
 
-        readiness = self._fresh_navigation_readiness()
-        if (
-            readiness.get("ready") is not True
-            or readiness.get("tfValid") is not True
-            or readiness.get("scanFresh") is not True
-        ):
-            return {
-                "success": False,
-                "message": "navigation/TF/scan precheck failed",
-                "readiness": readiness,
-            }
+        if not ignore_scan:
+            readiness = self._fresh_navigation_readiness()
+            if (
+                readiness.get("ready") is not True
+                or readiness.get("tfValid") is not True
+                or readiness.get("scanFresh") is not True
+            ):
+                return {
+                    "success": False,
+                    "message": "navigation/TF/scan precheck failed",
+                    "readiness": readiness,
+                }
 
         with self._lock:
             odom = self._odom_pose
             odom_stamp = self._odom_stamp
         odom_age = time.time() - float(odom_stamp) if odom_stamp is not None else math.inf
-        if odom is None or odom_age > 0.5:
-            return {"success": False, "message": f"odom unavailable/stale ({odom_age:.2f}s)"}
+        odom_limit = 3.0 if ignore_scan else 0.5
+        if odom is None or odom_age > odom_limit:
+            if ignore_scan and bypass_collision:
+                if self._node:
+                    self._node.get_logger().warn(
+                        f"relative move odom stale ({odom_age:.2f}s) — open-loop "
+                        f"{distance:.3f}m"
+                    )
+                return self._open_loop_translate(
+                    distance, speed, timeout_sec, bypass_collision=True
+                )
+            return {
+                "success": False,
+                "message": f"odom unavailable/stale ({odom_age:.2f}s)",
+                "movedM": 0.0,
+            }
 
         sign = 1.0 if distance > 0.0 else -1.0
         corridor_half_width = 0.07
         robot_half_length = 0.06
         safety_margin = 0.03
-        clearance, clearance_error = self._scan_clearance_base_x(
-            sign, corridor_half_width
-        )
+        clearance: float | None = None
         required_initial = robot_half_length + abs(distance) + safety_margin
-        if clearance_error is not None:
-            return {"success": False, "message": clearance_error}
-        if clearance is not None and clearance < required_initial:
-            return {
-                "success": False,
-                "message": "relative move blocked by scan",
-                "clearanceM": (clearance if clearance is not None and math.isfinite(clearance) else None),
-                "requiredClearanceM": required_initial,
-            }
+        if not ignore_scan:
+            clearance, clearance_error = self._scan_clearance_base_x(
+                sign, corridor_half_width
+            )
+            if clearance_error is not None:
+                return {"success": False, "message": clearance_error}
+            if (
+                clearance is not None
+                and math.isfinite(clearance)
+                and clearance < required_initial
+            ):
+                shrink = float(clearance) - robot_half_length - safety_margin
+                if shrink < 0.01:
+                    return {
+                        "success": False,
+                        "message": "relative move blocked by scan",
+                        "clearanceM": clearance,
+                        "requiredClearanceM": required_initial,
+                    }
+                distance = sign * shrink
 
         if dry_run:
             return {
@@ -2520,9 +3091,22 @@ class Ros2Backend(RobotBackend):
                 "requiredClearanceM": required_initial,
             }
 
-        if not self._motion_lock.acquire(blocking=False):
-            return {"success": False, "message": "another relative motion is active"}
+        if bypass_collision:
+            try:
+                self._cancel_nav_sync(timeout_sec=1.0)
+            except Exception:
+                pass
+            self._end_nav_session()
 
+        if not self._motion_lock.acquire(timeout=2.5):
+            return {
+                "success": False,
+                "message": "another relative motion is active",
+                "movedM": 0.0,
+            }
+
+        lateral_lim = 0.08 if ignore_scan else 0.035
+        yaw_lim = 0.35 if ignore_scan else 0.18
         start_x, start_y, start_yaw = odom
         deadline = time.monotonic() + (
             float(timeout_sec)
@@ -2536,8 +3120,16 @@ class Ros2Backend(RobotBackend):
             "movedM": 0.0,
         }
         stopped = False
+        move_epoch = self._motion_epoch_now()
         try:
             while True:
+                if self.motion_interrupted(move_epoch):
+                    result = {
+                        "success": False,
+                        "message": "relative move interrupted",
+                        "movedM": max(0.0, last_progress),
+                    }
+                    break
                 if time.monotonic() >= deadline:
                     result = {
                         "success": False,
@@ -2545,7 +3137,7 @@ class Ros2Backend(RobotBackend):
                         "movedM": max(0.0, last_progress),
                     }
                     break
-                if self.is_navigating():
+                if self.is_navigating() and not bypass_collision:
                     result = {
                         "success": False,
                         "message": "navigation became active during relative move",
@@ -2556,7 +3148,7 @@ class Ros2Backend(RobotBackend):
                     cur = self._odom_pose
                     cur_stamp = self._odom_stamp
                     visual_dock_active = self._visual_dock_active
-                if visual_dock_active:
+                if visual_dock_active and not bypass_collision:
                     result = {
                         "success": False,
                         "message": "visual docking became active during relative move",
@@ -2566,7 +3158,25 @@ class Ros2Backend(RobotBackend):
                 cur_age = (
                     time.time() - float(cur_stamp) if cur_stamp is not None else math.inf
                 )
-                if cur is None or cur_age > 0.5:
+                if cur is None or cur_age > odom_limit:
+                    if ignore_scan:
+                        remain = max(0.0, abs(distance) - last_progress)
+                        extra = self._open_loop_translate(
+                            sign * remain,
+                            speed,
+                            remain / max(speed, 0.01) + 1.0,
+                            bypass_collision=bypass_collision,
+                            hold_lock=True,
+                        )
+                        moved = last_progress + abs(float(extra.get("movedM") or 0.0))
+                        result = {
+                            "success": bool(extra.get("success")),
+                            "message": (
+                                f"odom stale mid-move; open-loop {extra.get('message')}"
+                            ),
+                            "movedM": moved,
+                        }
+                        break
                     result = {
                         "success": False,
                         "message": f"odom became stale ({cur_age:.2f}s)",
@@ -2579,14 +3189,14 @@ class Ros2Backend(RobotBackend):
                 progress = sign * forward
                 last_progress = progress
                 yaw_drift = abs(self._angle_error(cur[2], start_yaw))
-                if abs(lateral) > 0.035:
+                if abs(lateral) > lateral_lim:
                     result = {
                         "success": False,
                         "message": f"relative move lateral drift {lateral:.3f}m",
                         "movedM": max(0.0, progress),
                     }
                     break
-                if yaw_drift > 0.18:
+                if yaw_drift > yaw_lim:
                     result = {
                         "success": False,
                         "message": f"relative move yaw drift {yaw_drift:.3f}rad",
@@ -2604,36 +3214,41 @@ class Ros2Backend(RobotBackend):
                     }
                     break
 
-                remaining = max(0.0, abs(distance) - progress)
-                clearance, clearance_error = self._scan_clearance_base_x(
-                    sign, corridor_half_width
-                )
-                if clearance_error is not None:
-                    result = {
-                        "success": False,
-                        "message": clearance_error,
-                        "movedM": max(0.0, progress),
-                    }
-                    break
-                required = robot_half_length + remaining + safety_margin
-                if clearance is not None and clearance < required:
-                    result = {
-                        "success": False,
-                        "message": "relative move obstacle detected",
-                        "movedM": max(0.0, progress),
-                        "clearanceM": clearance,
-                        "requiredClearanceM": required,
-                    }
-                    break
-                self.drive(sign * speed, 0.0)
+                if not ignore_scan:
+                    remaining = max(0.0, abs(distance) - progress)
+                    clearance, clearance_error = self._scan_clearance_base_x(
+                        sign, corridor_half_width
+                    )
+                    if clearance_error is not None:
+                        result = {
+                            "success": False,
+                            "message": clearance_error,
+                            "movedM": max(0.0, progress),
+                        }
+                        break
+                    required = robot_half_length + remaining + safety_margin
+                    if clearance is not None and clearance < required:
+                        result = {
+                            "success": False,
+                            "message": "relative move obstacle detected",
+                            "movedM": max(0.0, progress),
+                            "clearanceM": clearance,
+                            "requiredClearanceM": required,
+                        }
+                        break
+                self.drive(sign * speed, 0.0, bypass_collision=bypass_collision)
                 time.sleep(0.05)
         finally:
+            try:
+                self.drive(0.0, 0.0, bypass_collision=bypass_collision)
+            except Exception:
+                pass
             self._publish_zero_velocity()
             stopped = self._wait_for_odom_stop()
             self._motion_lock.release()
 
         result["stopped"] = bool(stopped)
-        if result.get("success") and not stopped:
+        if result.get("success") and not stopped and not bypass_collision:
             result["success"] = False
             result["message"] = "relative move reached distance but odom stop was not confirmed"
         return result

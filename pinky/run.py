@@ -55,6 +55,23 @@ def main() -> None:
             "~/pinky 에서 재시작하세요."
         )
     app = create_app()
+    def _handle_stop(signum, _frame) -> None:
+        print(f"[pinky] signal {signum} — stopping Nav2/bringup leftover processes")
+        pro = app.extensions.get("pro_launcher")
+        if pro is not None:
+            try:
+                pro.stop()
+            except Exception as exc:
+                print(f"[pinky] pro_launcher.stop failed: {exc}")
+        raise SystemExit(0)
+
+    import signal as _signal
+
+    _signal.signal(_signal.SIGINT, _handle_stop)
+    _signal.signal(_signal.SIGTERM, _handle_stop)
+    if hasattr(_signal, "SIGHUP"):
+        _signal.signal(_signal.SIGHUP, _handle_stop)
+
     try:
         nav = app.extensions["robot"].navigation.map_info()
         if nav:

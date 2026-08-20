@@ -286,6 +286,7 @@ erDiagram
 - 이미지가 **하나만** 등록되면 확대 슬롯에도 동일 소스 사용 + CSS 크롭/확대(`media-zoom`)
 - 로컬 업로드는 `/uploads/파일명` **상대 경로**로 저장 (LAN·hydration 안전)
 - Next.js가 `/uploads/*` → Web Server(`:4000`)로 rewrite
+- 관제 재시작 시 업로드 이미지(`/uploads/…`)는 덮어쓰지 않음. 관리자가 추가한 상품도 비활성화하지 않음
 
 
 
@@ -337,9 +338,15 @@ erDiagram
 
 - NestJS 관제를 **Flask**로 교체 (HTTP·JSON·SQLite 계약은 BFF와 동일하게 유지)
 - 주문 생성 시 미션을 **FIFO 큐(`CREATED`)** 에 넣고, **idle 카트**에만 할당
-- 할당 후 맵 웨이포인트 피킹 순회: 매대(W*) 가까운 순 → 계산대(C) → 운송대기(P) → 홈(S1/S2), 각 지점 **dwell 3초** (`PICK_DWELL_SEC`)
+- 할당 후 맵 웨이포인트 피킹 순회: 매대(W*) 가까운 순 → 계산대(C) → 운송대기(P) → 홈(S1/S2)
+- 매대(W1–W6)는 도착 후 **OMX 픽업 완료(DONE)** 를 기다린 뒤 다음 작업 진행, C/P/S1/S2는 기존 **dwell** 유지 (`PICK_DWELL_SEC`)
 - Pinky: `POST /nav/goal_wait` (Nav2 도착 대기). URL은 `PINKY_ROBOTS` / `PINKY_URL`+`PINKY_URL_2`
-- 데모 상품: 케이크·롤케이크·샌드위치·아이스크림·우유·콜라 (`slug` → W1–W6)
+- 2대 동시 미션: `TrafficCoordinator`가 leg 전송 전 경로 충돌 검사·mission FIFO 우선순위·홈 복귀(S1/S2) 순차 제어 (`GET /traffic/state` 모니터링)
+- 웨이포인트 **zone 점유**: 매대/계산대/운송대기 도킹~언독(C는 dwell 후) 구간을 disc로 등록; 다른 로봇 경로가 zone을 지나면 leg grant 보류
+- **충돌 대기**: 동일 shelf 점유·remaining 교집합 시 waiter는 **홈(S1/S2)에 있으면 그 자리에서 대기**하고, 이미 매대 쪽이면 **W7**로 스테이징 후 재시도; 투어 순서는 `conflict_aware_tour_order`로 충돌 shelf를 뒤로 미룸
+- **P 진입**: 다른 카트가 운송대기(P)에서 S1/S2로 복귀 중이면, P로 가려는 카트는 **W7에서 대기**하고 상대가 대기장소에 도착한 뒤에 진입
+- **OMX 통신 불가 우회**: OMX 서버 미접속/폴링 예외 시 `omx-unreachable-override` 노트를 남기고 해당 매대 픽업을 성공으로 간주해 작업을 이어감
+- 데모 상품: 케이크(W1)·롤케이크(W2)·우유(W3)·비스킷(W4)·아이스크림(W5)·샌드위치(W6)
 - 의존성: `apps/controller-server/requirements.txt` + `.venv`
 
 ---
@@ -388,6 +395,7 @@ Web Server만 호출합니다. 인증/JWT는 없고, BFF가 프록시합니다.
 | GET/POST/PATCH/DELETE | `/carts/:userId...`                           | 장바구니 · merge             |
 | POST                  | `/orders` · GET `/orders/:id`                 | 주문 (생성 후 Mock 파이프라인)     |
 | GET                   | `/devices`                                    | 디바이스 목록 (snake_case raw) |
+| GET                   | `/traffic/state`                              | 다중 로봇 교통 상태 (phase, path, home owner) |
 
 
 ---
@@ -512,8 +520,19 @@ pnpm dev:web          # Next.js :3000
 | `PINKY_URL`            | BFF/Controller → 1번 Pinky (`cart-1`)                         |
 | `PINKY_URL_2`          | (선택) 2번 Pinky (`cart-2`)                                    |
 | `PINKY_ROBOTS`         | (선택) `cart-1=url1,cart-2=url2` — 다대 등록 시 우선              |
-| `PICK_DWELL_SEC`       | 매대/계산대/운송대기 도착 후 대기 초 (기본 `3`)                      |
+| `OMX_URL`              | OMX 로봇팔 서버 URL (예: `http://127.0.0.1:8080`)                 |
+| `OMX_POLL_SEC`         | OMX `/pick/state` 폴링 주기 초 (기본 `0.5`)                        |
+| `OMX_PICK_TIMEOUT_SEC` | OMX 픽업 1회 타임아웃 초 (기본 `90`)                               |
+| `PICK_DWELL_SEC`       | C/P/S1/S2 도착 후 대기 초 (기본 `3`)                              |
 | `PICK_NAV_TIMEOUT_SEC` | Nav2 goal_wait 타임아웃 초 (기본 `180`)                          |
+| `TRAFFIC_ENABLED`      | 다중 로봇 교통 제어 on/off (기본 `1`, `PINKY_ROBOTS` 2대 이상일 때 적용) |
+| `TRAFFIC_CLEARANCE_M`  | 경로 충돌 판정 거리 m (기본 `0.20`)                              |
+| `TRAFFIC_RELEASE_MARGIN_M` | owner가 충돌 구간 통과 후 추가 여유 m (기본 `0.20`)           |
+| `TRAFFIC_POLL_HZ`      | waiter 폴링 주기 Hz (기본 `2.0`)                                 |
+| `TRAFFIC_HOME_PRIORITY`| 홈 복귀 순서: `fifo` 또는 `cart-1` (기본 `fifo`)                 |
+| `TRAFFIC_MISSION_TIMEOUT` | nav leg / 홈 복귀 acquire 대기 상한 초 (기본 `300`)           |
+| `TRAFFIC_ZONE_RADIUS_M` | 웨이포인트 점유 zone 반경 m (기본 `0.45`, W1–W6/C/P 도킹~언독 구간) |
+| `TRAFFIC_STAGING_WAYPOINT` | 충돌·동일 목적지 대기 스테이징 웨이포인트 id (기본 `W7`)          |
 | `DATABASE_PATH`        | SQLite 경로 (Controller cwd 기준, 기본 `./data/smartshop.db`) |
 | `JWT_SECRET`           | JWT 서명 키                                                |
 | `UPLOAD_DIR`           | 업로드 디렉터리                                                |
@@ -630,12 +649,12 @@ stateDiagram-v2
 - 대기 큐: `missions.status=CREATED` and `device_id IS NULL` (FIFO)
 - idle `cart-*`만 할당. 두 대 busy면 큐에 대기
 - 웨이포인트: `app/waypoints.py` (S1/S2 홈, W1–W6 매대, C 계산대, P 운송대기)
-- 각 경유지 dwell 기본 3초 (`PICK_DWELL_SEC`)
+- 매대(W1–W6)는 OMX 픽업 완료 기반 진행, C/P/S1/S2는 dwell 기본 3초 (`PICK_DWELL_SEC`)
 - 작업 종료 시점: **대기장소(S1/S2) 도착 완료** 후 `COMPLETED` (모니터링 할당 해제). 복귀 중은 `RETURNING`
 - 중도 실패 시에도 대기장소 복귀 시도 후 `FAILED`
 - 각 전이는 `mission_events`에 기록. 모니터링은 `current_waypoint` 표시
 
-DB에 이미 시드가 있어도 기동 시 데모 상품 6종을 upsert하고 기타 SKU는 `is_active=0`으로 숨깁니다.
+DB에 이미 시드가 있어도 기동 시 데모 상품 6종을 upsert합니다(관리자 업로드 이미지 유지).
 완전 초기화는 SQLite 파일 삭제 후 Controller 재시작.
 
 ---

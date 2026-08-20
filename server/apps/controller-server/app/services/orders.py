@@ -7,26 +7,32 @@ import time
 from typing import Any
 
 from ..adapters import (
+    OmxHttpStationAdapter,
     ORDER_FLOW,
     MockAiAdapter,
     MockCartAdapter,
     MockStationAdapter,
     PinkyHttpCartAdapter,
+    parse_omx_url,
     parse_pinky_robot_urls,
 )
 from ..db import now_iso
 from ..errors import ApiError
 from ..waypoints import (
+    SLUG_TO_WAYPOINT,
     WAYPOINTS,
     aruco_marker_id_for_waypoint,
     aruco_standoff_for_waypoint,
+    conflict_aware_tour_order,
     get_waypoint,
     home_for_device,
-    nearest_neighbor_order,
     shelf_undock_after_aruco,
+    shelf_undock_distance_m,
+    staging_waypoint_id,
     waypoint_ids_for_slugs,
 )
 from .carts import CartsService
+from .traffic import NavGoal, TrafficCoordinator, TrafficTimeoutError
 
 _dispatch_lock = threading.Lock()
 
@@ -43,6 +49,26 @@ def _wrap_angle(a: float) -> float:
     return a
 
 
+def _short_error(exc: BaseException, limit: int = 180) -> str:
+    text = " ".join(str(exc).split())
+    low = text.lower()
+    if "<html" in low or "<!doctype" in low:
+        return "pinky HTTP 500 (check pinky_bridge logs)"
+    return text[:limit]
+
+
+def _nav_error_needs_retreat(detail: str) -> bool:
+    """Nav2가 시작점 점유/진행불가/TF로 즉시 ABORT 한 경우 후진 회복이 필요."""
+    text = (detail or "").lower()
+    if any(s in text for s in ("interrupted", "canceled", "cancelled")):
+        return False
+    if "error_code=102" in text or "error_code=105" in text or "error_code=108" in text:
+        return True
+    if "aborted" in text or "no_valid_path" in text or "no_tf" in text:
+        return True
+    return False
+
+
 class OrdersService:
     def __init__(self, conn, carts: CartsService):
         self.conn = conn
@@ -52,13 +78,31 @@ class OrdersService:
             self.cart_port = PinkyHttpCartAdapter(urls)
         else:
             self.cart_port = MockCartAdapter()
-        self.station_port = MockStationAdapter()
+        self.traffic = TrafficCoordinator(
+            self.cart_port, robot_codes=list(urls.keys()) if urls else []
+        )
+        omx_url = parse_omx_url()
+        if omx_url and os.environ.get("ADAPTER_MODE", "").strip().lower() != "mock":
+            self.station_port = OmxHttpStationAdapter(omx_url)
+        else:
+            self.station_port = MockStationAdapter()
         self.ai_port = MockAiAdapter()
         self._dwell_sec = float(os.environ.get("PICK_DWELL_SEC", "3"))
         self._nav_timeout = float(os.environ.get("PICK_NAV_TIMEOUT_SEC", "180"))
+        self._mission_timeout = float(os.environ.get("TRAFFIC_MISSION_TIMEOUT", "300"))
         self._aborted_missions: set[int] = set()
         self._abort_lock = threading.Lock()
         self._returning_home: set[str] = set()
+        self._tour_locks: dict[str, threading.Lock] = {}
+
+    def _device_tour_lock(self, device_code: str) -> threading.Lock:
+        code = (device_code or "").strip()
+        with self._abort_lock:
+            lock = self._tour_locks.get(code)
+            if lock is None:
+                lock = threading.Lock()
+                self._tour_locks[code] = lock
+            return lock
 
     def _mark_aborted(self, mission_id: int) -> None:
         with self._abort_lock:
@@ -92,7 +136,7 @@ class OrdersService:
             (device_code,),
         ).fetchone()
 
-    def abort_device(self, device_code: str) -> dict[str, Any]:
+    def abort_device(self, device_code: str, *, dispatch: bool = True) -> dict[str, Any]:
         """
         주행 정지: Nav2 stop + 활성 미션 FAILED.
         그 자리에 멈춤 (홈 복귀 없음).
@@ -104,6 +148,10 @@ class OrdersService:
         mission = self._active_mission_for_device(code)
         try:
             self.cart_port.stop_nav(code)
+        except Exception:
+            pass
+        try:
+            self.traffic.interrupt_robot(code)
         except Exception:
             pass
 
@@ -128,7 +176,8 @@ class OrdersService:
                 "status": "FAILED",
             }
 
-        threading.Thread(target=self.try_dispatch, daemon=True).start()
+        if dispatch:
+            threading.Thread(target=self.try_dispatch, daemon=True).start()
         return {
             "ok": True,
             "deviceCode": code,
@@ -144,18 +193,11 @@ class OrdersService:
         if not code:
             raise ApiError(400, "deviceCode required")
 
-        abort_info = self.abort_device(code)
+        abort_info = self.abort_device(code, dispatch=False)
         home = home_for_device(code)
 
         with self._abort_lock:
-            if code in self._returning_home:
-                return {
-                    "ok": True,
-                    "deviceCode": code,
-                    "home": home.id,
-                    "alreadyReturning": True,
-                    "mission": abort_info.get("mission"),
-                }
+            already = code in self._returning_home
             self._returning_home.add(code)
 
         # 복귀 중 busy 유지 (다른 주문 할당 방지)
@@ -169,24 +211,46 @@ class OrdersService:
             try:
                 try:
                     self.cart_port.stop_nav(code)
-                    time.sleep(0.3)
+                    time.sleep(0.4)
                 except Exception:
                     pass
-                # 미션 없이 홈으로 이동
-                attempts = max(1, int(os.environ.get("PICK_NAV_RETRIES", "3")))
-                for attempt in range(1, attempts + 1):
-                    result = self.cart_port.navigate_pose(
-                        code,
-                        home.x,
-                        home.y,
-                        home.yaw,
-                        timeout_sec=self._nav_timeout,
-                        require_yaw=False,
-                    )
-                    if result == "ARRIVED":
-                        break
-                    if attempt < attempts:
-                        time.sleep(1.0)
+                try:
+                    self.traffic.acquire_return_home(code, timeout_sec=5.0)
+                except TypeError:
+                    self.traffic.acquire_return_home(code)
+                except Exception:
+                    pass
+                try:
+                    attempts = max(1, int(os.environ.get("PICK_NAV_RETRIES", "3")))
+                    arrived = False
+                    errors: list[str] = []
+                    for attempt in range(1, attempts + 1):
+                        result = self.cart_port.navigate_pose(
+                            code,
+                            home.x,
+                            home.y,
+                            HOME_YAW,
+                            timeout_sec=self._nav_timeout,
+                            require_yaw=False,
+                        )
+                        if result == "ARRIVED":
+                            arrived = True
+                            break
+                        detail = (
+                            getattr(self.cart_port, "last_nav_error", None)
+                            or "nav failed"
+                        )
+                        errors.append(f"try{attempt}:{detail}")
+                        if attempt < attempts:
+                            time.sleep(1.0)
+                    if not arrived:
+                        print(
+                            f"[return-home] {code} failed: "
+                            + " | ".join(errors),
+                            flush=True,
+                        )
+                finally:
+                    self.traffic.release_return_home(code)
             finally:
                 with self._abort_lock:
                     self._returning_home.discard(code)
@@ -205,6 +269,7 @@ class OrdersService:
             "deviceCode": code,
             "home": {"id": home.id, "x": home.x, "y": home.y, "yaw": home.yaw},
             "returning": True,
+            "alreadyReturning": already,
             "mission": abort_info.get("mission"),
         }
 
@@ -553,54 +618,190 @@ class OrdersService:
         *,
         require_yaw: bool = False,
         mission_id: int | None = None,
+        allow_retreat: bool = True,
+        skip_traffic_wait: bool = False,
     ) -> None:
         # Nav2 aborts/replans mid-leg often; retry before failing the whole tour.
         attempts = max(1, int(os.environ.get("PICK_NAV_RETRIES", "3")))
         yaw_tol = float(os.environ.get("PICK_HOME_YAW_TOL_RAD", "0.12"))
         errors: list[str] = []
-        for attempt in range(1, attempts + 1):
-            if mission_id is not None:
+        leg_goal = NavGoal(float(x), float(y), float(yaw))
+        if mission_id is not None:
+            self._ensure_not_aborted(mission_id)
+            try:
+                self.traffic.acquire_nav_leg(
+                    device_code,
+                    leg_goal,
+                    mission_id,
+                    waypoint_id,
+                    skip_traffic_wait=skip_traffic_wait,
+                )
+            except TrafficTimeoutError:
                 self._ensure_not_aborted(mission_id)
-            result = self.cart_port.navigate_pose(
-                device_code,
-                x,
-                y,
-                yaw,
-                timeout_sec=self._nav_timeout,
-                require_yaw=require_yaw,
-                yaw_tol_rad=yaw_tol,
-            )
-            if result == "ARRIVED":
+                raise
+        try:
+            for attempt in range(1, attempts + 1):
                 if mission_id is not None:
                     self._ensure_not_aborted(mission_id)
-                return
-            detail = getattr(self.cart_port, "last_nav_error", None) or "unknown"
-            errors.append(f"try{attempt}:{detail}")
-            if mission_id is not None:
-                self._mission_note(
-                    mission_id, f"nav retry {waypoint_id} {attempt}/{attempts}: {detail}"
+                result = self.cart_port.navigate_pose(
+                    device_code,
+                    x,
+                    y,
+                    yaw,
+                    timeout_sec=self._nav_timeout,
+                    require_yaw=require_yaw,
+                    yaw_tol_rad=yaw_tol,
                 )
-            if attempt < attempts:
-                time.sleep(1.0)
+                if result == "ARRIVED":
+                    if mission_id is not None:
+                        self._ensure_not_aborted(mission_id)
+                    return
+                detail = getattr(self.cart_port, "last_nav_error", None) or "unknown"
+                errors.append(f"try{attempt}:{detail}")
+                if mission_id is not None:
+                    self._mission_note(
+                        mission_id,
+                        f"nav retry {waypoint_id} {attempt}/{attempts}: {detail}",
+                    )
+                if attempt < attempts:
+                    if allow_retreat and _nav_error_needs_retreat(detail):
+                        self._retreat_from_obstacle(
+                            device_code,
+                            mission_id,
+                            waypoint_id=waypoint_id,
+                        )
+                    time.sleep(0.4)
+                    continue
+                raise RuntimeError(
+                    f"nav failed at {waypoint_id} after {attempts} tries: "
+                    + " | ".join(errors)
+                )
+        finally:
+            if mission_id is not None:
+                self.traffic.release_nav_leg(device_code)
+
+    def _near_device_home(self, device_code: str) -> bool:
+        """True when pose is still at this cart's S1/S2 wait spot."""
+        home = home_for_device(device_code)
+        near_m = float(os.environ.get("PICK_HOME_POSE_NEAR_M", "0.4"))
+        pose = self.cart_port.get_pose(device_code)
+        if not pose or pose.get("x") is None or pose.get("y") is None:
+            return False
+        dx = float(pose["x"]) - home.x
+        dy = float(pose["y"]) - home.y
+        return (dx * dx + dy * dy) ** 0.5 < near_m
+
+    def _near_waypoint(
+        self, device_code: str, waypoint_id: str, near_m: float | None = None
+    ) -> bool:
+        wp = get_waypoint(waypoint_id)
+        radius = near_m if near_m is not None else float(
+            os.environ.get("TRAFFIC_STAGING_NEAR_M", "0.40")
+        )
+        pose = self.cart_port.get_pose(device_code)
+        if not pose or pose.get("x") is None or pose.get("y") is None:
+            return False
+        dx = float(pose["x"]) - wp.x
+        dy = float(pose["y"]) - wp.y
+        return (dx * dx + dy * dy) ** 0.5 < radius
+
+    def _ensure_waypoint_access(
+        self,
+        device_code: str,
+        waypoint_id: str,
+        mission_id: int,
+    ) -> None:
+        """Wait until target shelf zone is free.
+
+        Still at S1/S2: stay put (no W7 hop — avoids spin/backup at home).
+        Already out on the floor: stage at W7, then poll for access.
+        """
+        if self.traffic.waypoint_access_granted(device_code, waypoint_id):
+            return
+        staging_id = staging_waypoint_id()
+        staging = get_waypoint(staging_id)
+        home = home_for_device(device_code)
+        poll_sec = float(os.environ.get("TRAFFIC_STAGING_POLL_SEC", "2.0"))
+        note_interval = max(5.0, poll_sec * 3)
+        last_note = 0.0
+        while not self.traffic.waypoint_access_granted(device_code, waypoint_id):
+            self._ensure_not_aborted(mission_id)
+            now = time.monotonic()
+            if self._near_device_home(device_code):
+                self._set_waypoint(
+                    mission_id,
+                    home.id,
+                    label_suffix="충돌 대기",
+                )
+                if now - last_note >= note_interval:
+                    self._mission_note(
+                        mission_id,
+                        f"staging at home {home.id} for {waypoint_id}",
+                    )
+                    last_note = now
+            else:
+                self._set_waypoint(
+                    mission_id,
+                    staging_id,
+                    label_suffix="충돌 대기",
+                )
+                if not self._near_waypoint(device_code, staging_id):
+                    if now - last_note >= note_interval:
+                        self._mission_note(
+                            mission_id,
+                            f"nav staging {staging_id} for {waypoint_id}",
+                        )
+                        last_note = now
+                    self._nav_or_fail(
+                        device_code,
+                        staging.x,
+                        staging.y,
+                        staging.yaw,
+                        staging_id,
+                        require_yaw=False,
+                        mission_id=mission_id,
+                        allow_retreat=True,
+                        skip_traffic_wait=True,
+                    )
+                elif now - last_note >= note_interval:
+                    self._mission_note(
+                        mission_id,
+                        f"staging at {staging_id} for {waypoint_id}",
+                    )
+                    last_note = now
+            self.traffic.acquire_waypoint_access(device_code, waypoint_id)
+            time.sleep(max(0.2, poll_sec))
+
+    def _acquire_waypoint_zone(
+        self,
+        device_code: str,
+        waypoint_id: str,
+        mission_id: int,
+    ) -> None:
+        """Wait for access, atomically claim zone, then nav/dock may proceed."""
+        while True:
+            self._ensure_not_aborted(mission_id)
+            if not self.traffic.waypoint_access_granted(device_code, waypoint_id):
+                self._ensure_waypoint_access(device_code, waypoint_id, mission_id)
                 continue
-            raise RuntimeError(
-                f"nav failed at {waypoint_id} after {attempts} tries: "
-                + " | ".join(errors)
-            )
+            if self.traffic.try_claim_waypoint_zone(device_code, waypoint_id):
+                return
+            time.sleep(max(0.2, float(os.environ.get("TRAFFIC_STAGING_POLL_SEC", "2.0"))))
 
     def _aruco_dock_or_fail(
         self,
         device_code: str,
         waypoint_id: str,
         mission_id: int | None = None,
-    ) -> None:
+    ) -> float:
         marker_id = aruco_marker_id_for_waypoint(waypoint_id)
         if marker_id is None:
-            return
+            return 0.0
         standoff = aruco_standoff_for_waypoint(waypoint_id)
         timeout = float(os.environ.get("ARUCO_DOCK_TIMEOUT_SEC", "60"))
         attempts = max(1, int(os.environ.get("PICK_ARUCO_RETRIES", "2")))
         last_detail = "unknown"
+        last_travel = 0.0
 
         phase_labels = {
             "SEARCH": "마커 탐색 중",
@@ -619,7 +820,7 @@ class OrdersService:
                 self._ensure_not_aborted(mission_id)
             dock = getattr(self.cart_port, "aruco_dock", None)
             if not callable(dock):
-                return
+                return 0.0
 
             if mission_id is not None:
                 self._set_waypoint(
@@ -699,23 +900,29 @@ class OrdersService:
                         label_suffix="도킹 완료",
                     )
                     self._mission_note(mission_id, note)
-                if approach_travel is not None:
-                    try:
-                        self._undock_after_shelf_aruco(
-                            device_code,
-                            waypoint_id,
-                            float(approach_travel),
-                            mission_id,
-                        )
-                    except (TypeError, ValueError):
-                        pass
-                return
+                try:
+                    travel = (
+                        float(approach_travel)
+                        if approach_travel is not None
+                        else 0.0
+                    )
+                except (TypeError, ValueError):
+                    travel = 0.0
+                return max(0.0, travel)
             last_detail = (
                 getattr(self.cart_port, "last_aruco_error", None)
                 or result.get("message")
                 or result.get("status")
                 or "unknown"
             )
+            for key in ("approachTravelM", "distanceM"):
+                raw = result.get(key)
+                if raw is None:
+                    continue
+                try:
+                    last_travel = max(last_travel, float(raw))
+                except (TypeError, ValueError):
+                    pass
             if mission_id is not None:
                 self._set_waypoint(
                     mission_id,
@@ -725,6 +932,12 @@ class OrdersService:
             if attempt < attempts:
                 time.sleep(0.5)
                 continue
+            self._retreat_from_obstacle(
+                device_code,
+                mission_id,
+                waypoint_id=waypoint_id,
+                travel_m=last_travel,
+            )
             raise RuntimeError(
                 f"aruco dock failed at {waypoint_id} after {attempts} tries: {last_detail}"
             )
@@ -736,23 +949,17 @@ class OrdersService:
         approach_travel_m: float,
         mission_id: int | None = None,
     ) -> None:
-        """W1–W6 마커 접근 전진분만큼 후진해 다음 Nav2 goal 여유 확보."""
+        """도킹 대기 후 후진. 측정 거리가 접근 직전 마커 거리에 도달하면 정지."""
         if not shelf_undock_after_aruco(waypoint_id):
             return
-        try:
-            total = float(approach_travel_m)
-        except (TypeError, ValueError):
-            return
+        target = shelf_undock_distance_m(waypoint_id, approach_travel_m)
         min_m = float(os.environ.get("PICK_SHELF_UNDOCK_MIN_M", "0.005"))
-        if total < min_m:
+        if target < min_m:
             return
-        max_m = float(os.environ.get("PICK_SHELF_UNDOCK_MAX_M", "0.50"))
-        total = min(total, max_m)
         speed = float(os.environ.get("PICK_SHELF_UNDOCK_SPEED_MPS", "0.02"))
-        step_max = float(os.environ.get("PICK_SHELF_UNDOCK_STEP_M", "0.20"))
-        rel = getattr(self.cart_port, "relative_move", None)
-        if not callable(rel):
-            return
+        max_travel = float(os.environ.get("PICK_SHELF_UNDOCK_MAX_M", "0.80"))
+        marker_id = aruco_marker_id_for_waypoint(waypoint_id)
+        timeout = float(os.environ.get("PINKY_ARUCO_UNDOCK_TIMEOUT_SEC", "30"))
 
         if mission_id is not None:
             self._set_waypoint(
@@ -762,12 +969,123 @@ class OrdersService:
             )
             self._mission_note(
                 mission_id,
-                f"undock {waypoint_id} back {total:.3f}m",
+                f"undock {waypoint_id} until range={target:.3f}m",
             )
 
+        undock_fn = getattr(self.cart_port, "aruco_undock", None)
+        if callable(undock_fn) and marker_id is not None:
+            if mission_id is not None:
+                self._ensure_not_aborted(mission_id)
+            result = undock_fn(
+                device_code,
+                marker_id,
+                target_range_m=target,
+                timeout_sec=timeout,
+                speed_mps=speed,
+                max_travel_m=max_travel,
+            )
+            if mission_id is not None:
+                self._mission_note(
+                    mission_id,
+                    f"undock {waypoint_id} "
+                    f"ok={bool(result.get('success'))} "
+                    f"range={result.get('distanceM')} "
+                    f"moved={result.get('movedM')} "
+                    f"{result.get('message') or ''}".strip(),
+                )
+                suffix = "후진 완료" if result.get("success") else "후진 부분"
+                self._set_waypoint(mission_id, waypoint_id, label_suffix=suffix)
+            if result.get("success"):
+                return
+
+        rel = getattr(self.cart_port, "relative_move", None)
+        if not callable(rel):
+            return
+        if mission_id is not None:
+            self._mission_note(
+                mission_id,
+                f"undock {waypoint_id} fallback odom back {target:.3f}m",
+            )
+        step_max = float(os.environ.get("PICK_SHELF_UNDOCK_STEP_M", "0.20"))
+        remaining = target
+        moved_sum = 0.0
+        max_steps = max(4, int(math.ceil(target / max(step_max, 0.05))) + 3)
+        steps = 0
+        while remaining > min_m and steps < max_steps:
+            steps += 1
+            if mission_id is not None:
+                self._ensure_not_aborted(mission_id)
+            step = min(remaining, step_max)
+            step_timeout = max(2.5, step / max(speed, 0.01) + 2.0)
+            result = rel(
+                device_code,
+                -step,
+                speed_mps=speed,
+                timeout_sec=step_timeout,
+                bypass_collision=True,
+                ignore_scan=True,
+            )
+            try:
+                moved = abs(
+                    float(
+                        result.get(
+                            "movedM",
+                            step if result.get("success") else 0.0,
+                        )
+                    )
+                )
+            except (TypeError, ValueError):
+                moved = step if result.get("success") else 0.0
+            moved_sum += moved
+            remaining = max(0.0, target - moved_sum)
+            if not result.get("success") and moved < min_m:
+                break
+            if moved < min_m:
+                break
+        if mission_id is not None:
+            self._mission_note(
+                mission_id,
+                f"undock {waypoint_id} fallback done moved={moved_sum:.3f}m",
+            )
+            self._set_waypoint(mission_id, waypoint_id, label_suffix="후진 완료")
+
+    def _retreat_from_obstacle(
+        self,
+        device_code: str,
+        mission_id: int | None,
+        *,
+        waypoint_id: str | None = None,
+        travel_m: float | None = None,
+    ) -> None:
+        """선반/벽에 박힌 채 Nav2 하면 error 102로 즉시 abort — cmd_vel 후진으로 빠져나온다."""
+        wid = (waypoint_id or "").strip().upper()
+        if wid == "C":
+            return
+        fallback = float(os.environ.get("PICK_ABORT_BACKUP_M", "0.30"))
+        total = 0.0
+        if wid and shelf_undock_after_aruco(wid):
+            total = shelf_undock_distance_m(wid, travel_m)
+        if total < 0.05:
+            total = fallback
+        max_m = float(os.environ.get("PICK_SHELF_UNDOCK_MAX_M", "0.80"))
+        total = min(max(total, 0.05), max_m)
+        speed = float(os.environ.get("PICK_SHELF_UNDOCK_SPEED_MPS", "0.02"))
+        step_max = float(os.environ.get("PICK_SHELF_UNDOCK_STEP_M", "0.20"))
+        rel = getattr(self.cart_port, "relative_move", None)
+        if not callable(rel):
+            return
+        if mission_id is not None:
+            self._mission_note(
+                mission_id,
+                f"retreat {wid or 'abort'} back {total:.3f}m before nav",
+            )
         remaining = total
         moved_sum = 0.0
-        while remaining > min_m:
+        min_m = 0.005
+        max_steps = max(4, int(math.ceil(total / max(step_max, 0.05))) + 3)
+        steps = 0
+        while remaining > min_m and steps < max_steps:
+            steps += 1
             if mission_id is not None:
                 self._ensure_not_aborted(mission_id)
             step = min(remaining, step_max)
@@ -777,30 +1095,134 @@ class OrdersService:
                 -step,
                 speed_mps=speed,
                 timeout_sec=timeout,
+                bypass_collision=True,
+                ignore_scan=True,
             )
-            if not result.get("success"):
-                detail = result.get("message") or "relative_move failed"
+            try:
+                moved = abs(
+                    float(
+                        result.get(
+                            "movedM",
+                            step if result.get("success") else 0.0,
+                        )
+                    )
+                )
+            except (TypeError, ValueError):
+                moved = step if result.get("success") else 0.0
+            moved_sum += moved
+            remaining = max(0.0, total - moved_sum)
+            if not result.get("success") and moved < min_m:
                 if mission_id is not None:
                     self._mission_note(
                         mission_id,
-                        f"undock {waypoint_id} partial ({moved_sum:.3f}m): {detail}",
+                        f"retreat step fail: {result.get('message') or result}",
                     )
                 break
-            try:
-                moved = float(result.get("movedM", step))
-            except (TypeError, ValueError):
-                moved = step
-            moved_sum += abs(moved)
-            remaining = max(0.0, total - moved_sum)
             if moved < min_m:
+                if mission_id is not None:
+                    self._mission_note(
+                        mission_id,
+                        f"retreat step zero: {result.get('message') or result}",
+                    )
                 break
-
         if mission_id is not None:
             self._mission_note(
                 mission_id,
-                f"undock {waypoint_id} done moved={moved_sum:.3f}m",
+                f"retreat done moved={moved_sum:.3f}m",
             )
-            self._set_waypoint(mission_id, waypoint_id, label_suffix="후진 완료")
+
+    def _dock_dwell_undock(
+        self,
+        device_code: str,
+        waypoint_id: str,
+        mission_id: int,
+    ) -> None:
+        """접근 → 대기 3초 → 후진(측정 거리가 접근 전 마커 거리에 도달할 때까지)."""
+        travel = self._aruco_dock_or_fail(device_code, waypoint_id, mission_id)
+        self._dwell_at(device_code, mission_id, waypoint_id)
+        self._undock_after_shelf_aruco(
+            device_code, waypoint_id, travel, mission_id
+        )
+
+    def _omx_pick_at_shelf(
+        self,
+        device_code: str,
+        order_id: int,
+        mission_id: int,
+        waypoint_id: str,
+        picks: list[tuple[str, int]],
+    ) -> None:
+        """Run OMX pick for shelf waypoints; fallback to dwell in mock mode."""
+        if not picks:
+            self._dwell_at(device_code, mission_id, waypoint_id)
+            return
+        if not isinstance(self.station_port, OmxHttpStationAdapter):
+            self._dwell_at(device_code, mission_id, waypoint_id)
+            return
+        timeout = float(os.environ.get("OMX_PICK_TIMEOUT_SEC", "90"))
+        for slug, qty in picks:
+            self._ensure_not_aborted(mission_id)
+            self._set_waypoint(
+                mission_id,
+                waypoint_id,
+                label_suffix=f"{slug} 0/{qty}",
+            )
+            self._mission_note(mission_id, f"omx pick start {slug} x{qty}")
+
+            def _on_progress(done: int, total: int) -> None:
+                self._set_waypoint(
+                    mission_id,
+                    waypoint_id,
+                    label_suffix=f"{slug} {done}/{total}",
+                )
+                self._mission_note(mission_id, f"omx pick {slug} {done}/{total}")
+
+            result = self.station_port.pick(
+                device_code=device_code,
+                slug=slug,
+                quantity=qty,
+                order_id=order_id,
+                timeout_sec=timeout,
+                should_abort=lambda: self._is_aborted(mission_id),
+                on_progress=_on_progress,
+                force_success_on_unreachable=True,
+            )
+            done = int(self.station_port.last_state.get("done") or 0)
+            if result == "DONE":
+                if self.station_port.last_error:
+                    self._mission_note(
+                        mission_id,
+                        f"omx-unreachable-override {slug} x{qty}: {self.station_port.last_error}",
+                    )
+                else:
+                    self._mission_note(
+                        mission_id, f"omx pick done {slug} {done}/{qty}"
+                    )
+                continue
+            detail = self.station_port.last_error or "unknown"
+            self._mission_note(
+                mission_id,
+                f"omx pick {result} {slug} {done}/{qty}: {detail}",
+            )
+            raise RuntimeError(f"OMX pick {result} at {waypoint_id}: {detail}")
+
+    def _dock_pick_or_dwell_undock(
+        self,
+        device_code: str,
+        waypoint_id: str,
+        mission_id: int,
+        order_id: int,
+        shelf_picks: list[tuple[str, int]],
+    ) -> None:
+        travel = self._aruco_dock_or_fail(device_code, waypoint_id, mission_id)
+        self._omx_pick_at_shelf(
+            device_code,
+            order_id,
+            mission_id,
+            waypoint_id,
+            shelf_picks,
+        )
+        self._undock_after_shelf_aruco(device_code, waypoint_id, travel, mission_id)
 
     def _dwell_at(
         self,
@@ -830,6 +1252,48 @@ class OrdersService:
         self._mission_note(mission_id, f"dwell end {waypoint_id}")
         self._set_waypoint(mission_id, waypoint_id)
 
+    def _leave_checkout_then_pack(self, device_code: str, mission_id: int) -> None:
+        """계산대 스탠드오프에서 현재 자세로 짧게 전진한 뒤 운송대기(P)로 Nav2."""
+        p = get_waypoint("P")
+        fwd = float(os.environ.get("PICK_C_EXIT_FORWARD_M", "0.25"))
+        rel = getattr(self.cart_port, "relative_move", None)
+        if fwd >= 0.05 and callable(rel):
+            if mission_id is not None:
+                self._ensure_not_aborted(mission_id)
+            self._set_waypoint(mission_id, "C", label_suffix="출차 전진")
+            self._mission_note(mission_id, f"checkout exit forward {fwd:.3f}m")
+            speed = float(os.environ.get("PICK_SHELF_UNDOCK_SPEED_MPS", "0.02"))
+            timeout = max(2.5, fwd / max(speed, 0.01) + 2.0)
+            result = rel(
+                device_code,
+                fwd,
+                speed_mps=speed,
+                timeout_sec=timeout,
+                bypass_collision=True,
+                ignore_scan=True,
+            )
+            self._mission_note(
+                mission_id,
+                f"checkout exit forward done success={bool(result.get('success'))} "
+                f"moved={result.get('movedM')}",
+            )
+        self._set_waypoint(mission_id, "P")
+        self._acquire_waypoint_zone(device_code, "P", mission_id)
+        try:
+            self._nav_or_fail(
+                device_code,
+                p.x,
+                p.y,
+                p.yaw,
+                "P",
+                require_yaw=True,
+                mission_id=mission_id,
+                allow_retreat=False,
+            )
+            self._dock_dwell_undock(device_code, "P", mission_id)
+        finally:
+            self.traffic.release_waypoint_zone(device_code)
+
     def _return_home(
         self,
         device_code: str,
@@ -844,43 +1308,53 @@ class OrdersService:
         yaw_tol = float(os.environ.get("PICK_HOME_YAW_TOL_RAD", "0.12"))
         if stop_first:
             try:
-                self.cart_port.stop_nav(device_code)
+                stop = self.cart_port.stop_nav
+                try:
+                    stop(device_code, freeze=False)
+                except TypeError:
+                    stop(device_code)
                 time.sleep(0.3)
             except Exception:
                 pass
         self._set_waypoint(mission_id, home.id)
         try:
-            self._nav_or_fail(
-                device_code,
-                home.x,
-                home.y,
-                home_yaw,
-                home.id,
-                require_yaw=False,
-                mission_id=mission_id,
-            )
-            for align in range(1, 4):
-                self._ensure_not_aborted(mission_id)
-                pose = self.cart_port.get_pose(device_code)
-                if pose:
-                    err = abs(
-                        _wrap_angle(float(pose.get("yaw") or 0.0) - home_yaw)
-                    )
-                    if err <= yaw_tol:
-                        break
-                    self._mission_note(
-                        mission_id,
-                        f"home yaw align {home.id} err={err:.2f} try={align}",
-                    )
+            self.traffic.acquire_return_home(device_code)
+            try:
                 self._nav_or_fail(
                     device_code,
                     home.x,
                     home.y,
                     home_yaw,
-                    f"{home.id}-yaw",
-                    require_yaw=True,
+                    home.id,
+                    require_yaw=False,
                     mission_id=mission_id,
+                    allow_retreat=False,
                 )
+                for align in range(1, 4):
+                    self._ensure_not_aborted(mission_id)
+                    pose = self.cart_port.get_pose(device_code)
+                    if pose:
+                        err = abs(
+                            _wrap_angle(float(pose.get("yaw") or 0.0) - home_yaw)
+                        )
+                        if err <= yaw_tol:
+                            break
+                        self._mission_note(
+                            mission_id,
+                            f"home yaw align {home.id} err={err:.2f} try={align}",
+                        )
+                    self._nav_or_fail(
+                        device_code,
+                        home.x,
+                        home.y,
+                        home_yaw,
+                        f"{home.id}-yaw",
+                        require_yaw=True,
+                        mission_id=mission_id,
+                        allow_retreat=False,
+                    )
+            finally:
+                self.traffic.release_return_home(device_code)
             self._dwell_at(device_code, mission_id, home.id)
             return True
         except Exception:
@@ -903,8 +1377,19 @@ class OrdersService:
     def _run_pick_tour(
         self, order_id: int, mission_id: int, device_code: str
     ) -> None:
+        lock = self._device_tour_lock(device_code)
+        lock.acquire()
+        try:
+            self._run_pick_tour_locked(order_id, mission_id, device_code)
+        finally:
+            lock.release()
+
+    def _run_pick_tour_locked(
+        self, order_id: int, mission_id: int, device_code: str
+    ) -> None:
         home = home_for_device(device_code)
         try:
+            self._ensure_not_aborted(mission_id)
             if not self.cart_port.is_reachable(device_code):
                 raise RuntimeError(
                     f"pinky unreachable for {device_code} "
@@ -913,6 +1398,7 @@ class OrdersService:
 
             self.ai_port.request_pick_plan(order_id)
             self.cart_port.notify_assign(device_code, order_id)
+            self.traffic.register_mission(device_code, mission_id)
 
             # 현재 pose 기준 투어 시작. 홈 initialpose 는 넣지 않음
             # (작업 중/재할당 시 대기장소 점프 방지 — pinky ensure 가 현재 pose 사용)
@@ -938,7 +1424,7 @@ class OrdersService:
 
             rows = self.conn.execute(
                 """
-                SELECT oi.product_id, p.slug
+                SELECT oi.product_id, p.slug, oi.quantity
                 FROM order_items oi
                 JOIN products p ON p.id = oi.product_id
                 WHERE oi.order_id = ?
@@ -947,45 +1433,87 @@ class OrdersService:
             ).fetchall()
             slugs = [r["slug"] for r in rows if r["slug"]]
             shelf_ids = waypoint_ids_for_slugs(slugs)
-            tour = nearest_neighbor_order(start, shelf_ids)
+            shelf_picks_by_waypoint: dict[str, list[tuple[str, int]]] = {}
+            qty_by_slug: dict[str, int] = {}
+            for row in rows:
+                slug = row["slug"]
+                if not slug:
+                    continue
+                qty_by_slug[slug] = qty_by_slug.get(slug, 0) + int(row["quantity"] or 0)
+            for slug, qty in qty_by_slug.items():
+                wid = SLUG_TO_WAYPOINT.get(slug)
+                if not wid:
+                    continue
+                if wid not in shelf_picks_by_waypoint:
+                    shelf_picks_by_waypoint[wid] = []
+                shelf_picks_by_waypoint[wid].append((slug, max(1, int(qty))))
+            defer_ids = self.traffic.conflicting_waypoints(device_code, shelf_ids)
+            tour = conflict_aware_tour_order(start, shelf_ids, defer_ids)
+            remaining = [wp.id for wp in tour] + ["C", "P"]
+            self.traffic.update_remaining(device_code, remaining)
 
             self._set_status(order_id, mission_id, "PICKING", note="pick tour start")
 
             for wp in tour:
                 self._ensure_not_aborted(mission_id)
                 self._set_waypoint(mission_id, wp.id)
-                self._nav_or_fail(
-                    device_code,
-                    wp.x,
-                    wp.y,
-                    wp.yaw,
-                    wp.id,
-                    mission_id=mission_id,
-                )
-                self._aruco_dock_or_fail(device_code, wp.id, mission_id)
-                self._dwell_at(device_code, mission_id, wp.id)
+                self._acquire_waypoint_zone(device_code, wp.id, mission_id)
+                try:
+                    self._nav_or_fail(
+                        device_code,
+                        wp.x,
+                        wp.y,
+                        wp.yaw,
+                        wp.id,
+                        require_yaw=True,
+                        mission_id=mission_id,
+                    )
+                    self._dock_pick_or_dwell_undock(
+                        device_code,
+                        wp.id,
+                        mission_id,
+                        order_id,
+                        shelf_picks_by_waypoint.get(wp.id, []),
+                    )
+                finally:
+                    self.traffic.release_waypoint_zone(device_code)
+                if remaining and remaining[0] == wp.id:
+                    remaining = remaining[1:]
+                else:
+                    remaining = [w for w in remaining if w != wp.id]
+                self.traffic.update_remaining(device_code, remaining)
 
             self._ensure_not_aborted(mission_id)
             self._set_status(order_id, mission_id, "CHECKOUT", note="checkout")
             c = get_waypoint("C")
             self._set_waypoint(mission_id, "C")
-            self._nav_or_fail(
-                device_code, c.x, c.y, c.yaw, "C", mission_id=mission_id
-            )
-            self._aruco_dock_or_fail(device_code, "C", mission_id)
-            self._dwell_at(device_code, mission_id, "C")
+            self._acquire_waypoint_zone(device_code, "C", mission_id)
+            try:
+                self._nav_or_fail(
+                    device_code,
+                    c.x,
+                    c.y,
+                    c.yaw,
+                    "C",
+                    require_yaw=True,
+                    mission_id=mission_id,
+                    allow_retreat=False,
+                )
+                self._dock_dwell_undock(device_code, "C", mission_id)
+            finally:
+                self.traffic.release_waypoint_zone(device_code)
+            remaining = [w for w in remaining if w != "C"]
+            self.traffic.update_remaining(device_code, remaining)
 
             self._ensure_not_aborted(mission_id)
             self._set_status(order_id, mission_id, "PACKING", note="transport wait")
-            p = get_waypoint("P")
-            self._set_waypoint(mission_id, "P")
-            self._nav_or_fail(
-                device_code, p.x, p.y, p.yaw, "P", mission_id=mission_id
-            )
-            self._aruco_dock_or_fail(device_code, "P", mission_id)
-            self._dwell_at(device_code, mission_id, "P")
+            self._leave_checkout_then_pack(device_code, mission_id)
+            self.traffic.mark_returning_home(device_code)
+            remaining = [w for w in remaining if w != "P"]
+            self.traffic.update_remaining(device_code, remaining)
 
-            # 대기장소 복귀 중 — 모니터링 할당은 이때까지 유지, 도착 후 COMPLETED
+            # 대기장소 복귀 중 — P 접근 대기가 홈 도착 전에 풀리지 않도록
+            # returning_home 을 acquire 전에 켠다 (acquire_return_home 이 재설정).
             self._ensure_not_aborted(mission_id)
             self._set_status(
                 order_id, mission_id, "RETURNING", note="returning to wait spot"
@@ -1006,14 +1534,14 @@ class OrdersService:
                 pass
             else:
                 # Don't block forever on home return when pinky is already down
-                note = f"failed:{exc}"
+                note = f"failed:{_short_error(exc)}"
                 try:
                     if self.cart_port.is_reachable(device_code):
                         self._set_status(
                             order_id,
                             mission_id,
                             "RETURNING",
-                            note=f"abort return home:{exc}",
+                            note=f"abort return home:{_short_error(exc)}",
                         )
                         home_ok = self._return_home(
                             device_code,
@@ -1028,11 +1556,12 @@ class OrdersService:
                     else:
                         note = f"{note}; skip home (pinky unreachable)"
                 except Exception as home_exc:
-                    note = f"{note}; home exc:{home_exc}"
+                    note = f"{note}; home exc:{_short_error(home_exc)}"
                 self._set_waypoint(mission_id, None)
                 self._set_status(order_id, mission_id, "FAILED", note=note)
                 self._release_device(mission_id)
         finally:
+            self.traffic.unregister_mission(device_code)
             self._clear_aborted(mission_id)
             threading.Thread(target=self.try_dispatch, daemon=True).start()
 
