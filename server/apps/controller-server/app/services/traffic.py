@@ -11,11 +11,15 @@ from typing import Any, Protocol
 
 from .traffic_paths import (
     advance_path_index,
+    densify_path,
     distance_to_point,
     find_path_conflicts,
     has_passed_path_index,
+    nearest_path_index,
+    path_distance_between,
     path_intersects_zones,
     path_points,
+    retreat_path_index,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -55,10 +59,13 @@ class RobotTrafficState:
     phase: str = "IDLE"
     active_path: list[tuple[float, float]] = field(default_factory=list)
     release_index: int | None = None
+    hold_index: int | None = None
     planned_goal: NavGoal | None = None
     returning_home: bool = False
     occupied_waypoint: str | None = None
     remaining_waypoints: list[str] = field(default_factory=list)
+    conflict_owner_sticky: str | None = None
+    last_wait_reason: str | None = None
 
 
 class TrafficTimeoutError(RuntimeError):
@@ -81,6 +88,7 @@ class TrafficCoordinator:
         self._home_waiters: list[str] = []
         self._abort_gen: dict[str, int] = {}
         self._clearance_m = float(os.environ.get("TRAFFIC_CLEARANCE_M", "0.20"))
+        self._hold_margin_m = float(os.environ.get("TRAFFIC_HOLD_MARGIN_M", "0.35"))
         self._release_margin_m = float(os.environ.get("TRAFFIC_RELEASE_MARGIN_M", "0.20"))
         self._plan_timeout = float(os.environ.get("TRAFFIC_PLAN_TIMEOUT_SEC", "10"))
         self._poll_hz = float(os.environ.get("TRAFFIC_POLL_HZ", "2.0"))
@@ -119,10 +127,13 @@ class TrafficCoordinator:
             state.phase = "IDLE"
             state.active_path = []
             state.release_index = None
+            state.hold_index = None
             state.planned_goal = None
             state.returning_home = False
             state.occupied_waypoint = None
             state.remaining_waypoints = []
+            state.conflict_owner_sticky = None
+            state.last_wait_reason = None
             self._cond.notify_all()
 
     def interrupt_robot(self, device_code: str) -> None:
@@ -135,10 +146,13 @@ class TrafficCoordinator:
                 state.phase = "IDLE"
                 state.active_path = []
                 state.release_index = None
+                state.hold_index = None
                 state.planned_goal = None
                 state.returning_home = False
                 state.occupied_waypoint = None
                 state.remaining_waypoints = []
+                state.conflict_owner_sticky = None
+                state.last_wait_reason = None
             if self._home_owner == code:
                 self._home_owner = None
             self._cond.notify_all()
@@ -348,6 +362,10 @@ class TrafficCoordinator:
                     raise TrafficTimeoutError(f"traffic interrupted for {code}")
             other_paths = self._collect_other_paths(code)
             other_poses = self._collect_other_poses(code)
+            try:
+                other_poses[code] = self._cart_port.get_pose(code)
+            except Exception:
+                other_poses[code] = None
             with self._lock:
                 grant, wait_reason = self._evaluate_leg_grant(
                     code, planned, other_paths, other_poses
@@ -364,16 +382,14 @@ class TrafficCoordinator:
             if wait_reason == "owner_passed":
                 continue
         LOGGER.warning(
-            "traffic wait timed out for %s -> (%.3f, %.3f); granting so nav can proceed",
+            "traffic wait timed out for %s -> (%.3f, %.3f); conflict still active",
             code,
             goal.x,
             goal.y,
         )
-        with self._lock:
-            state = self._robots[code]
-            state.phase = "NAVIGATING"
-            state.active_path = list(planned)
-            self._cond.notify_all()
+        raise TrafficTimeoutError(
+            f"traffic wait timed out for {code} -> ({goal.x:.3f}, {goal.y:.3f})"
+        )
 
     def release_nav_leg(self, device_code: str) -> None:
         if not self.enabled():
@@ -386,7 +402,10 @@ class TrafficCoordinator:
             state.phase = "IDLE"
             state.active_path = []
             state.release_index = None
+            state.hold_index = None
             state.planned_goal = None
+            state.conflict_owner_sticky = None
+            state.last_wait_reason = None
             self._cond.notify_all()
 
     def mark_returning_home(self, device_code: str) -> None:
@@ -465,9 +484,12 @@ class TrafficCoordinator:
                     "phase": st.phase,
                     "pathPoints": len(st.active_path),
                     "releaseIndex": st.release_index,
+                    "holdIndex": st.hold_index,
                     "returningHome": st.returning_home,
                     "occupiedWaypoint": st.occupied_waypoint,
                     "remainingWaypoints": list(st.remaining_waypoints),
+                    "conflictOwnerSticky": st.conflict_owner_sticky,
+                    "lastWaitReason": st.last_wait_reason,
                     "plannedGoal": (
                         {
                             "x": st.planned_goal.x,
@@ -483,6 +505,7 @@ class TrafficCoordinator:
             return {
                 "enabled": self.enabled(),
                 "clearanceM": self._clearance_m,
+                "holdMarginM": self._hold_margin_m,
                 "releaseMarginM": self._release_margin_m,
                 "zoneRadiusM": self._zone_radius_m,
                 "stagingWaypoint": self._staging_waypoint,
@@ -576,6 +599,94 @@ class TrafficCoordinator:
                 poses[code] = None
         return poses
 
+    def _robot_conflict_metrics(
+        self,
+        path: list[tuple[float, float]],
+        pose: dict[str, float] | None,
+        start_index: int,
+        end_index: int,
+    ) -> dict[str, Any]:
+        current_index = nearest_path_index(path, pose)
+        inside = start_index <= current_index <= end_index
+        if current_index < start_index:
+            distance_to_entry = path_distance_between(path, current_index, start_index)
+        else:
+            distance_to_entry = 0.0
+        if current_index <= end_index:
+            distance_to_exit = path_distance_between(path, current_index, end_index)
+        else:
+            distance_to_exit = 0.0
+        release_index = advance_path_index(path, end_index, self._release_margin_m)
+        available_release_margin = path_distance_between(path, end_index, release_index)
+        can_clear = available_release_margin + 1e-6 >= self._release_margin_m
+        return {
+            "currentIndex": current_index,
+            "entryIndex": start_index,
+            "exitIndex": end_index,
+            "releaseIndex": release_index,
+            "insideConflict": inside,
+            "distanceToEntryM": distance_to_entry,
+            "distanceToExitM": distance_to_exit,
+            "availableReleaseMarginM": available_release_margin,
+            "canClearConflict": can_clear,
+        }
+
+    def _select_conflict_owner(
+        self,
+        self_code: str,
+        other_code: str,
+        self_metrics: dict[str, Any],
+        other_metrics: dict[str, Any],
+        self_state: RobotTrafficState,
+        other_state: RobotTrafficState,
+    ) -> str | None:
+        selectable: list[str] = []
+        if self_metrics["canClearConflict"]:
+            selectable.append(self_code)
+        if other_metrics["canClearConflict"]:
+            selectable.append(other_code)
+        if not selectable:
+            return None
+
+        sticky = self_state.conflict_owner_sticky or other_state.conflict_owner_sticky
+        if sticky in selectable:
+            return sticky
+
+        if len(selectable) == 1:
+            return selectable[0]
+
+        if self_code not in selectable:
+            return other_code
+        if other_code not in selectable:
+            return self_code
+
+        if self_metrics["insideConflict"] != other_metrics["insideConflict"]:
+            return self_code if self_metrics["insideConflict"] else other_code
+
+        if self_metrics["insideConflict"] and other_metrics["insideConflict"]:
+            delta = float(self_metrics["distanceToExitM"]) - float(
+                other_metrics["distanceToExitM"]
+            )
+            if abs(delta) > 1e-6:
+                return self_code if delta < 0.0 else other_code
+        else:
+            delta = float(self_metrics["distanceToEntryM"]) - float(
+                other_metrics["distanceToEntryM"]
+            )
+            if abs(delta) > 1e-6:
+                return self_code if delta < 0.0 else other_code
+
+        return (
+            self_code
+            if self_state.mission_assigned_at <= other_state.mission_assigned_at
+            else other_code
+        )
+
+    def _densify_for_traffic(
+        self, path: list[tuple[float, float]]
+    ) -> list[tuple[float, float]]:
+        return densify_path(path, step_m=min(self._clearance_m * 0.5, 0.05))
+
     def _evaluate_leg_grant(
         self,
         device_code: str,
@@ -583,6 +694,11 @@ class TrafficCoordinator:
         other_paths: dict[str, list[tuple[float, float]]],
         other_poses: dict[str, dict[str, float] | None],
     ) -> tuple[bool, str]:
+        dense_planned = self._densify_for_traffic(planned_path)
+        dense_others = {
+            code: self._densify_for_traffic(path)
+            for code, path in other_paths.items()
+        }
         others = [
             (code, st)
             for code, st in self._robots.items()
@@ -592,16 +708,20 @@ class TrafficCoordinator:
             return True, "solo"
 
         self_state = self._robots[device_code]
+        self_pose = other_poses.get(device_code)
         occupied_zones = self.occupied_zones(exclude_device=device_code)
         if occupied_zones and path_intersects_zones(planned_path, occupied_zones):
+            self_state.last_wait_reason = "wait_zone"
             return False, "wait_zone"
 
         for other_code, other_state in others:
-            other_path = other_paths.get(other_code) or list(other_state.active_path)
+            other_path = dense_others.get(other_code) or self._densify_for_traffic(
+                other_paths.get(other_code) or list(other_state.active_path)
+            )
             if not other_path:
                 continue
             conflict = find_path_conflicts(
-                planned_path,
+                dense_planned,
                 other_path,
                 clearance_m=self._clearance_m,
                 max_samples=50,
@@ -610,49 +730,107 @@ class TrafficCoordinator:
             if not segments:
                 continue
 
-            self_is_owner = self_state.mission_assigned_at <= other_state.mission_assigned_at
-            if self_is_owner:
-                release_segment = max(
-                    segments, key=lambda item: int(item["cart1_end_index"])
-                )
-                self_state.release_index = advance_path_index(
+            segment = segments[0]
+            self_metrics = self._robot_conflict_metrics(
+                dense_planned,
+                self_pose,
+                int(segment["cart1_start_index"]),
+                int(segment["cart1_end_index"]),
+            )
+            other_metrics = self._robot_conflict_metrics(
+                other_path,
+                other_poses.get(other_code),
+                int(segment["cart2_start_index"]),
+                int(segment["cart2_end_index"]),
+            )
+
+            if not self_metrics["canClearConflict"] and not other_metrics["canClearConflict"]:
+                self_state.last_wait_reason = "wait_blocked"
+                return False, "wait_blocked"
+
+            owner_code = self._select_conflict_owner(
+                device_code,
+                other_code,
+                self_metrics,
+                other_metrics,
+                self_state,
+                other_state,
+            )
+            if owner_code is None:
+                self_state.last_wait_reason = "wait_blocked"
+                return False, "wait_blocked"
+
+            if owner_code == device_code:
+                self_state.release_index = nearest_path_index(
                     planned_path,
-                    int(release_segment["cart1_end_index"]),
-                    self._release_margin_m,
+                    {
+                        "x": dense_planned[int(self_metrics["releaseIndex"])][0],
+                        "y": dense_planned[int(self_metrics["releaseIndex"])][1],
+                    },
                 )
+                self_state.conflict_owner_sticky = device_code
+                other_state.conflict_owner_sticky = device_code
+                self_state.hold_index = None
+                self_state.last_wait_reason = None
                 return True, "owner"
-            owner_code = other_code
+
             owner_state = other_state
+            owner_dense_path = other_path
+            owner_raw_path = other_paths.get(other_code) or list(other_state.active_path)
+            owner_pose = other_poses.get(other_code)
             if owner_state.phase == "IDLE":
                 return True, "owner_done"
             if owner_state.phase != "NAVIGATING" or not owner_state.active_path:
+                self_state.last_wait_reason = "wait_owner"
                 return False, "wait_owner"
-            owner_pose = other_poses.get(owner_code)
+
             release_idx = owner_state.release_index
             if release_idx is None:
                 owner_conflict = find_path_conflicts(
-                    owner_state.active_path,
-                    planned_path,
+                    owner_dense_path,
+                    dense_planned,
                     clearance_m=self._clearance_m,
                     max_samples=10,
                 )
                 owner_segments = owner_conflict.get("segments") or []
                 if owner_segments:
-                    release_segment = max(
-                        owner_segments,
-                        key=lambda item: int(item["cart1_end_index"]),
+                    owner_segment = owner_segments[0]
+                    owner_metrics = self._robot_conflict_metrics(
+                        owner_dense_path,
+                        owner_pose,
+                        int(owner_segment["cart1_start_index"]),
+                        int(owner_segment["cart1_end_index"]),
                     )
-                    release_idx = advance_path_index(
-                        owner_state.active_path,
-                        int(release_segment["cart1_end_index"]),
-                        self._release_margin_m,
+                    release_idx = nearest_path_index(
+                        owner_raw_path,
+                        {
+                            "x": owner_dense_path[int(owner_metrics["releaseIndex"])][0],
+                            "y": owner_dense_path[int(owner_metrics["releaseIndex"])][1],
+                        },
                     )
                     owner_state.release_index = release_idx
-            if has_passed_path_index(
-                owner_state.active_path, owner_pose, release_idx or 0
-            ):
+
+            entry_index = nearest_path_index(
+                planned_path,
+                {
+                    "x": dense_planned[int(self_metrics["entryIndex"])][0],
+                    "y": dense_planned[int(self_metrics["entryIndex"])][1],
+                },
+            )
+            hold_index = retreat_path_index(
+                planned_path, entry_index, self._hold_margin_m
+            )
+            self_state.hold_index = hold_index
+            self_state.last_wait_reason = "wait_owner"
+
+            if has_passed_path_index(owner_raw_path, owner_pose, release_idx or 0):
+                self_state.conflict_owner_sticky = None
+                owner_state.conflict_owner_sticky = None
                 return True, "owner_passed"
             return False, "wait_owner"
+
+        self_state.hold_index = None
+        self_state.last_wait_reason = None
         return True, "clear"
 
     def _live_path(

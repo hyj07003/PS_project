@@ -108,6 +108,106 @@ def advance_path_index(
     return len(path) - 1
 
 
+def nearest_path_index(
+    path: list[tuple[float, float]],
+    pose: dict[str, float] | None,
+) -> int:
+    """Index of the closest path vertex to pose (for progress along a route)."""
+    if pose is None:
+        return 0
+    return _closest_path_index(path, pose)
+
+
+def densify_path(
+    path: list[tuple[float, float]],
+    step_m: float = 0.05,
+) -> list[tuple[float, float]]:
+    """Insert points along segments so sparse Nav2 / fallback paths still conflict-check."""
+    if len(path) < 2:
+        return list(path)
+    step = max(0.01, float(step_m))
+    out: list[tuple[float, float]] = [path[0]]
+    for i in range(len(path) - 1):
+        x0, y0 = path[i]
+        x1, y1 = path[i + 1]
+        seg_len = math.hypot(x1 - x0, y1 - y0)
+        if seg_len < 1e-9:
+            continue
+        n_steps = max(1, int(math.ceil(seg_len / step)))
+        for k in range(1, n_steps + 1):
+            t = min(1.0, k / n_steps)
+            out.append((x0 + t * (x1 - x0), y0 + t * (y1 - y0)))
+    return out
+
+
+def point_to_segment_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    """Shortest distance from point to a finite segment."""
+    px, py = point
+    return math.sqrt(
+        _dist_point_to_segment_sq(px, py, start[0], start[1], end[0], end[1])
+    )
+
+
+def _append_pair(
+    pairs: list[tuple[int, int]],
+    samples: list[dict[str, float]],
+    i: int,
+    j: int,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    threshold2: float,
+    max_samples: int,
+) -> None:
+    ddx = x1 - x2
+    ddy = y1 - y2
+    d2 = ddx * ddx + ddy * ddy
+    if d2 <= threshold2:
+        pairs.append((i, j))
+        if len(samples) < max_samples:
+            samples.append(
+                {
+                    "x": (x1 + x2) / 2.0,
+                    "y": (y1 + y2) / 2.0,
+                    "distanceM": math.sqrt(d2),
+                }
+            )
+
+
+def _segment_point_pairs(
+    path_a: list[tuple[float, float]],
+    path_b: list[tuple[float, float]],
+    clearance: float,
+    max_samples: int,
+    samples: list[dict[str, float]],
+) -> list[tuple[int, int]]:
+    """Point-on-A vs segment-on-B proximity pairs (complements point-point grid)."""
+    threshold2 = clearance * clearance
+    pairs: list[tuple[int, int]] = []
+    if len(path_b) < 2:
+        return pairs
+    for i, (x1, y1) in enumerate(path_a):
+        for j in range(len(path_b) - 1):
+            x0, y0 = path_b[j]
+            x2, y2 = path_b[j + 1]
+            if point_to_segment_distance((x1, y1), (x0, y0), (x2, y2)) <= clearance:
+                d0 = math.hypot(x1 - x0, y1 - y0)
+                d2 = math.hypot(x1 - x2, y1 - y2)
+                closest = j if d0 <= d2 else j + 1
+                bx, by = path_b[closest]
+                _append_pair(
+                    pairs, samples, i, closest, x1, y1, bx, by, threshold2, max_samples
+                )
+                if len(pairs) >= max_samples * 4:
+                    return pairs
+    return pairs
+
+
 def _closest_path_index(
     path: list[tuple[float, float]],
     pose: dict[str, float],
@@ -215,9 +315,12 @@ def find_path_conflicts(
             "segments": [],
         }
 
+    dense1 = densify_path(path1, step_m=min(clearance * 0.5, 0.05))
+    dense2 = densify_path(path2, step_m=min(clearance * 0.5, 0.05))
+
     cell = clearance
     grid: dict[tuple[int, int], list[tuple[int, float, float]]] = {}
-    for j, (x, y) in enumerate(path2):
+    for j, (x, y) in enumerate(dense2):
         key = (math.floor(x / cell), math.floor(y / cell))
         grid.setdefault(key, []).append((j, x, y))
 
@@ -226,7 +329,7 @@ def find_path_conflicts(
     samples: list[dict[str, float]] = []
     pairs: list[tuple[int, int]] = []
 
-    for i, (x1, y1) in enumerate(path1):
+    for i, (x1, y1) in enumerate(dense1):
         cx, cy = math.floor(x1 / cell), math.floor(y1 / cell)
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
@@ -247,7 +350,18 @@ def find_path_conflicts(
                                 }
                             )
 
-    segments = _merge_conflict_segments(path1, path2, pairs)
+    seg_pairs_a = _segment_point_pairs(
+        dense1, dense2, clearance, max_samples, samples
+    )
+    seg_pairs_b = _segment_point_pairs(
+        dense2, dense1, clearance, max_samples, samples
+    )
+    for i, j in seg_pairs_a:
+        pairs.append((i, j))
+    for i, j in seg_pairs_b:
+        pairs.append((j, i))
+
+    segments = _merge_conflict_segments(dense1, dense2, pairs)
     return {
         "conflict": bool(segments),
         "clearanceM": clearance,
@@ -289,6 +403,19 @@ def _segment_dict(
     j0: int,
     j1: int,
 ) -> dict[str, Any]:
+    if not path1 or not path2:
+        return {
+            "entry": {"x": 0.0, "y": 0.0},
+            "exit": {"x": 0.0, "y": 0.0},
+            "cart1_start_index": 0,
+            "cart1_end_index": 0,
+            "cart2_start_index": 0,
+            "cart2_end_index": 0,
+        }
+    i0 = max(0, min(int(i0), len(path1) - 1))
+    i1 = max(0, min(int(i1), len(path1) - 1))
+    j0 = max(0, min(int(j0), len(path2) - 1))
+    j1 = max(0, min(int(j1), len(path2) - 1))
     entry = {"x": path1[i0][0], "y": path1[i0][1]}
     exit_point = {"x": path1[i1][0], "y": path1[i1][1]}
     return {

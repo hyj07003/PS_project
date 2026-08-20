@@ -186,6 +186,8 @@ cd ~/pinky && python3 run.py
 ```
 
 투어/작업 중 `ensure localization`은 S1/S2 **홈 fallback을 하지 않습니다**. TF·마지막 주행 pose·도킹 hold만 사용하고, 없으면 goal을 거부합니다 (대기 점프 방지).
+대기장소 **idle freeze** 상태에서 첫 출발할 때는 홈 시드를 허용합니다 (`_boot_home_cancel`만으로 막지 않음).
+관제 측은 `NO_TF`/로컬라이즈 실패에 **맹목 후진(retreat)을 하지 않습니다** (벽 충돌 방지).
 ### 대기 중 AMCL lifecycle
 
 대기(idle)에서는 `/amcl`을 **deactivate**해 라이다로 pose가 점프하지 않게 합니다. NavigateToPose·수동 initialpose 직전에만 activate + `initialpose` 후 주행하고, 정지·도착 시 다시 deactivate합니다.

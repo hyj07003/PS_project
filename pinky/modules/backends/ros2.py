@@ -649,7 +649,12 @@ class Ros2Backend(RobotBackend):
         return None
 
     def _should_block_home_seed(self) -> bool:
-        """투어/작업/홈이 아닌 마지막 pose 가 있으면 S1/S2 강제 시드 금지."""
+        """투어/작업/홈이 아닌 마지막 pose 가 있으면 S1/S2 강제 시드 금지.
+
+        Note: `_boot_home_cancel` 은 ensure_localization 진입 시마다 부트 루프
+        중단용으로 set 되므로, 그 플래그만으로 홈 시드를 막으면 대기장소
+        첫 출발이 항상 실패한다.
+        """
         with self._lock:
             if self._home_seed_locked_out:
                 return True
@@ -664,9 +669,6 @@ class Ros2Backend(RobotBackend):
             lg = self._last_good_map_pose
             frozen = self._nav_pose
             idle = self._localization_idle_frozen
-        if self._boot_home_cancel.is_set() and lg is not None:
-            # last_good 가 홈으로 오염돼도 작업 시작 이후엔 홈 시드 금지
-            return True
         if lg is not None and not self._pose_is_home(lg):
             return True
         if frozen is not None and not self._pose_is_home(frozen) and not idle:
@@ -1034,6 +1036,22 @@ class Ros2Backend(RobotBackend):
             )
             dock_pose = self._visual_dock_pose
 
+        # 대기장소 idle freeze 상태에서 첫 출발: 이전 투어의 sticky lock 해제
+        if was_idle_frozen and (
+            (frozen is not None and self._pose_is_home(frozen))
+            or (last_good is not None and self._pose_is_home(last_good))
+            or (frozen is None and last_good is None)
+        ):
+            with self._lock:
+                self._home_seed_locked_out = False
+                self._tour_active = False
+            tour_or_work = (
+                self._visual_dock_active
+                or self._nav_session_active
+                or self._is_navigating
+                or self._visual_dock_pose is not None
+            )
+
         self._invalidate_pending_freeze()
 
         # 홈이 아닌 마지막 TF/캐시가 있으면 투어로 간주 → 홈 시드 금지
@@ -1221,6 +1239,34 @@ class Ros2Backend(RobotBackend):
                         )
                     return True
                 time.sleep(0.05)
+            # 대기장소 idle 출발: TF 가 안 오면 홈 시드로 한 번 더 시도
+            if was_idle_frozen or (
+                last_good is not None and self._pose_is_home(last_good)
+            ):
+                from ..home_poses import home_pose_for_device
+
+                hx, hy, hyaw = home_pose_for_device()
+                if frozen is not None and self._pose_is_home(frozen):
+                    hx, hy, hyaw = frozen[0], frozen[1], frozen[2]
+                elif last_good is not None and self._pose_is_home(last_good):
+                    hx, hy, hyaw = last_good[0], last_good[1], last_good[2]
+                seed = (hx, hy, float(yaw) if yaw is not None else hyaw)
+                with self._lock:
+                    self._home_seed_locked_out = False
+                    self._tour_active = False
+                if self._node:
+                    self._node.get_logger().warn(
+                        "ensure localization → last-resort wait-spot seed "
+                        f"({seed[0]:.3f},{seed[1]:.3f},{seed[2]:.3f})"
+                    )
+            else:
+                if self._node:
+                    self._node.get_logger().error(
+                        "ensure localization → no TF and home seed forbidden"
+                    )
+                return False
+
+        if seed is None:
             if self._node:
                 self._node.get_logger().error(
                     "ensure localization → no TF and home seed forbidden"

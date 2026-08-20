@@ -58,13 +58,31 @@ def _short_error(exc: BaseException, limit: int = 180) -> str:
 
 
 def _nav_error_needs_retreat(detail: str) -> bool:
-    """Nav2가 시작점 점유/진행불가/TF로 즉시 ABORT 한 경우 후진 회복이 필요."""
+    """Nav2가 시작점 점유/진행불가일 때만 후진 회복.
+
+    로컬라이즈/TF 실패는 후진하면 벽을 향해 밀려 가므로 제외한다.
+    """
     text = (detail or "").lower()
     if any(s in text for s in ("interrupted", "canceled", "cancelled")):
         return False
+    # 대기장소/AMCL 시드 실패 — cmd_vel 후진 금지
+    if any(
+        s in text
+        for s in (
+            "no_tf",
+            "no tf",
+            "home seed",
+            "localization",
+            "amcl seed",
+            "map→base",
+            "map->base",
+            "after amcl",
+        )
+    ):
+        return False
     if "error_code=102" in text or "error_code=105" in text or "error_code=108" in text:
         return True
-    if "aborted" in text or "no_valid_path" in text or "no_tf" in text:
+    if "aborted" in text or "no_valid_path" in text:
         return True
     return False
 

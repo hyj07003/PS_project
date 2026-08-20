@@ -341,7 +341,7 @@ erDiagram
 - 할당 후 맵 웨이포인트 피킹 순회: 매대(W*) 가까운 순 → 계산대(C) → 운송대기(P) → 홈(S1/S2)
 - 매대(W1–W6)는 도착 후 **OMX 픽업 완료(DONE)** 를 기다린 뒤 다음 작업 진행, C/P/S1/S2는 기존 **dwell** 유지 (`PICK_DWELL_SEC`)
 - Pinky: `POST /nav/goal_wait` (Nav2 도착 대기). URL은 `PINKY_ROBOTS` / `PINKY_URL`+`PINKY_URL_2`
-- 2대 동시 미션: `TrafficCoordinator`가 leg 전송 전 경로 충돌 검사·mission FIFO 우선순위·홈 복귀(S1/S2) 순차 제어 (`GET /traffic/state` 모니터링)
+- 2대 동시 미션: `TrafficCoordinator`가 leg 전송 전 경로 충돌 검사·progress/sticky owner(`can_clear`·`releaseIndex`)·동점 시 mission FIFO·홈 복귀(S1/S2) 순차 제어 (`GET /traffic/state` 모니터링)
 - 웨이포인트 **zone 점유**: 매대/계산대/운송대기 도킹~언독(C는 dwell 후) 구간을 disc로 등록; 다른 로봇 경로가 zone을 지나면 leg grant 보류
 - **충돌 대기**: 동일 shelf 점유·remaining 교집합 시 waiter는 **홈(S1/S2)에 있으면 그 자리에서 대기**하고, 이미 매대 쪽이면 **W7**로 스테이징 후 재시도; 투어 순서는 `conflict_aware_tour_order`로 충돌 shelf를 뒤로 미룸
 - **P 진입**: 다른 카트가 운송대기(P)에서 S1/S2로 복귀 중이면, P로 가려는 카트는 **W7에서 대기**하고 상대가 대기장소에 도착한 뒤에 진입
@@ -528,7 +528,8 @@ pnpm dev:web          # Next.js :3000
 | `PICK_NAV_TIMEOUT_SEC` | Nav2 goal_wait 타임아웃 초 (기본 `180`)                          |
 | `TRAFFIC_ENABLED`      | 다중 로봇 교통 제어 on/off (기본 `1`, `PINKY_ROBOTS` 2대 이상일 때 적용) |
 | `TRAFFIC_CLEARANCE_M`  | 경로 충돌 판정 거리 m (기본 `0.20`)                              |
-| `TRAFFIC_RELEASE_MARGIN_M` | owner가 충돌 구간 통과 후 추가 여유 m (기본 `0.20`)           |
+| `TRAFFIC_HOLD_MARGIN_M` | waiter가 충돌 ENTRY 전에 확보하는 여유 m (기본 `0.35`, `holdIndex`·대기 판정) |
+| `TRAFFIC_RELEASE_MARGIN_M` | owner가 충돌 EXIT 뒤 확보해야 하는 여유 m (기본 `0.20`, `can_clear`·`releaseIndex`) |
 | `TRAFFIC_POLL_HZ`      | waiter 폴링 주기 Hz (기본 `2.0`)                                 |
 | `TRAFFIC_HOME_PRIORITY`| 홈 복귀 순서: `fifo` 또는 `cart-1` (기본 `fifo`)                 |
 | `TRAFFIC_MISSION_TIMEOUT` | nav leg / 홈 복귀 acquire 대기 상한 초 (기본 `300`)           |
