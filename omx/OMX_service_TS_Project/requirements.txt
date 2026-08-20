@@ -1,0 +1,16 @@
+# OMX 픽업 정책 — 검증된 조합 (2026-08-20)
+#
+# lerobot 은 editable 설치를 전제로 한다:
+#     git clone <lerobot> && pip install -e .
+# ultralytics 는 opencv-python 을 요구하지만 lerobot 은
+# opencv-python-headless<4.13 을 제약하므로 --no-deps 로 넣어야 한다.
+# 그냥 설치하면 두 배포판이 중복되어 cv2 가 섀도잉된다.
+#
+#     pip install --no-deps ultralytics==8.4.120 lap==0.5.13
+
+lerobot==0.4.4
+torch==2.10.0
+numpy==2.2.6
+opencv-python-headless==4.12.0.88
+ultralytics==8.4.120
+lap==0.5.13

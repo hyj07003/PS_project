@@ -1,0 +1,16 @@
+# 정책 체크포인트 (1.3 GB/개) — 별도 배포
+outputs/
+checkpoints/
+*.safetensors
+
+# 검출기 가중치 (팀원 제공) — 별도 배포
+*.pt
+
+# 학습·평가 데이터 (3.4 GB) — HF 캐시에 있다
+data/
+*.mp4
+*.parquet
+
+__pycache__/
+*.pyc
+.venv/
