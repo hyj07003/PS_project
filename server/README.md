@@ -339,13 +339,13 @@ erDiagram
 - NestJS 관제를 **Flask**로 교체 (HTTP·JSON·SQLite 계약은 BFF와 동일하게 유지)
 - 주문 생성 시 미션을 **FIFO 큐(`CREATED`)** 에 넣고, **idle 카트**에만 할당
 - 할당 후 맵 웨이포인트 피킹 순회: 매대(W*) 가까운 순 → 계산대(C) → 운송대기(P) → 홈(S1/S2)
-- 매대(W1–W6)는 도착 후 **OMX 픽업 완료(DONE)** 를 기다린 뒤 다음 작업 진행 (고정 dwell 없음). OMX 서버 미통신·mock·`OMX_URL` 없음은 성공으로 처리 후 즉시 계속. C/P는 dwell 기본 0 (`PICK_DWELL_SEC`)
+- 매대(W1–W6)는 도착 후 **진열대 OMX 픽업 완료(DONE)** 를 기다린 뒤 다음 작업 진행 (고정 dwell 없음). OMX 서버 미통신·mock·`OMX_URL` 없음은 성공으로 처리 후 즉시 계속. 계산대(C)는 **계산대 OMX `/pack`** (`PACK_URL`); 없으면 dwell. P는 dwell 기본 0 (`PICK_DWELL_SEC`)
 - Pinky: `POST /nav/goal_wait` (Nav2 도착 대기). URL은 `PINKY_ROBOTS` / `PINKY_URL`+`PINKY_URL_2`
 - 2대 동시 미션: `TrafficCoordinator`가 leg 전송 전 경로 충돌 검사·progress/sticky owner(`can_clear`·`releaseIndex`)·동점 시 mission FIFO·홈 복귀(S1/S2) 순차 제어 (`GET /traffic/state` 모니터링)
 - 웨이포인트 **zone 점유**: 매대/계산대/운송대기 도킹~언독(C는 dwell 후) 구간을 disc로 등록; 다른 로봇 경로가 zone을 지나면 leg grant 보류
 - **충돌 대기**: 동일 shelf 점유·remaining 교집합 시 waiter는 **홈(S1/S2)에 있으면 그 자리에서 대기**하고, 이미 매대 쪽이면 **W7**로 스테이징 후 재시도; 투어 순서는 `conflict_aware_tour_order`로 충돌 shelf를 뒤로 미룸
 - **P 진입**: 다른 카트가 운송대기(P)에서 S1/S2로 복귀 중이면, P로 가려는 카트는 **W7에서 대기**하고 상대가 대기장소에 도착한 뒤에 진입
-- **OMX 통신 불가 우회**: OMX 서버 미접속/폴링 예외 시 `omx-unreachable-override` 노트를 남기고 해당 매대 픽업을 성공으로 간주해 작업을 이어감
+- **OMX 통신 불가 우회**: 진열대/계산대 OMX 미접속 시 해당 단계를 성공으로 간주해 작업을 이어감 (미션 노트에 기록)
 - 데모 상품: 케이크(W1)·롤케이크(W2)·우유(W3)·비스킷(W4)·아이스크림(W5)·샌드위치(W6)
 - 의존성: `apps/controller-server/requirements.txt` + `.venv`
 
@@ -520,11 +520,16 @@ pnpm dev:web          # Next.js :3000
 | `PINKY_URL`            | BFF/Controller → 1번 Pinky (`cart-1`)                         |
 | `PINKY_URL_2`          | (선택) 2번 Pinky (`cart-2`)                                    |
 | `PINKY_ROBOTS`         | (선택) `cart-1=url1,cart-2=url2` — 다대 등록 시 우선              |
-| `OMX_URL`              | OMX 로봇팔 PC URL (예: `http://192.168.129.50:8080`, **관제 PC와 다른 머신**) |
-| `OMX_CONNECT_TIMEOUT_SEC` | OMX HTTP 연결 타임아웃 초 (기본 `5`, LAN/원격)                    |
-| `OMX_POLL_SEC`         | OMX `/pick/state` 폴링 주기 초 (기본 `0.5`)                        |
-| `OMX_PICK_TIMEOUT_SEC` | OMX 픽업 1회 타임아웃 초 (기본 `90`)                               |
-| `PICK_DWELL_SEC`       | C/P/홈 도착 후 대기 초 (기본 `0`, 비활성)                           |
+| `OMX_URL`              | 진열대 OMX PC URL (예: `http://192.168.129.50:8080`) |
+| `OMX_CONNECT_TIMEOUT_SEC` | 진열대 OMX HTTP 연결 타임아웃 초 (기본 `5`)                    |
+| `OMX_POLL_SEC`         | 진열대 `/pick/state` 폴링 주기 초 (기본 `0.5`)                        |
+| `OMX_PICK_TIMEOUT_SEC` | 진열대 픽업 1회 타임아웃 초 (기본 `90`)                               |
+| `PACK_URL`             | 계산대 OMX PC URL (예: `http://192.168.129.50:8081`) |
+| `PACK_CONNECT_TIMEOUT_SEC` | 계산대 OMX 연결 타임아웃 초 (기본 `5`) |
+| `PACK_POLL_SEC`        | 계산대 `/pack/state` 폴링 주기 초 (기본 `0.5`) |
+| `PACK_ATTEMPT_TIMEOUT_SEC` | 계산대 포장 1시도 타임아웃 초 (기본 `90`) |
+| `PACK_MAX_ATTEMPTS`    | 계산대 포장 재시도 횟수 (기본 `3`) |
+| `PICK_DWELL_SEC`       | C(fallback)/P/홈 도착 후 대기 초 (기본 `0`, 비활성)                           |
 | `PICK_NAV_TIMEOUT_SEC` | Nav2 goal_wait 타임아웃 초 (기본 `180`)                          |
 | `TRAFFIC_ENABLED`      | 다중 로봇 교통 제어 on/off (기본 `1`, `PINKY_ROBOTS` 2대 이상일 때 적용) |
 | `TRAFFIC_CLEARANCE_M`  | 경로 충돌 판정 거리 m (기본 `0.20`)                              |
@@ -600,33 +605,41 @@ netsh advfirewall firewall add rule name="SmartShop API 4000" dir=in action=allo
 
 ### OMX 로봇팔 (별도 PC)
 
-OMX 서버는 **로봇팔·카메라가 연결된 PC**에서 구동하고, 관제 PC는 HTTP로 픽업만 요청한다.
+OMX는 **진열대(:8080)** 와 **계산대(:8081)** 두 HTTP 서버로 나뉜다. 보통 같은 OMX PC에서 포트를 나눠 띄운다.
 
 | PC | 역할 | 포트 |
 |---|---|---|
 | 관제 PC | controller-server, web | 4100, 4000, 3000 |
-| OMX PC | `python -m omx_yolo.server` | 8080 (기본 `0.0.0.0` bind) |
+| OMX PC | `omx_yolo.server` (진열대) | 8080 |
+| OMX PC | `omx_pack.server` (계산대) | 8081 |
 
-**OMX PC**
+**OMX PC — 진열대**
 
 ```bash
 cd omx/OMX_service_TS_Project
 cp .env.example .env   # OMX_HOST=0.0.0.0, OMX_PORT=8080
 POLICY=/path/to/checkpoint ./scripts/start_server.sh
-# 기동 로그에 "관제 PC .env 예: OMX_URL=http://192.168.x.x:8080" 출력
+```
+
+**OMX PC — 계산대** (요약; 상세는 `API_PACK.md`)
+
+```bash
+PYTHONPATH=... python -m omx_pack.server --basket yellow --port 8081 ...
 ```
 
 **관제 PC** (`server/.env`)
 
 ```env
 # ADAPTER_MODE=mock  ← 주석 처리 또는 삭제
-OMX_URL=http://192.168.129.50:8080   # OMX PC LAN IP
+OMX_URL=http://192.168.129.50:8080    # 진열대
+PACK_URL=http://192.168.129.50:8081   # 계산대
 OMX_CONNECT_TIMEOUT_SEC=5
+PACK_CONNECT_TIMEOUT_SEC=5
 ```
 
-**방화벽 (OMX PC)**: TCP 8080을 관제 PC(또는 같은 서브넷)에서 허용.
+**방화벽 (OMX PC)**: TCP **8080·8081** 을 관제 PC(또는 같은 서브넷)에서 허용.
 
-OMX PC 브라우저 모니터: `http://<OMX PC IP>:8080/view`
+모니터: `http://<OMX PC>:8080/view` (진열대), `http://<OMX PC>:8081/view` (계산대)
 
 ---
 
@@ -680,7 +693,7 @@ stateDiagram-v2
 - 대기 큐: `missions.status=CREATED` and `device_id IS NULL` (FIFO)
 - idle `cart-*`만 할당. 두 대 busy면 큐에 대기
 - 웨이포인트: `app/waypoints.py` (S1/S2 홈, W1–W6 매대, C 계산대, P 운송대기)
-- 매대(W1–W6)는 OMX 픽업 완료 기반 진행(미통신 시 성공 처리), C/P dwell 기본 0 (`PICK_DWELL_SEC`)
+- 매대(W1–W6)는 진열대 OMX 픽업, 계산대(C)는 계산대 OMX `/pack` (`PACK_URL` 없으면 dwell), P dwell 기본 0
 - 작업 종료 시점: **대기장소(S1/S2) 도착 완료** 후 `COMPLETED` (모니터링 할당 해제). 복귀 중은 `RETURNING`
 - 중도 실패 시에도 대기장소 복귀 시도 후 `FAILED`
 - 각 전이는 `mission_events`에 기록. 모니터링은 `current_waypoint` 표시

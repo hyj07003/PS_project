@@ -842,3 +842,192 @@ class PinkyHttpCartAdapter:
             )
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             return {"success": False, "message": str(exc)}
+
+
+def parse_omx_pack_url() -> str | None:
+    """계산대 OMX(:8081) URL. 스킴 없으면 http:// 를 붙인다."""
+    raw = (os.environ.get("PACK_URL") or "").strip().rstrip("/")
+    if not raw:
+        return None
+    if not raw.startswith(("http://", "https://")):
+        raw = f"http://{raw}"
+    return raw
+
+
+def get_omx_pack_connect_timeout() -> float:
+    return float(os.environ.get("PACK_CONNECT_TIMEOUT_SEC", "5"))
+
+
+class OmxPackStationAdapter:
+    """HTTP adapter for the checkout (계산대) OMX arm (:8081) — POST /pack."""
+
+    def __init__(self, url: str | None = None, poll_sec: float | None = None) -> None:
+        self.url = url if url is not None else parse_omx_pack_url()
+        self.poll_sec = float(
+            poll_sec
+            if poll_sec is not None
+            else os.environ.get("PACK_POLL_SEC", "0.5")
+        )
+        self.attempt_timeout_sec = float(
+            os.environ.get("PACK_ATTEMPT_TIMEOUT_SEC", "90")
+        )
+        self.max_attempts = int(os.environ.get("PACK_MAX_ATTEMPTS", "3"))
+        self.connect_timeout = get_omx_pack_connect_timeout()
+        self.last_error: str | None = None
+        self.last_state: dict[str, Any] = {}
+        if self.url:
+            logger.info(
+                "OMX checkout(pack) adapter: %s (connect_timeout=%.1fs, poll=%.2fs)",
+                self.url,
+                self.connect_timeout,
+                self.poll_sec,
+            )
+
+    def _request_timeout(self, timeout: float) -> float:
+        return max(float(timeout), self.connect_timeout)
+
+    def _post(
+        self, path: str, body: dict[str, Any], timeout: float = 10.0
+    ) -> dict[str, Any]:
+        if not self.url:
+            raise RuntimeError("PACK_URL is not configured")
+        req = urllib.request.Request(
+            f"{self.url}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                req, timeout=self._request_timeout(timeout)
+            ) as res:
+                return json.loads(res.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                payload = {"success": False, "message": raw[:200] or str(exc)}
+            if isinstance(payload, dict):
+                payload.setdefault("httpStatus", exc.code)
+                return payload
+            return {"success": False, "message": str(exc), "httpStatus": exc.code}
+
+    def _get(self, path: str, timeout: float = 5.0) -> dict[str, Any]:
+        if not self.url:
+            raise RuntimeError("PACK_URL is not configured")
+        req = urllib.request.Request(f"{self.url}{path}", method="GET")
+        with urllib.request.urlopen(
+            req, timeout=self._request_timeout(timeout)
+        ) as res:
+            return json.loads(res.read().decode("utf-8"))
+
+    def is_reachable(self) -> bool:
+        if not self.url:
+            return False
+        try:
+            health = self._get("/health", timeout=min(3.0, self.connect_timeout))
+            return bool(health.get("robotConnected", False))
+        except Exception as exc:
+            logger.debug("OMX pack unreachable at %s: %s", self.url, exc)
+            return False
+
+    def is_server_reachable(self) -> bool:
+        """True if PACK HTTP /health responds (robotConnected not required)."""
+        if not self.url:
+            return False
+        try:
+            health = self._get("/health", timeout=min(3.0, self.connect_timeout))
+            return isinstance(health, dict)
+        except Exception as exc:
+            logger.debug("OMX pack server unreachable at %s: %s", self.url, exc)
+            return False
+
+    def supported_devices(self) -> list[str]:
+        try:
+            return sorted(
+                (self._get("/baskets", timeout=3.0).get("devices") or {}).keys()
+            )
+        except Exception:
+            return []
+
+    def pack(
+        self,
+        *,
+        device_code: str,
+        order_id: int = 0,
+        max_attempts: int | None = None,
+        timeout_sec: float | None = None,
+        should_abort: Callable[[], bool] | None = None,
+        on_progress: Callable[[int, int, Any], None] | None = None,
+        force_success_on_unreachable: bool = False,
+    ) -> Literal["DONE", "FAILED", "ABORTED"]:
+        """Empty cart box at checkout. Completion via OMX top-view boxEmpty."""
+        self.last_error = None
+        self.last_state = {}
+        attempts = int(
+            max_attempts if max_attempts is not None else self.max_attempts
+        )
+        per_attempt = float(timeout_sec or self.attempt_timeout_sec)
+
+        try:
+            started = self._post(
+                "/pack",
+                {
+                    "orderId": int(order_id),
+                    "deviceCode": device_code,
+                    "maxAttempts": attempts,
+                    "timeoutSec": per_attempt,
+                },
+                timeout=15.0,
+            )
+        except Exception as exc:
+            self.last_error = f"omx pack request failed: {exc}"
+            return "DONE" if force_success_on_unreachable else "FAILED"
+
+        if not started.get("success"):
+            self.last_error = str(started.get("message") or "omx pack rejected")
+            if int(started.get("httpStatus") or 0) <= 0 and force_success_on_unreachable:
+                return "DONE"
+            return "FAILED"
+
+        deadline = time.time() + max(10.0, (per_attempt + 10.0) * attempts)
+        stop_sent = False
+        last_seen: tuple[int, Any] = (-1, None)
+        while time.time() < deadline:
+            time.sleep(max(0.2, self.poll_sec))
+            try:
+                state = self._get("/pack/state", timeout=3.0)
+            except Exception as exc:
+                self.last_error = f"omx pack state polling failed: {exc}"
+                return "DONE" if force_success_on_unreachable else "FAILED"
+            self.last_state = state
+
+            attempt = int(state.get("attempt") or 0)
+            total = int(state.get("maxAttempts") or attempts)
+            box_empty = state.get("boxEmpty")
+            if on_progress and (attempt, box_empty) != last_seen:
+                on_progress(attempt, total, box_empty)
+                last_seen = (attempt, box_empty)
+
+            if should_abort and should_abort() and not stop_sent:
+                stop_sent = True
+                try:
+                    self._post("/pack/stop", {"mode": "afterCurrent"}, timeout=5.0)
+                except Exception:
+                    pass
+
+            status = str(state.get("status") or "")
+            if status in ("DONE", "FAILED", "ABORTED"):
+                if status in ("FAILED", "ABORTED"):
+                    self.last_error = str(state.get("message") or status)
+                return status  # type: ignore[return-value]
+
+        self.last_error = "omx pack timeout"
+        return "DONE" if force_success_on_unreachable else "FAILED"
+
+    def stop(self, mode: str = "afterCurrent") -> dict[str, Any]:
+        try:
+            return self._post("/pack/stop", {"mode": mode}, timeout=5.0)
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}

@@ -8,11 +8,13 @@ from typing import Any
 
 from ..adapters import (
     OmxHttpStationAdapter,
+    OmxPackStationAdapter,
     ORDER_FLOW,
     MockAiAdapter,
     MockCartAdapter,
     MockStationAdapter,
     PinkyHttpCartAdapter,
+    parse_omx_pack_url,
     parse_omx_url,
     parse_pinky_robot_urls,
 )
@@ -118,6 +120,14 @@ class OrdersService:
             self.station_port = OmxHttpStationAdapter(omx_url)
         else:
             self.station_port = MockStationAdapter()
+        # 계산대 OMX(:8081) — 진열대 팔과 별개. PACK_URL 없으면 None → C dwell.
+        pack_url = parse_omx_pack_url()
+        if pack_url and os.environ.get("ADAPTER_MODE", "").strip().lower() != "mock":
+            self.pack_port: OmxPackStationAdapter | None = OmxPackStationAdapter(
+                pack_url
+            )
+        else:
+            self.pack_port = None
         self.ai_port = MockAiAdapter()
         self._dwell_sec = float(os.environ.get("PICK_DWELL_SEC", "0"))
         self._nav_timeout = float(os.environ.get("PICK_NAV_TIMEOUT_SEC", "180"))
@@ -126,8 +136,9 @@ class OrdersService:
         self._abort_lock = threading.Lock()
         self._returning_home: set[str] = set()
         self._tour_locks: dict[str, threading.Lock] = {}
-        # Single physical OMX arm — serialize picks across carts.
+        # 진열대 팔 / 계산대 팔 — 별개 하드웨어이므로 락 분리.
         self._omx_arm_lock = threading.Lock()
+        self._omx_pack_lock = threading.Lock()
         self._omx_busy_retries = max(
             1, int(os.environ.get("OMX_BUSY_RETRIES", "8"))
         )
@@ -1435,7 +1446,7 @@ class OrdersService:
         waypoint_id: str,
         mission_id: int,
     ) -> None:
-        """ArUco dock → (optional dwell) → undock. No OMX at C/P."""
+        """ArUco dock → (optional dwell) → undock. Used at P (and C fallback)."""
         travel, final_range = self._aruco_dock_or_fail(
             device_code, waypoint_id, mission_id
         )
@@ -1450,7 +1461,7 @@ class OrdersService:
         )
 
     def _acquire_omx_arm(self, mission_id: int) -> None:
-        """Wait for the single OMX arm; abortable while waiting."""
+        """Wait for the shelf (진열대) OMX arm; abortable while waiting."""
         waited = False
         while True:
             self._ensure_not_aborted(mission_id)
@@ -1462,6 +1473,101 @@ class OrdersService:
                 self._mission_note(mission_id, "omx arm wait")
                 waited = True
 
+    def _acquire_omx_pack(self, mission_id: int) -> None:
+        """Wait for the checkout (계산대) OMX arm — separate from shelf arm."""
+        waited = False
+        while True:
+            self._ensure_not_aborted(mission_id)
+            if self._omx_pack_lock.acquire(timeout=0.5):
+                if waited:
+                    self._mission_note(mission_id, "omx pack arm acquired")
+                return
+            if not waited:
+                self._mission_note(mission_id, "omx pack arm wait")
+                waited = True
+
+    def _omx_pack_at_station(
+        self,
+        device_code: str,
+        order_id: int,
+        mission_id: int,
+        waypoint_id: str,
+    ) -> None:
+        """계산대 OMX로 적재함을 비운다. PACK_URL 없으면 dwell 로 통과."""
+        if self.pack_port is None:
+            self._dwell_at(device_code, mission_id, waypoint_id)
+            return
+        if not self.pack_port.is_server_reachable():
+            self._mission_note(
+                mission_id,
+                f"omx pack unreachable at {waypoint_id} — success override, continue",
+            )
+            return
+
+        self._acquire_omx_pack(mission_id)
+        try:
+            self._ensure_not_aborted(mission_id)
+            self._set_waypoint(mission_id, waypoint_id, label_suffix="계산대 포장 중")
+            self._mission_note(mission_id, f"omx pack start {device_code}")
+
+            def _progress(attempt: int, total: int, box_empty: Any) -> None:
+                mark = (
+                    "비움"
+                    if box_empty is True
+                    else "남음"
+                    if box_empty is False
+                    else "확인전"
+                )
+                self._set_waypoint(
+                    mission_id,
+                    waypoint_id,
+                    label_suffix=f"포장 {attempt}/{total} {mark}",
+                )
+                self._mission_note(
+                    mission_id, f"omx pack {attempt}/{total} box={mark}"
+                )
+
+            result = self.pack_port.pack(
+                device_code=device_code,
+                order_id=order_id,
+                should_abort=lambda: self._is_aborted(mission_id),
+                on_progress=_progress,
+            )
+
+            state = self.pack_port.last_state or {}
+            box_empty = state.get("boxEmpty")
+            if result == "DONE":
+                self._mission_note(mission_id, "omx pack done (적재함 비움)")
+                return
+
+            reason = self.pack_port.last_error or result
+            if box_empty is None:
+                reason = f"적재함 상태를 확인하지 못했습니다 ({reason})"
+            self._mission_note(mission_id, f"omx pack {result}: {reason}")
+            raise RuntimeError(f"OMX 계산대 포장 {result}: {reason}")
+        finally:
+            self._omx_pack_lock.release()
+
+    def _dock_pack_undock(
+        self,
+        device_code: str,
+        order_id: int,
+        mission_id: int,
+        waypoint_id: str = "C",
+    ) -> None:
+        """C: ArUco dock → 계산대 OMX /pack → undock."""
+        travel, final_range = self._aruco_dock_or_fail(
+            device_code, waypoint_id, mission_id
+        )
+        self._omx_pack_at_station(device_code, order_id, mission_id, waypoint_id)
+        self._undock_after_shelf_aruco(
+            device_code,
+            waypoint_id,
+            travel,
+            mission_id,
+            final_range_m=final_range,
+        )
+
     def _omx_pick_at_shelf(
         self,
         device_code: str,
@@ -1470,7 +1576,7 @@ class OrdersService:
         waypoint_id: str,
         picks: list[tuple[str, int]],
     ) -> None:
-        """OMX pick then continue tour. No dwell pause.
+        """진열대 OMX pick then continue tour. No dwell pause.
 
         Mock / no OMX URL / server unreachable → treat as success and proceed.
         """
@@ -1670,7 +1776,11 @@ class OrdersService:
         stop_first: bool = False,
         best_effort: bool = False,
     ) -> bool:
-        """Navigate to wait spot (S1/S2) using waypoint pose."""
+        """Navigate to wait spot (S1/S2) using waypoint pose.
+
+        best_effort (작업 실패 복귀): 교통 wait_zone / 비상대기(W7)에 막히지 않고
+        navigate_pose 로 직행한다. 정상 완료 복귀는 기존 교통 직렬화를 유지한다.
+        """
         home = home_for_device(device_code)
         home_yaw = float(home.yaw)
         yaw_tol = float(os.environ.get("PICK_HOME_YAW_TOL_RAD", "0.12"))
@@ -1684,7 +1794,68 @@ class OrdersService:
                 time.sleep(0.3)
             except Exception:
                 pass
+        try:
+            self.traffic.release_waypoint_zone(device_code)
+        except Exception:
+            pass
+        try:
+            self.traffic.release_nav_leg(device_code)
+        except Exception:
+            pass
+        try:
+            self.traffic.mark_returning_home(device_code)
+        except Exception:
+            pass
         self._set_waypoint(mission_id, home.id)
+
+        if best_effort:
+            # Failure recovery — mirror return_home_device: no acquire_nav_leg.
+            try:
+                try:
+                    self.traffic.acquire_return_home(device_code, timeout_sec=8.0)
+                except TypeError:
+                    self.traffic.acquire_return_home(device_code)
+                except Exception:
+                    pass
+                attempts = max(1, int(os.environ.get("PICK_NAV_RETRIES", "3")))
+                for attempt in range(1, attempts + 1):
+                    try:
+                        self._ensure_not_aborted(mission_id)
+                    except Exception:
+                        # Operator abort during recovery — stop trying home.
+                        return False
+                    self._mission_note(
+                        mission_id,
+                        f"fail-home nav {home.id} try={attempt}/{attempts}",
+                    )
+                    result = self.cart_port.navigate_pose(
+                        device_code,
+                        home.x,
+                        home.y,
+                        home_yaw,
+                        timeout_sec=self._nav_timeout,
+                        require_yaw=False,
+                        yaw_tol_rad=yaw_tol,
+                    )
+                    if result == "ARRIVED":
+                        self._dwell_at(device_code, mission_id, home.id)
+                        return True
+                    detail = (
+                        getattr(self.cart_port, "last_nav_error", None) or result
+                    )
+                    self._mission_note(
+                        mission_id,
+                        f"fail-home nav retry {attempt}: {detail}",
+                    )
+                    if attempt < attempts:
+                        time.sleep(0.5)
+                return False
+            finally:
+                try:
+                    self.traffic.release_return_home(device_code)
+                except Exception:
+                    pass
+
         try:
             self.traffic.acquire_return_home(device_code)
             try:
@@ -1697,6 +1868,7 @@ class OrdersService:
                     require_yaw=False,
                     mission_id=mission_id,
                     allow_retreat=False,
+                    skip_traffic_wait=False,
                 )
                 for align in range(1, 4):
                     self._ensure_not_aborted(mission_id)
@@ -1726,10 +1898,7 @@ class OrdersService:
             self._dwell_at(device_code, mission_id, home.id)
             return True
         except Exception:
-            if best_effort:
-                return False
             raise
-
     def _release_device(self, mission_id: int) -> None:
         mission = self.conn.execute(
             "SELECT device_id FROM missions WHERE id = ?",
@@ -1990,7 +2159,7 @@ class OrdersService:
                     mission_id=mission_id,
                     allow_retreat=False,
                 )
-                self._dock_dwell_undock(device_code, "C", mission_id)
+                self._dock_pack_undock(device_code, order_id, mission_id, "C")
             except TrafficYieldError as yield_exc:
                 try:
                     self.traffic.release_waypoint_zone(device_code)
@@ -2043,6 +2212,18 @@ class OrdersService:
                 # Don't block forever on home return when pinky is already down
                 note = f"failed:{_short_error(exc)}"
                 try:
+                    try:
+                        self.traffic.release_waypoint_zone(device_code)
+                    except Exception:
+                        pass
+                    try:
+                        self.traffic.release_nav_leg(device_code)
+                    except Exception:
+                        pass
+                    try:
+                        self.traffic.clear_stale_emergency_wait(device_code)
+                    except Exception:
+                        pass
                     if self.cart_port.is_reachable(device_code):
                         self._set_status(
                             order_id,

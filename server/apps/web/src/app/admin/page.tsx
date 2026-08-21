@@ -71,6 +71,13 @@ type OmxHealth = {
   message?: string;
   robotConnected?: boolean;
   busy?: boolean;
+  basket?: string;
+  startPose?: {
+    grade?: string;
+    out?: unknown[];
+    edge?: unknown[];
+    messages?: string[];
+  };
   rig?: {
     ok?: boolean;
     meanShiftPx?: number;
@@ -327,6 +334,7 @@ function CartStatusPanel({
 export default function AdminRobotPage() {
   const [robots, setRobots] = useState<RobotMonitor[]>([]);
   const [omx, setOmx] = useState<OmxHealth | null>(null);
+  const [omxPack, setOmxPack] = useState<OmxHealth | null>(null);
   const [missions, setMissions] = useState<MissionListItem[]>([]);
   const [queueLength, setQueueLength] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -381,7 +389,7 @@ export default function AdminRobotPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [res, o, m] = await Promise.all([
+      const [res, o, op, m] = await Promise.all([
         api<RobotsResponse>("/admin/robots"),
         api<OmxHealth>("/admin/omx/health").catch(
           (err: unknown): OmxHealth => ({
@@ -390,7 +398,17 @@ export default function AdminRobotPage() {
             configured: false,
             reachable: false,
             message:
-              err instanceof Error ? err.message : "OMX health 요청 실패",
+              err instanceof Error ? err.message : "진열대 OMX health 요청 실패",
+          }),
+        ),
+        api<OmxHealth>("/admin/omx/pack/health").catch(
+          (err: unknown): OmxHealth => ({
+            success: false,
+            status: "ERROR",
+            configured: false,
+            reachable: false,
+            message:
+              err instanceof Error ? err.message : "계산대 OMX health 요청 실패",
           }),
         ),
         api<MissionListItem[]>("/admin/robot/missions").catch(
@@ -401,6 +419,7 @@ export default function AdminRobotPage() {
       setRobots(list);
       setQueueLength(res.queueLength ?? 0);
       setOmx(o);
+      setOmxPack(op);
       setMissions(Array.isArray(m) ? m : []);
       setError(null);
       setUpdatedAt(new Date().toLocaleTimeString("ko-KR"));
@@ -677,7 +696,7 @@ export default function AdminRobotPage() {
       <section className="robot-block robot-block-omx">
         <header className="robot-block-head">
           <div>
-            <h2 className="robot-block-title">OMX 로봇팔</h2>
+            <h2 className="robot-block-title">OMX 로봇팔 (진열대)</h2>
             <p className="robot-block-url muted">
               {omx?.url || "OMX_URL 미설정"}
               {typeof omx?.latencyMs === "number"
@@ -744,13 +763,13 @@ export default function AdminRobotPage() {
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={`${getApiUrl()}/admin/omx/stream?cam=camera1&fps=10&token=${encodeURIComponent(omxStreamToken)}`}
-                alt="OMX front (top) camera"
+                alt="진열대 OMX front (top) camera"
               />
             ) : (
               <div className="omx-cam-placeholder muted">
                 {omx?.reachable
                   ? "인증 토큰 대기…"
-                  : "스트림 없음 (OMX 연결 필요)"}
+                  : "스트림 없음 (진열대 OMX 연결 필요)"}
               </div>
             )}
             <figcaption>
@@ -763,18 +782,127 @@ export default function AdminRobotPage() {
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={`${getApiUrl()}/admin/omx/stream?cam=camera2&fps=10&token=${encodeURIComponent(omxStreamToken)}`}
-                alt="OMX wrist camera"
+                alt="진열대 OMX wrist camera"
               />
             ) : (
               <div className="omx-cam-placeholder muted">
                 {omx?.reachable
                   ? "인증 토큰 대기…"
-                  : "스트림 없음 (OMX 연결 필요)"}
+                  : "스트림 없음 (진열대 OMX 연결 필요)"}
               </div>
             )}
             <figcaption>
               <span className="omx-cam-tag">wrist</span> 손목 · camera2 · 10
               fps
+            </figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section className="robot-block robot-block-omx">
+        <header className="robot-block-head">
+          <div>
+            <h2 className="robot-block-title">OMX 로봇팔 (계산대)</h2>
+            <p className="robot-block-url muted">
+              {omxPack?.url || "PACK_URL 미설정"}
+              {typeof omxPack?.latencyMs === "number"
+                ? ` · ${omxPack.latencyMs}ms`
+                : ""}
+            </p>
+          </div>
+          <span
+            className={`robot-block-status ${
+              omxPack?.reachable ? "status-ok" : "status-bad"
+            }`}
+          >
+            {omxPack?.reachable
+              ? "네트워크 연결됨"
+              : omxPack?.configured === false
+                ? "미설정"
+                : "연결 불가"}
+          </span>
+        </header>
+
+        <dl className="monitor-dl omx-net-dl">
+          <div>
+            <dt>상태</dt>
+            <dd>{omxPack?.status || "—"}</dd>
+          </div>
+          <div>
+            <dt>로봇 연결</dt>
+            <dd>
+              {omxPack?.reachable
+                ? omxPack.robotConnected
+                  ? "연결됨"
+                  : "미연결"
+                : "—"}
+            </dd>
+          </div>
+          <div>
+            <dt>포장</dt>
+            <dd>
+              {omxPack?.reachable
+                ? omxPack.busy
+                  ? "작업 중"
+                  : "대기"
+                : "—"}
+            </dd>
+          </div>
+          <div>
+            <dt>시작자세</dt>
+            <dd>
+              {omxPack?.reachable
+                ? omxPack.startPose?.grade ||
+                  (omxPack.rig?.error
+                    ? omxPack.rig.error
+                    : omxPack.rig?.ok === true
+                      ? "OK"
+                      : "—")
+                : "—"}
+            </dd>
+          </div>
+        </dl>
+        {omxPack?.message ? (
+          <p className="muted" style={{ margin: "0.5rem 0 0", fontSize: "0.85rem" }}>
+            {omxPack.message}
+          </p>
+        ) : null}
+
+        <div className="omx-cam-grid">
+          <figure className="omx-cam">
+            {omxPack?.reachable && omxStreamToken ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={`${getApiUrl()}/admin/omx/pack/stream?cam=front&fps=10&token=${encodeURIComponent(omxStreamToken)}`}
+                alt="계산대 OMX front (top) camera"
+              />
+            ) : (
+              <div className="omx-cam-placeholder muted">
+                {omxPack?.reachable
+                  ? "인증 토큰 대기…"
+                  : "스트림 없음 (계산대 OMX 연결 필요)"}
+              </div>
+            )}
+            <figcaption>
+              <span className="omx-cam-tag">front</span> 탑뷰 · front · 10 fps
+            </figcaption>
+          </figure>
+          <figure className="omx-cam">
+            {omxPack?.reachable && omxStreamToken ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={`${getApiUrl()}/admin/omx/pack/stream?cam=wrist&fps=10&token=${encodeURIComponent(omxStreamToken)}`}
+                alt="계산대 OMX wrist camera"
+              />
+            ) : (
+              <div className="omx-cam-placeholder muted">
+                {omxPack?.reachable
+                  ? "인증 토큰 대기…"
+                  : "스트림 없음 (계산대 OMX 연결 필요)"}
+              </div>
+            )}
+            <figcaption>
+              <span className="omx-cam-tag">wrist</span> 손목 · wrist · 10 fps
             </figcaption>
           </figure>
         </div>

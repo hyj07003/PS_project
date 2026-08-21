@@ -17,7 +17,7 @@ from .traffic_paths import (
     has_passed_path_index,
     nearest_path_index,
     path_distance_between,
-    path_goal_in_zones,
+    path_intersects_zones,
     path_points,
     pose_near_path,
     retreat_path_index,
@@ -1110,9 +1110,8 @@ class TrafficCoordinator:
                 self_state.last_wait_reason = None
 
         occupied_zones = self.occupied_zones(exclude_device=device_code)
-        # Only block when our *goal* sits in a peer-occupied zone — not when the
-        # planned path merely grazes a distant shelf the peer is working.
-        if occupied_zones and path_goal_in_zones(planned_path, occupied_zones):
+        # Peer가 점유한 매대/C/P 구역을 경로가 지나가면 grant 보류 (목표만 겹칠 때만이 아님).
+        if occupied_zones and path_intersects_zones(planned_path, occupied_zones):
             self_state.last_wait_reason = "wait_zone"
             return False, "wait_zone"
 
