@@ -140,20 +140,26 @@ def main() -> None:
     if a.state is not None:
         state = np.array(a.state, np.float64)
     else:
-        # 팔에서 직접 읽는다 — 모터를 읽기만 하므로 움직이지 않는다.
-        from lerobot.motors import Motor, MotorNormMode
-        from lerobot.motors.dynamixel import DynamixelMotorsBus
+        # 로봇 클래스로 연결한다.
+        #
+        # 모터 버스를 직접 열면 캘리브레이션이 등록되지 않아
+        # "has no calibration registered" 로 죽는다. 학습 통계는 정규화된
+        # 각도 단위이므로 원시값(0~4095)과 비교할 수 없다 — 캘리브레이션을
+        # 거쳐야 같은 단위가 된다.
+        #
+        # ⚠ 연결하는 순간 토크가 켜진다(configure 가 torque_disabled 컨텍스트를
+        #   빠져나오며 재활성화한다). 팔 주변을 비우고 실행할 것.
+        from lerobot.robots.omx_follower import OmxFollowerConfig
+        from lerobot.robots.utils import make_robot_from_config
 
-        models = ("xl430-w250",) * 3 + ("xl330-m288",) * 3
-        motors = {j: Motor(11 + i, models[i],
-                           MotorNormMode.RANGE_0_100 if j == "gripper"
-                           else MotorNormMode.DEGREES)
-                  for i, j in enumerate(JOINTS)}
-        bus = DynamixelMotorsBus(port=a.robot_port, motors=motors)
-        bus.connect(handshake=False)
-        state = np.array([bus.read("Present_Position", j) for j in JOINTS],
-                         np.float64)
-        bus.disconnect()
+        robot = make_robot_from_config(
+            OmxFollowerConfig(port=a.robot_port, id="omx_pack_arm", cameras={}))
+        robot.connect()
+        try:
+            obs = robot.get_observation()
+            state = np.array([obs[f"{j}.pos"] for j in JOINTS], np.float64)
+        finally:
+            robot.disconnect()
 
     vs = rng.check(state)
     print(format_report(vs))
