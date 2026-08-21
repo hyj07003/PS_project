@@ -64,13 +64,16 @@ def _connect_with_retry(robot, attempts: int = 3, pause_s: float = 1.5) -> None:
 class BaseArm:
     """작업(job) 모델과 인터럽트. 구동 방식과 무관한 부분만 여기 둔다."""
 
-    def __init__(self, fps: int = 30, trace_dir: str | None = None):
+    def __init__(self, fps: int = 30, trace_dir: str | None = None,
+                 home_after: bool = False):
         self.fps = fps
         # 궤적 기록 디렉터리. None 이면 기록하지 않는다. 종료 판정과 홈
         # 자세를 측정으로 정하기 위한 것이라, 실기 세션에서는 켜 두는 편이
         # 낫다 — 에피소드당 43KB 뿐이고, 다시 돌릴 기회는 비싸다.
         self.trace_dir = Path(trace_dir) if trace_dir else None
         self.traces: list[str] = []
+        # 작업이 끝나면 홈으로 데려다 놓을지. 홈 값이 없으면 경고만 남는다.
+        self.home_after = home_after
         self.lock = threading.Lock()
         self.busy = False
         self.job: dict | None = None
@@ -163,6 +166,14 @@ class BaseArm:
             "results": [],
             "message": "",
         }
+        # busy 는 **스레드를 띄우기 전에** 세운다.
+        #
+        # 워커 안에서 세우면 202 를 반환한 뒤 스레드가 실제로 도는 사이에
+        # 틈이 생긴다. 그 틈에 /health 가 들어오면 모터 버스를 읽어 제어
+        # 루프와 충돌한다(2026-08-21 통합 시험에서 이 충돌로 작업 하나가
+        # 통째로 실패했다). 틈은 1ms 남짓이지만 관제는 0.5초마다 폴링하므로
+        # 언젠가는 맞는다.
+        self.busy = True
         threading.Thread(target=self._run_job, args=(basket, timeout_s),
                          daemon=True).start()
         return self.state()
@@ -221,16 +232,25 @@ class BaseArm:
                 job["message"] = (f"{job['maxAttempts']}회 시도했지만 적재함을 "
                                   f"비우지 못했습니다 ({why})")
 
-            if self._stop == "immediate":
-                # 홈 복귀는 있으면 좋은 것이지 작업 결과를 좌우하는 것이
-                # 아니다. 포장 팔의 홈 자세를 아직 모르므로 go_home 이
-                # NotImplementedError 를 내는데, 그것을 그대로 두면 밖의
-                # except 가 잡아 ABORTED 를 FAILED 로 덮어쓴다.
+            # 작업이 끝나면 팔을 대기 자세로 데려다 놓는다.
+            #
+            # 정책은 멈춘 자리에 그대로 선다. 그 자리가 적재함 위면 탑뷰를
+            # 가려 다음 판정을 방해하고, 사람이 물건을 채워 넣기도 불편하다.
+            #
+            # 홈 복귀는 **있으면 좋은 것이지 작업 결과를 좌우하지 않는다.**
+            # 실패해도 그때까지의 결과(DONE/FAILED/ABORTED)를 덮어쓰지 않는다 —
+            # 운영자가 멈춘 것과 작업이 실패한 것은 관제에게 다른 의미다.
+            if self.home_after or self._stop == "immediate":
                 try:
-                    self.go_home()
+                    r = self.go_home()
+                    logger.info("홈 복귀 완료 (오차 최대 %.2f도)",
+                                r.get("maxErrorDeg", float("nan")))
                 except NotImplementedError as e:
                     job["message"] += f" (홈 복귀 안 함: {e})"
                     logger.warning("홈 복귀를 건너뜁니다: %s", e)
+                except Exception as e:                # noqa: BLE001
+                    job["message"] += f" (홈 복귀 실패: {e})"
+                    logger.warning("홈 복귀 실패: %s", e)
         except Exception as exc:                      # noqa: BLE001
             logger.exception("작업 실패")
             job["state"] = "FAILED"
@@ -321,8 +341,9 @@ class MockArm(BaseArm):
     FAKE_HOME = np.array([4.13, -15.50, 5.54, 27.77, 13.35, 55.43], np.float32)
 
     def __init__(self, fps: int = 30, episode_sec: float = 4.0,
-                 behavior: str = "return-home", trace_dir: str | None = None):
-        super().__init__(fps=fps, trace_dir=trace_dir)
+                 behavior: str = "return-home", trace_dir: str | None = None,
+                 home_after: bool = False):
+        super().__init__(fps=fps, trace_dir=trace_dir, home_after=home_after)
         self.episode_sec = episode_sec
         self.behavior = behavior
         self._t = 0.0
@@ -467,8 +488,9 @@ class PackArm(BaseArm):
                  checkpoint: str | None = None, fps: int = 30,
                  finish: str = "duration", finish_sec: float = 60.0,
                  trace_dir: str | None = None, observe_only: bool = False,
-                 strict_start: bool = False, box_name: str = "upper"):
-        super().__init__(fps=fps, trace_dir=trace_dir)
+                 strict_start: bool = False, box_name: str = "box1",
+                 home_after: bool = False):
+        super().__init__(fps=fps, trace_dir=trace_dir, home_after=home_after)
         self.basket = basket
         self.finish_kind = finish
         self.finish_sec = finish_sec
@@ -741,7 +763,18 @@ class PackArm(BaseArm):
         return None, (f"적재함을 볼 수 없었습니다 (팔이 {last_dark*100:.0f}% 가림)")
 
     def start_pose_check(self) -> dict | None:
-        """지금 팔 자세가 학습 분포 안인지 본다. 팔을 읽기만 한다."""
+        """지금 팔 자세가 학습 분포 안인지 본다.
+
+        ⚠ **작업 중에는 절대 부르면 안 된다.** 모터 버스를 읽는데,
+        Dynamixel 포트 핸들러는 스레드 안전하지 않다. 제어 루프가 30Hz 로
+        Goal_Position 을 쓰는 동안 HTTP 스레드에서 읽으면 이렇게 죽는다:
+
+            Failed to sync write 'Goal_Position' ... [TxRxResult] Port is in use!
+
+        2026-08-21 통합 시험 중 실제로 발생했다. 관제가 is_reachable() 로
+        /health 를 폴링하는 순간 진행 중이던 포장 작업이 통째로 실패했다.
+        부르는 쪽(health)에서 busy 를 확인한다.
+        """
         if self.range is None:
             return None
         obs = self.robot.get_observation()
@@ -785,11 +818,21 @@ class PackArm(BaseArm):
             return f
 
     def go_home(self, seconds: float = 3.0) -> dict:
-        # ⚠ 포장 팔의 홈 자세를 모른다. 픽업 값을 쓰면 안 된다 — 다른 팔이고
-        # 다른 자리다. 알아내기 전까지는 현재 자세를 유지하며 정지만 한다.
-        raise NotImplementedError(
-            "포장 팔의 홈 자세가 아직 확인되지 않았습니다. "
-            "팀원의 rollout 명령줄/스크립트를 받은 뒤 채워야 합니다.")
+        """저장된 홈 자세로 천천히 복귀한다.
+
+        포장 정책은 스스로 홈으로 가지 않으므로 여기서 데려다 놓는다.
+        홈 값이 없으면 NotImplementedError 를 낸다 — **픽업 값으로 대체하지
+        않는다.** 다른 팔이고 다른 자리라 엉뚱한 데로 간다.
+        """
+        from .home import HOME_PATH, interpolate_home, load_home
+
+        home = load_home()
+        if home is None:
+            raise NotImplementedError(
+                f"포장 팔의 홈 자세가 없습니다 ({HOME_PATH}). "
+                "팔을 대기 자세에 두고 `python -m omx_pack.home --capture` "
+                "로 기록하십시오.")
+        return interpolate_home(self.robot, home, seconds=seconds, fps=self.fps)
 
     def health(self) -> dict:
         out = {"success": True, "status": "OK", "message": "",
@@ -797,10 +840,16 @@ class PackArm(BaseArm):
                "busy": bool(self.busy), "basket": self.basket,
                "finishMode": self.finish_kind,
                "observeOnly": bool(self.observe_only)}
-        try:
-            chk = self.start_pose_check()
-        except Exception as exc:                      # noqa: BLE001
-            chk = {"grade": "UNKNOWN", "error": str(exc)}
+        # 작업 중에는 모터 버스를 건드리지 않는다. /health 는 관제가 수시로
+        # 폴링하는 엔드포인트라, 여기서 버스를 읽으면 작업이 깨진다.
+        if self.busy:
+            chk = {"grade": "SKIPPED",
+                   "note": "작업 중에는 자세를 읽지 않습니다 (모터 버스 충돌 방지)"}
+        else:
+            try:
+                chk = self.start_pose_check()
+            except Exception as exc:                  # noqa: BLE001
+                chk = {"grade": "UNKNOWN", "error": str(exc)}
         if chk is not None:
             out["startPose"] = chk
             if chk.get("grade") == OUT:

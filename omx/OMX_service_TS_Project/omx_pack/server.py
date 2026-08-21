@@ -320,6 +320,9 @@ def main() -> None:
     p.add_argument("--robot-id", default="omx_pack_arm")
     p.add_argument("--front", default="/dev/omx_cam_pack_top")
     p.add_argument("--wrist", default="/dev/omx_cam_pack_hand")
+    p.add_argument("--home-after", action="store_true",
+                   help="작업이 끝나면 팔을 대기 자세로 되돌린다. "
+                        "홈 값은 `python -m omx_pack.home --capture` 로 기록")
     p.add_argument("--strict-start", action="store_true",
                    help="시작 자세가 학습 범위 밖이면 /pack 을 400 으로 거절한다. "
                         "기본은 경고만 남기고 진행")
@@ -343,7 +346,7 @@ def main() -> None:
         from .arm import MockArm
 
         arm = MockArm(episode_sec=a.mock_episode_sec, behavior=a.mock_behavior,
-                      trace_dir=a.trace_dir)
+                      trace_dir=a.trace_dir, home_after=a.home_after)
         logger.info("가짜 팔로 시작합니다 — 하드웨어에 연결하지 않습니다 "
                     "(에피소드 %.1f초 · 행동 %s)",
                     a.mock_episode_sec, a.mock_behavior)
@@ -355,7 +358,8 @@ def main() -> None:
                       wrist_device=a.wrist, checkpoint=a.checkpoint,
                       finish=a.finish, finish_sec=a.finish_sec,
                       trace_dir=a.trace_dir, observe_only=a.observe_only,
-                      strict_start=a.strict_start, box_name=a.box)
+                      strict_start=a.strict_start, box_name=a.box,
+                      home_after=a.home_after)
 
     # 기동 직후 자세를 한 번 찍어 준다. 서버를 띄운 사람이 요청을 보내기
     # 전에 보게 하려는 것이다 — 요청 시점의 경고는 로그에 묻히기 쉽다.

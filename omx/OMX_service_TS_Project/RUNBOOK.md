@@ -47,11 +47,19 @@ export YOLO_AUTOINSTALL=false          # 제어 루프 중 pip install 방지
 
 ```bash
 PYTHONPATH=~/il_ws/src ~/venv/pack/bin/python -m omx_pack.server \
-    --basket yellow --strict-start \
+    --basket yellow --strict-start --home-after \
     --robot-port /dev/omx_pack_follower \
     --front /dev/omx_cam_pack_top --wrist /dev/omx_cam_pack_hand \
     --trace-dir ~/il_ws/traces/$(date +%m%d) \
     --finish box-empty --box cart-1 --port 8081
+```
+
+`--home-after` 는 작업이 끝나면 팔을 대기 자세로 되돌린다. 홈 값이 없으면
+경고만 남고 작업 결과는 그대로다. 처음 한 번은 기록해 두어야 한다 —
+**서버를 내린 상태에서** 팔을 원하는 대기 자세에 두고:
+
+```bash
+PYTHONPATH=~/il_ws/src ~/venv/pack/bin/python -m omx_pack.home --capture
 ```
 
 기동 순서는 상관없다. 관제가 먼저 떠 있어도 요청할 때마다 `/health` 를 본다.
@@ -113,6 +121,8 @@ INFO 판정 근거 화면: /home/newuser/il_ws/traces/0821/..._boxview.jpg
 | 서버 기동이 `Missing motor IDs: 11` 로 실패 | 모터 버스 간헐 무응답. 서버가 3회 재시도하지만 그래도 실패하면 팔 전원을 껐다 켠다. 반복되면 베이스 관절 커넥터를 다시 꽂는다 |
 | `POST /pack` 이 400 · "시작 자세가 학습 범위 밖" | `--strict-start` 가 막은 것이다. 팔을 학습 범위 안 자세로 두거나, 데모 중이면 `--strict-start` 없이 띄우고 기동 로그의 자세 표만 확인한다 |
 | `POST /pack` 이 409 · "yellow 바구니 모델을 올려 두었습니다" | 서버는 바구니 하나만 올린다. `cart-2` 를 쓰려면 `--basket mint --box cart-2` 로 다시 띄운다 |
+| 작업 후 팔이 멈춘 자리에 그대로 섬 | 정책은 스스로 홈으로 가지 않는다. `--home-after` 를 주고, 홈 값이 없으면 `omx_pack.home --capture` 로 기록한다 |
+| 서버가 `Port is in use` 로 죽음 | 다른 프로세스가 같은 팔을 잡고 있다. `preflight.py`·`omx_pack.home`·`omx_pack.dist` 는 서버를 내린 뒤에 쓸 것 |
 | 포장이 안 끝나고 90초까지 감 | 적재함을 못 본 것이다. 로그에 `N초째 적재함을 보지 못했습니다` 가 있는지 본다. 팔이 계속 가리고 있으면 ROI 나 가림 기준을 다시 잡아야 한다 |
 | `boxEmpty: null` 로 끝남 | 확인 실패이지 실패가 아니다. `_boxview.jpg` 를 열어 무엇을 보고 그랬는지 확인한다 |
 | 픽업이 매대에서 3초만 대기하고 지나감 | 관제가 Mock 으로 빠진 것이다. `OMX_URL` 과 `/health` 를 확인한다 |
@@ -141,8 +151,10 @@ PYTHONPATH=~/il_ws/src ~/venv/pack/bin/python -m omx_pack.trace ~/il_ws/traces/0
 
 - **팔은 각각 하나씩이다.** 픽업·포장 모두 두 번째 요청은 `409` 다. 다만
   서로 다른 하드웨어라 **동시에 돌 수 있다** — 관제에서 같은 락으로 묶지 말 것.
-- **포장 서버는 바구니 하나만 올린다.** `cart-1`(노랑)과 `cart-2`(민트)를
-  모두 쓰려면 서버를 두 개 띄우거나 재기동해야 한다.
+- **포장 서버는 바구니 하나만 올린다.** `cart-2`(민트)를 쓰려면
+  `--basket mint --box cart-2` 로 **다시 띄워야 한다.** 서버를 두 개 띄우는
+  방법은 쓸 수 없다 — 팔이 하나뿐이라 같은 시리얼 포트를 두 프로세스가
+  열 수 없다.
 - **포장 성공률이 5/9(56%)이고 물건 위치에 민감하다.** `maxAttempts` 재시도가
   이를 흡수하지만, 데모에서는 적재함에 물건을 2~3개만 두는 편이 안전하다.
 - **`POST /home` 은 포장에서 `501` 이다.** 포장 팔의 홈 자세를 아직 측정하지

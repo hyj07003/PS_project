@@ -107,6 +107,16 @@ print(json.dumps(out))
 """
 
 
+def _server_up(port: int) -> bool:
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
+        return True
+    except Exception:                                 # noqa: BLE001
+        return False
+
+
 def check_cameras() -> None:
     print("\n■ 카메라 읽기 (각 4초 워밍업)")
     cams = ["/dev/omx_cam_top", "/dev/omx_cam_hand",
@@ -114,6 +124,16 @@ def check_cameras() -> None:
     live = [c for c in cams if Path(c).exists()]
     if not live:
         record("카메라", FAIL, "장치가 없어 건너뜀")
+        return
+
+    # 서버가 떠 있으면 카메라를 잡고 있어서 여기서는 못 읽는다. 그것을
+    # 고장으로 보고하면 오탐이다 — 실제로 2026-08-21 에 그렇게 나왔다.
+    # 서버가 떠 있는 경우에는 서버의 /health 가 카메라 상태를 대신 말해 준다.
+    busy = [p for p in (8080, 8081) if _server_up(p)]
+    if busy:
+        ports = ", ".join(f":{p}" for p in busy)
+        record("카메라", WARN,
+               f"서버({ports})가 카메라를 잡고 있어 건너뜀 — ■ 서버 항목을 볼 것")
         return
     code, out = run([PACK, "-c", CAM_SNIPPET, *live], timeout=40)
     try:
@@ -173,6 +193,20 @@ def check_arms() -> None:
     live = [p for p in arms if Path(p).exists()]
     if not live:
         record("로봇 팔", FAIL, "장치가 없어 건너뜀")
+        return
+
+    # 서버가 떠 있으면 팔을 건드리지 않는다.
+    #
+    # Dynamixel 포트 핸들러는 스레드/프로세스 안전하지 않다. 서버의 제어
+    # 루프가 30Hz 로 쓰는 동안 여기서 읽으면 서버 쪽이 이렇게 죽는다:
+    #     Failed to sync write 'Goal_Position' ... [TxRxResult] Port is in use!
+    # 2026-08-21 통합 시험 중 실제로 작업 하나가 통째로 실패했다.
+    # 점검하자고 시험을 깨뜨릴 수는 없다.
+    busy = [pt for pt in (8080, 8081) if _server_up(pt)]
+    if busy:
+        ports = ", ".join(f":{p}" for p in busy)
+        record("로봇 팔", WARN,
+               f"서버({ports})가 떠 있어 건너뜀 — 팔을 건드리면 작업이 깨집니다")
         return
     # 모터 버스는 가끔 통째로 응답하지 않는 구간이 있다(2026-08-21 실측:
     # 20회 연속 무응답 후 곧바로 정상 복구). 한 번의 실패로 단정하지 않고

@@ -273,10 +273,20 @@
 테두리를 계속 집으려 든다. 그래서 서버가 탑뷰로 보고 끊는다. 이 판정이
 없으면 `timeoutSec` 까지 돈다.
 
-**④ 서버는 바구니 하나만 올린다.** `cart-1`(노랑)과 `cart-2`(민트)를 모두
-받으려면 서버를 두 개 띄우거나(포트 분리), 요청 사이에 재기동해야 한다.
-체크포인트가 각각 0.28 GB 라 동시 상주 자체는 가능하지만 아직 구현되지
-않았다.
+**④ 서버는 바구니 하나만 올린다.** 기동할 때 `--basket` 으로 지정한 모델
+하나만 올리므로, 다른 바구니 요청은 `409` 다. `cart-2`(민트)를 쓰려면
+**서버를 `--basket mint --box cart-2` 로 다시 띄워야 한다.**
+
+> 서버를 두 개(포트 분리) 띄우는 방법은 **쓸 수 없다.** 포장 팔은 하나뿐이고
+> 두 프로세스가 같은 시리얼 포트를 동시에 열 수 없어 두 번째가 기동조차
+> 하지 못한다. 한 프로세스가 두 체크포인트를 다 올리고 `deviceCode` 로
+> 고르도록 고치는 것이 옳은 해결이고, 아직 구현되지 않았다(체크포인트가
+> 각각 0.28 GB 라 동시 상주 자체는 문제없다).
+
+**⑤ 작업이 끝나도 정책은 홈으로 가지 않는다.** 멈춘 자리에 그대로 선다.
+서버에 `--home-after` 를 주면 작업 후 대기 자세로 데려다 놓는다. 홈 값은
+`python -m omx_pack.home --capture` 로 한 번 기록해 두면 된다. 팔이 적재함
+위에 서 있으면 탑뷰를 가려 다음 판정이 늦어진다.
 
 ---
 
@@ -311,7 +321,7 @@ PYTHONPATH=~/il_ws/src ~/venv/pack/bin/python -m omx_pack.server \
 
 ```bash
 PYTHONPATH=~/il_ws/src ~/venv/pack/bin/python -m omx_pack.server \
-    --basket yellow --strict-start \
+    --basket yellow --strict-start --home-after \
     --robot-port /dev/omx_pack_follower \
     --front /dev/omx_cam_pack_top --wrist /dev/omx_cam_pack_hand \
     --finish box-empty --box cart-1 --port 8081
