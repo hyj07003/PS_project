@@ -540,6 +540,15 @@ def run_aruco_dock(
     )
     approach_v_max = min(0.05, abs(_env_float("PINKY_ARUCO_APPROACH_V", 0.035)))
     approach_gain = max(0.05, _env_float("PINKY_ARUCO_APPROACH_GAIN", 0.30))
+    # APPROACH 중에는 FACE 진입 전보다 느슨하게 — 1× tol 흔들림으로 stop↔접근 반복 방지
+    approach_center_abort_px = max(
+        center_tol * 1.8,
+        _env_float("PINKY_ARUCO_APPROACH_CENTER_ABORT_PX", center_tol * 2.2),
+    )
+    standoff_arrive_grace_sec = max(
+        0.5,
+        _env_float("PINKY_ARUCO_STANDOFF_ARRIVE_GRACE_SEC", 2.5),
+    )
     marker_len = _env_float("PINKY_ARUCO_MARKER_LENGTH_M", 0.037)
     width = _env_int("PINKY_CAMERA_WIDTH", 640)
     height = _env_int("PINKY_CAMERA_HEIGHT", 480)
@@ -661,6 +670,8 @@ def run_aruco_dock(
     pose_ready_before_approach = False
     us_last: float | None = None
     pre_approach_marker_m: float | None = None
+    # z≤standoff 인데 자세 미달로 ARRIVED 못 할 때 경과 시각
+    standoff_pose_fail_since: float | None = None
 
     def _capture_pre_approach_range(*, force: bool = False) -> None:
         """접근 시작 직전 마커(또는 초음파) 거리를 한 번만 저장. 후진 목표 range로 쓴다."""
@@ -1120,13 +1131,16 @@ def run_aruco_dock(
                     }
 
                 # 가깝더라도 정자세 미달이면 FACE/SHIFT 우선 (거리 도착보다 자세 우선)
-                need_pose_first = (not center_ok) or (
-                    not lat_ready and not shift_stop_further and phase != "APPROACH"
-                )
-                # APPROACH 중에는 중앙이 크게 벗어날 때만 FACE 복귀 (close_zone 으로 전진 금지 방지)
+                # APPROACH 중에는 중앙·횡이 크게 어긋날 때만 중단 (미세 흔들림으로 stop 반복 금지)
+                if phase == "APPROACH":
+                    need_pose_first = abs(center_err) > approach_center_abort_px
+                else:
+                    need_pose_first = (not center_ok) or (
+                        not lat_ready and not shift_stop_further
+                    )
                 approach_recenter = (
                     phase == "APPROACH"
-                    and abs(center_err) > center_tol * 2.0
+                    and abs(center_err) > approach_center_abort_px
                 )
 
                 # FACE: center marker in frame first (yaw soft). Force progress after face_max_sec.
@@ -1218,48 +1232,82 @@ def run_aruco_dock(
                 if lat_ready and not shift_stop_further:
                     shift_iters = 0
                     shift_tx_before = None
-                # 접근 중에도 자세 깨지면 전진 중단 → FACE
-                if not center_ok or (
+                # 접근 중: 큰 편차만 FACE 복귀 (1× center_tol 흔들림으로는 전진 유지)
+                approach_center_bad = abs(center_err) > approach_center_abort_px
+                approach_lat_bad = (
                     not lat_ready
                     and not shift_stop_further
-                    and abs(tx) > lateral_reenter
-                ):
+                    and abs(tx) > max(lateral_reenter, lateral_tol * 2.0)
+                )
+                if approach_center_bad or approach_lat_bad:
+                    stop()
+                    phase = "FACE"
+                    face_started_at = time.time()
+                    settle_ok = 0
+                    # standoff 밖에서의 재정렬만 grace 리셋 (도착권에서 FACE↔APPROACH 정체 허용)
+                    if z > standoff * 1.05:
+                        standoff_pose_fail_since = None
+                    _report("FACE", force=True)
+                    continue
+                v_cmd = _approach_speed(z)
+                if v_cmd <= 0.0:
+                    # standoff 도달 — 자세 OK면 ARRIVED, 아니면 잠시 정렬 후 강제 완료
+                    arrive_pose = _arrive_pose_ok(
+                        center_ok=center_ok,
+                        lat_ready=lat_ready or shift_stop_further,
+                        yaw_ready=yaw_ready,
+                        err_x=center_err,
+                    )
+                    if arrive_pose:
+                        standoff_pose_fail_since = None
+                        stop()
+                        _report("ARRIVED", force=True)
+                        return {
+                            "success": True,
+                            "status": "ARRIVED",
+                            "message": "aruco dock at standoff",
+                            "markerId": int(marker_id),
+                            "distanceM": z,
+                            "centerErrorPx": center_err,
+                            "lateralM": tx,
+                            "yawErrRad": yaw_err,
+                            "phase": "ARRIVED",
+                            "phaseLabel": phase_label_ko("ARRIVED"),
+                            "approachTravelM": _undock_distance_m(),
+                        }
+                    now_t = time.time()
+                    if standoff_pose_fail_since is None:
+                        standoff_pose_fail_since = now_t
+                    elif (now_t - standoff_pose_fail_since) >= standoff_arrive_grace_sec:
+                        # 거리상 도착인데 자세만 안 맞아 정체 → best-effort ARRIVED
+                        standoff_pose_fail_since = None
+                        stop()
+                        _report("ARRIVED", force=True)
+                        if release_hold is None:
+                            _rehold()
+                        return {
+                            "success": True,
+                            "status": "ARRIVED",
+                            "message": (
+                                "aruco dock at standoff "
+                                "(pose grace timeout)"
+                            ),
+                            "markerId": int(marker_id),
+                            "distanceM": z,
+                            "centerErrorPx": center_err,
+                            "lateralM": tx,
+                            "yawErrRad": yaw_err,
+                            "phase": "ARRIVED",
+                            "phaseLabel": phase_label_ko("ARRIVED"),
+                            "approachTravelM": _undock_distance_m(),
+                        }
                     stop()
                     phase = "FACE"
                     face_started_at = time.time()
                     settle_ok = 0
                     _report("FACE", force=True)
                     continue
-                v_cmd = _approach_speed(z)
-                if v_cmd <= 0.0:
-                    # standoff 도달 — 자세 재확인 후에만 ARRIVED
-                    if not _arrive_pose_ok(
-                        center_ok=center_ok,
-                        lat_ready=lat_ready or shift_stop_further,
-                        yaw_ready=yaw_ready,
-                        err_x=center_err,
-                    ):
-                        stop()
-                        phase = "FACE"
-                        face_started_at = time.time()
-                        settle_ok = 0
-                        _report("FACE", force=True)
-                        continue
-                    stop()
-                    _report("ARRIVED", force=True)
-                    return {
-                        "success": True,
-                        "status": "ARRIVED",
-                        "message": "aruco dock at standoff",
-                        "markerId": int(marker_id),
-                        "distanceM": z,
-                        "centerErrorPx": center_err,
-                        "lateralM": tx,
-                        "yawErrRad": yaw_err,
-                        "phase": "ARRIVED",
-                        "phaseLabel": phase_label_ko("ARRIVED"),
-                        "approachTravelM": _undock_distance_m(),
-                    }
+                standoff_pose_fail_since = None
                 # 접근 중 횡오차 커지면 다시 micro-SHIFT (한도·오버슈트 가드 내)
                 if (
                     not shift_stop_further

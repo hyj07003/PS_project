@@ -298,6 +298,11 @@ class OrdersService:
                             + " | ".join(errors),
                             flush=True,
                         )
+                    else:
+                        try:
+                            self.cart_port.set_lcd(code, "pinky_charging")
+                        except Exception:
+                            pass
                 finally:
                     self.traffic.release_return_home(code)
             finally:
@@ -698,6 +703,26 @@ class OrdersService:
             )
         self.conn.commit()
 
+    def _set_lcd(self, device_code: str, emotion: str) -> None:
+        """Pinky LCD GIF via /actuators/lcd (pinky_emotion). Best-effort."""
+        setter = getattr(self.cart_port, "set_lcd", None)
+        if not callable(setter):
+            print(f"[lcd] {device_code} set_lcd unavailable", flush=True)
+            return
+        try:
+            result = setter(device_code, emotion) or {}
+        except Exception as exc:
+            print(f"[lcd] {device_code} {emotion} exception: {exc}", flush=True)
+            return
+        if not result.get("success", False):
+            print(
+                f"[lcd] {device_code} {emotion} failed: "
+                f"{result.get('message') or result}",
+                flush=True,
+            )
+        else:
+            print(f"[lcd] {device_code} -> {emotion}", flush=True)
+
     def _nav_or_fail(
         self,
         device_code: str,
@@ -740,6 +765,8 @@ class OrdersService:
                 except TrafficTimeoutError:
                     self._ensure_not_aborted(mission_id)
                     raise
+        # 주행 중 LCD
+        self._set_lcd(device_code, "pinky_moving")
         try:
             for attempt in range(1, attempts + 1):
                 if mission_id is not None:
@@ -884,6 +911,7 @@ class OrdersService:
                 continue
             now = time.monotonic()
             if self._near_device_home(device_code):
+                self._set_lcd(device_code, "pinky_charging")
                 self._set_waypoint(
                     mission_id,
                     home.id,
@@ -1504,6 +1532,7 @@ class OrdersService:
             )
             return
 
+        self._set_lcd(device_code, "pinky_payment")
         self._acquire_omx_pack(mission_id)
         try:
             self._ensure_not_aborted(mission_id)
@@ -1556,6 +1585,7 @@ class OrdersService:
         waypoint_id: str = "C",
     ) -> None:
         """C: ArUco dock → 계산대 OMX /pack → undock."""
+        self._set_lcd(device_code, "pinky_payment")
         travel, final_range = self._aruco_dock_or_fail(
             device_code, waypoint_id, mission_id
         )
@@ -1597,6 +1627,7 @@ class OrdersService:
             return
 
         timeout = float(os.environ.get("OMX_PICK_TIMEOUT_SEC", "90"))
+        self._set_lcd(device_code, "pinky_loading")
         self._acquire_omx_arm(mission_id)
         try:
             for slug, qty in picks:
@@ -1839,6 +1870,7 @@ class OrdersService:
                     )
                     if result == "ARRIVED":
                         self._dwell_at(device_code, mission_id, home.id)
+                        self._set_lcd(device_code, "pinky_charging")
                         return True
                     detail = (
                         getattr(self.cart_port, "last_nav_error", None) or result
@@ -1896,9 +1928,11 @@ class OrdersService:
             finally:
                 self.traffic.release_return_home(device_code)
             self._dwell_at(device_code, mission_id, home.id)
+            self._set_lcd(device_code, "pinky_charging")
             return True
         except Exception:
             raise
+
     def _release_device(self, mission_id: int) -> None:
         mission = self.conn.execute(
             "SELECT device_id FROM missions WHERE id = ?",
@@ -2064,6 +2098,7 @@ class OrdersService:
             self.traffic.update_remaining(device_code, remaining)
 
             self._set_status(order_id, mission_id, "PICKING", note="pick tour start")
+            self._set_lcd(device_code, "pinky_charging")
 
             pending = list(tour)
             deferred_once: set[str] = set()

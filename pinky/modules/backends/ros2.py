@@ -19,6 +19,11 @@ EMOTIONS = (
     "happy",
     "interest",
     "sad",
+    # SmartShop mission LCD GIFs (pinky_emotion/emotion/*.gif)
+    "pinky_charging",
+    "pinky_payment",
+    "pinky_moving",
+    "pinky_loading",
 )
 
 
@@ -2854,15 +2859,33 @@ class Ros2Backend(RobotBackend):
         return self._call_service(self._set_brightness_cli, req)
 
     def set_emotion(self, emotion: str) -> dict[str, Any]:
-        if emotion not in EMOTIONS:
-            return {"success": False, "message": f"unknown emotion; use one of {EMOTIONS}"}
+        emo = str(emotion or "").strip()
+        if not emo:
+            return {"success": False, "message": "empty emotion"}
+        # EMOTIONS is the documented list; still forward unknown names so newly
+        # installed GIFs work before pinky whitelist is redeployed.
         if self._set_emotion_cli is None:
             return {"success": False, "message": "set_emotion client unavailable"}
         from pinky_interfaces.srv import Emotion
 
         req = Emotion.Request()
-        req.emotion = emotion
-        return self._call_service(self._set_emotion_cli, req)
+        req.emotion = emo
+        result = self._call_service(self._set_emotion_cli, req, timeout=3.0)
+        msg = str(result.get("message") or "")
+        low = msg.lower()
+        if (
+            "wrong" in low
+            or "not found" in low
+            or "not cached" in low
+            or "unknown" in low
+        ):
+            result = {**result, "success": False}
+        elif emo not in EMOTIONS and result.get("success"):
+            # Accepted by ROS but not yet listed locally — still OK.
+            result = {**result, "emotion": emo}
+        else:
+            result = {**result, "emotion": emo}
+        return result
 
     @staticmethod
     def _angle_error(current: float, reference: float) -> float:

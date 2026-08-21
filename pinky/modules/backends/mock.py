@@ -17,6 +17,10 @@ EMOTIONS = (
     "happy",
     "interest",
     "sad",
+    "pinky_charging",
+    "pinky_payment",
+    "pinky_moving",
+    "pinky_loading",
 )
 
 
@@ -133,12 +137,18 @@ class MockBackend(RobotBackend):
         return {"success": True, "message": "mock brightness ok", "brightness": self._brightness}
 
     def set_emotion(self, emotion: str) -> dict[str, Any]:
-        if emotion not in EMOTIONS:
+        emo = str(emotion or "").strip()
+        if not emo:
+            return {"success": False, "message": "empty emotion"}
+        if emo not in EMOTIONS:
+            # Mirror ROS: allow newly added GIF names in mock for controller tests.
+            self._emotion = emo
             return {
-                "success": False,
-                "message": f"unknown emotion; use one of {EMOTIONS}",
+                "success": True,
+                "message": f"mock emotion ok (unlisted {emo})",
+                "emotion": self._emotion,
             }
-        self._emotion = emotion
+        self._emotion = emo
         return {"success": True, "message": "mock emotion ok", "emotion": self._emotion}
 
     def drive(self, linear_x: float, angular_z: float) -> dict[str, Any]:

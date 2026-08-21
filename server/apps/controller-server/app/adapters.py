@@ -161,6 +161,12 @@ class MockCartAdapter:
         del device_code, freeze
         return {"success": True, "message": "mock stop"}
 
+    def set_lcd(
+        self, device_code: str, emotion: str
+    ) -> dict[str, Any]:
+        del device_code
+        return {"success": True, "emotion": emotion, "message": "mock lcd"}
+
     def aruco_dock(
         self,
         device_code: str,
@@ -736,6 +742,19 @@ class PinkyHttpCartAdapter:
                 device_code,
                 "/nav/stop",
                 {"freeze": bool(freeze)},
+                timeout=5.0,
+                accept_http_error=True,
+            )
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}
+
+    def set_lcd(self, device_code: str, emotion: str) -> dict[str, Any]:
+        """POST /actuators/lcd — pinky_emotion set_emotion (GIF name)."""
+        try:
+            return self._post(
+                device_code,
+                "/actuators/lcd",
+                {"emotion": str(emotion)},
                 timeout=5.0,
                 accept_http_error=True,
             )
