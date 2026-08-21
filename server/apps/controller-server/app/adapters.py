@@ -302,6 +302,17 @@ class OmxHttpStationAdapter:
             logger.debug("OMX unreachable at %s: %s", self.url, exc)
             return False
 
+    def is_server_reachable(self) -> bool:
+        """True if OMX HTTP /health responds (robotConnected not required)."""
+        if not self.url:
+            return False
+        try:
+            health = self._get("/health", timeout=min(3.0, self.connect_timeout))
+            return isinstance(health, dict)
+        except Exception as exc:
+            logger.debug("OMX server unreachable at %s: %s", self.url, exc)
+            return False
+
     def supported_slugs(self) -> list[str]:
         try:
             return list(self._get("/products", timeout=3.0).get("slugs") or [])

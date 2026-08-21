@@ -29,13 +29,26 @@ from ..waypoints import (
     home_for_device,
     shelf_undock_after_aruco,
     shelf_undock_distance_m,
+    shelf_undock_odom_travel_m,
     staging_waypoint_id,
     waypoint_ids_for_slugs,
 )
 from .carts import CartsService
-from .traffic import NavGoal, TrafficCoordinator, TrafficTimeoutError
+from .traffic import (
+    NavGoal,
+    TrafficCoordinator,
+    TrafficEmergencyWaitError,
+    TrafficTimeoutError,
+    TrafficYieldError,
+)
 
 _dispatch_lock = threading.Lock()
+
+
+class MissionYielded(Exception):
+    """Mission re-queued so another order can use this cart; not a hard failure."""
+
+    pass
 
 ACTIVE_STATUSES = ("ASSIGNED", "PICKING", "CHECKOUT", "PACKING", "RETURNING")
 # 대기장소(S1/S2) 복귀 시 강제 헤딩 — map +x (오른쪽)
@@ -106,7 +119,7 @@ class OrdersService:
         else:
             self.station_port = MockStationAdapter()
         self.ai_port = MockAiAdapter()
-        self._dwell_sec = float(os.environ.get("PICK_DWELL_SEC", "3"))
+        self._dwell_sec = float(os.environ.get("PICK_DWELL_SEC", "0"))
         self._nav_timeout = float(os.environ.get("PICK_NAV_TIMEOUT_SEC", "180"))
         self._mission_timeout = float(os.environ.get("TRAFFIC_MISSION_TIMEOUT", "300"))
         self._aborted_missions: set[int] = set()
@@ -530,7 +543,7 @@ class OrdersService:
                     SELECT m.id, m.order_id
                     FROM missions m
                     WHERE m.status IN ('QUEUED', 'CREATED') AND m.device_id IS NULL
-                    ORDER BY m.id ASC
+                    ORDER BY COALESCE(m.yield_count, 0) ASC, m.id ASC
                     LIMIT 1
                     """
                 ).fetchone()
@@ -573,6 +586,11 @@ class OrdersService:
                 )
                 self.conn.commit()
                 self._set_status(order_id, mission_id, "ASSIGNED", note="dispatched")
+                # FIFO home-depart uses this timestamp — set before tour thread races.
+                try:
+                    self.traffic.register_mission(device_code, mission_id)
+                except Exception:
+                    pass
 
                 threading.Thread(
                     target=self._run_pick_tour,
@@ -689,21 +707,55 @@ class OrdersService:
         leg_goal = NavGoal(float(x), float(y), float(yaw))
         if mission_id is not None:
             self._ensure_not_aborted(mission_id)
-            try:
-                self.traffic.acquire_nav_leg(
-                    device_code,
-                    leg_goal,
-                    mission_id,
-                    waypoint_id,
-                    skip_traffic_wait=skip_traffic_wait,
-                )
-            except TrafficTimeoutError:
-                self._ensure_not_aborted(mission_id)
-                raise
+            # Emergency (비상대기→W7) may interrupt acquire; retry after clear.
+            while True:
+                try:
+                    self.traffic.acquire_nav_leg(
+                        device_code,
+                        leg_goal,
+                        mission_id,
+                        waypoint_id,
+                        skip_traffic_wait=skip_traffic_wait,
+                    )
+                    break
+                except TrafficEmergencyWaitError:
+                    self._emergency_wait_on_peer_path(
+                        device_code,
+                        mission_id,
+                        waypoint_id=waypoint_id,
+                    )
+                    self.traffic.clear_stale_emergency_wait(device_code)
+                    self._ensure_not_aborted(mission_id)
+                except TrafficTimeoutError:
+                    self._ensure_not_aborted(mission_id)
+                    raise
         try:
             for attempt in range(1, attempts + 1):
                 if mission_id is not None:
                     self._ensure_not_aborted(mission_id)
+                # Stale emergency_wait flag must not block after paths diverge.
+                self.traffic.clear_stale_emergency_wait(device_code)
+                # Only hold when *currently* on a peer's remaining NAV path.
+                if self.traffic.is_on_peer_active_path(device_code):
+                    self._emergency_wait_on_peer_path(
+                        device_code,
+                        mission_id,
+                        waypoint_id=waypoint_id,
+                    )
+                    self.traffic.clear_stale_emergency_wait(device_code)
+                    if self.traffic.is_on_peer_active_path(device_code):
+                        errors.append(f"try{attempt}:emergency_hold")
+                        if attempt < attempts:
+                            continue
+                        # Last attempt: do not hard-fail — release traffic and
+                        # let outer tour handle timeout; try navigate anyway.
+                        if mission_id is not None:
+                            self._mission_note(
+                                mission_id,
+                                f"emergency hold exhausted at {waypoint_id}; "
+                                "clearing flag and retrying nav",
+                            )
+                        self.traffic.clear_stale_emergency_wait(device_code)
                 result = self.cart_port.navigate_pose(
                     device_code,
                     x,
@@ -725,21 +777,21 @@ class OrdersService:
                         f"nav retry {waypoint_id} {attempt}/{attempts}: {detail}",
                     )
                 if attempt < attempts:
-                    if allow_retreat and _nav_error_needs_retreat(detail):
-                        # Peer path overlap: stay put (emergency wait) instead of
-                        # reversing to dodge. W7 staging is unchanged elsewhere.
-                        if self.traffic.is_on_peer_active_path(device_code):
-                            self._emergency_wait_on_peer_path(
-                                device_code,
-                                mission_id,
-                                waypoint_id=waypoint_id,
-                            )
-                        else:
-                            self._retreat_from_obstacle(
-                                device_code,
-                                mission_id,
-                                waypoint_id=waypoint_id,
-                            )
+                    self.traffic.clear_stale_emergency_wait(device_code)
+                    # Peer path only: hold still. Never use stale emergency flag.
+                    if self.traffic.is_on_peer_active_path(device_code):
+                        self._emergency_wait_on_peer_path(
+                            device_code,
+                            mission_id,
+                            waypoint_id=waypoint_id,
+                        )
+                        self.traffic.clear_stale_emergency_wait(device_code)
+                    elif allow_retreat and _nav_error_needs_retreat(detail):
+                        self._retreat_from_obstacle(
+                            device_code,
+                            mission_id,
+                            waypoint_id=waypoint_id,
+                        )
                     time.sleep(0.4)
                     continue
                 raise RuntimeError(
@@ -784,7 +836,9 @@ class OrdersService:
         """Wait until target shelf zone is free.
 
         Still at S1/S2: stay put (no W7 hop — avoids spin/backup at home).
-        Already out on the floor: stage at W7, then poll for access.
+        Emergency (on peer path): 비상대기 at W7 only — never stack with 충돌/매대 대기.
+        Already out on the floor (zone occupied): stage at W7 as 매대 대기.
+        Soft timeout → TrafficYieldError so peer orders / other shelves proceed.
         """
         if self.traffic.waypoint_access_granted(device_code, waypoint_id):
             return
@@ -794,32 +848,54 @@ class OrdersService:
         poll_sec = float(os.environ.get("TRAFFIC_STAGING_POLL_SEC", "2.0"))
         note_interval = max(5.0, poll_sec * 3)
         last_note = 0.0
+        zone_yield = float(
+            os.environ.get(
+                "TRAFFIC_ZONE_YIELD_SEC",
+                os.environ.get("TRAFFIC_YIELD_SEC", "60"),
+            )
+        )
+        deadline = time.monotonic() + max(5.0, zone_yield)
         while not self.traffic.waypoint_access_granted(device_code, waypoint_id):
             self._ensure_not_aborted(mission_id)
+            if time.monotonic() >= deadline:
+                raise TrafficYieldError(
+                    f"zone yield for {device_code} at {waypoint_id} "
+                    f"after {zone_yield:.0f}s"
+                )
+            # 비상대기 우선: 피어 경로 위면 W7 비상대기만 (충돌/매대 대기와 동시 X).
+            if self.traffic.is_on_peer_active_path(device_code):
+                self._emergency_wait_on_peer_path(
+                    device_code,
+                    mission_id,
+                    waypoint_id=waypoint_id,
+                )
+                self.traffic.clear_stale_emergency_wait(device_code)
+                continue
             now = time.monotonic()
             if self._near_device_home(device_code):
                 self._set_waypoint(
                     mission_id,
                     home.id,
-                    label_suffix="충돌 대기",
+                    label_suffix="매대 대기",
                 )
                 if now - last_note >= note_interval:
                     self._mission_note(
                         mission_id,
-                        f"staging at home {home.id} for {waypoint_id}",
+                        f"zone wait at home {home.id} for {waypoint_id} "
+                        f"(peer occupies or P return)",
                     )
                     last_note = now
             else:
                 self._set_waypoint(
                     mission_id,
                     staging_id,
-                    label_suffix="충돌 대기",
+                    label_suffix="매대 대기",
                 )
                 if not self._near_waypoint(device_code, staging_id):
                     if now - last_note >= note_interval:
                         self._mission_note(
                             mission_id,
-                            f"nav staging {staging_id} for {waypoint_id}",
+                            f"nav staging {staging_id} for zone {waypoint_id}",
                         )
                         last_note = now
                     self._nav_or_fail(
@@ -830,16 +906,23 @@ class OrdersService:
                         staging_id,
                         require_yaw=False,
                         mission_id=mission_id,
-                        allow_retreat=True,
+                        allow_retreat=not self._recovery_suppressed(device_code),
                         skip_traffic_wait=True,
                     )
                 elif now - last_note >= note_interval:
                     self._mission_note(
                         mission_id,
-                        f"staging at {staging_id} for {waypoint_id}",
+                        f"staging at {staging_id} for zone {waypoint_id}",
                     )
                     last_note = now
-            self.traffic.acquire_waypoint_access(device_code, waypoint_id)
+            try:
+                self.traffic.acquire_waypoint_access(
+                    device_code,
+                    waypoint_id,
+                    timeout_sec=min(poll_sec, max(0.5, deadline - time.monotonic())),
+                )
+            except TrafficTimeoutError:
+                pass
             time.sleep(max(0.2, poll_sec))
 
     def _acquire_waypoint_zone(
@@ -863,10 +946,10 @@ class OrdersService:
         device_code: str,
         waypoint_id: str,
         mission_id: int | None = None,
-    ) -> float:
+    ) -> tuple[float, float | None]:
         marker_id = aruco_marker_id_for_waypoint(waypoint_id)
         if marker_id is None:
-            return 0.0
+            return 0.0, None
         standoff = aruco_standoff_for_waypoint(waypoint_id)
         timeout = float(os.environ.get("ARUCO_DOCK_TIMEOUT_SEC", "60"))
         attempts = max(1, int(os.environ.get("PICK_ARUCO_RETRIES", "2")))
@@ -890,7 +973,7 @@ class OrdersService:
                 self._ensure_not_aborted(mission_id)
             dock = getattr(self.cart_port, "aruco_dock", None)
             if not callable(dock):
-                return 0.0
+                return 0.0, None
 
             if mission_id is not None:
                 self._set_waypoint(
@@ -953,9 +1036,11 @@ class OrdersService:
                 dist = result.get("distanceM")
                 approach_travel = result.get("approachTravelM")
                 note = f"aruco dock {waypoint_id} ok"
+                final_m: float | None = None
                 if dist is not None:
                     try:
-                        note += f" distance={float(dist):.3f}"
+                        final_m = float(dist)
+                        note += f" distance={final_m:.3f}"
                     except (TypeError, ValueError):
                         pass
                 if approach_travel is not None:
@@ -978,7 +1063,7 @@ class OrdersService:
                     )
                 except (TypeError, ValueError):
                     travel = 0.0
-                return max(0.0, travel)
+                return max(0.0, travel), final_m
             last_detail = (
                 getattr(self.cart_port, "last_aruco_error", None)
                 or result.get("message")
@@ -1011,6 +1096,7 @@ class OrdersService:
             raise RuntimeError(
                 f"aruco dock failed at {waypoint_id} after {attempts} tries: {last_detail}"
             )
+        return 0.0, None
 
     def _undock_after_shelf_aruco(
         self,
@@ -1018,8 +1104,10 @@ class OrdersService:
         waypoint_id: str,
         approach_travel_m: float,
         mission_id: int | None = None,
+        *,
+        final_range_m: float | None = None,
     ) -> None:
-        """도킹 대기 후 후진. 측정 거리가 접근 직전 마커 거리에 도달하면 정지."""
+        """도킹 대기 후 후진. 측정 range가 접근 직전 값에 도달하거나 odom 예산 소진 시 정지."""
         if not shelf_undock_after_aruco(waypoint_id):
             return
         target = shelf_undock_distance_m(waypoint_id, approach_travel_m)
@@ -1027,7 +1115,13 @@ class OrdersService:
         if target < min_m:
             return
         speed = float(os.environ.get("PICK_SHELF_UNDOCK_SPEED_MPS", "0.02"))
+        odom_budget = shelf_undock_odom_travel_m(
+            waypoint_id,
+            approach_travel_m,
+            final_range_m=final_range_m,
+        )
         max_travel = float(os.environ.get("PICK_SHELF_UNDOCK_MAX_M", "0.80"))
+        odom_budget = max(min_m, min(odom_budget, max_travel))
         marker_id = aruco_marker_id_for_waypoint(waypoint_id)
         timeout = float(os.environ.get("PINKY_ARUCO_UNDOCK_TIMEOUT_SEC", "30"))
 
@@ -1039,7 +1133,8 @@ class OrdersService:
             )
             self._mission_note(
                 mission_id,
-                f"undock {waypoint_id} until range={target:.3f}m",
+                f"undock {waypoint_id} until range={target:.3f}m "
+                f"odomCap={odom_budget:.3f}m",
             )
 
         undock_fn = getattr(self.cart_port, "aruco_undock", None)
@@ -1052,7 +1147,7 @@ class OrdersService:
                 target_range_m=target,
                 timeout_sec=timeout,
                 speed_mps=speed,
-                max_travel_m=max_travel,
+                max_travel_m=odom_budget,
             )
             if mission_id is not None:
                 self._mission_note(
@@ -1061,6 +1156,7 @@ class OrdersService:
                     f"ok={bool(result.get('success'))} "
                     f"range={result.get('distanceM')} "
                     f"moved={result.get('movedM')} "
+                    f"cap={result.get('maxTravelM')} "
                     f"{result.get('message') or ''}".strip(),
                 )
                 suffix = "후진 완료" if result.get("success") else "후진 부분"
@@ -1074,17 +1170,24 @@ class OrdersService:
         if mission_id is not None:
             self._mission_note(
                 mission_id,
-                f"undock {waypoint_id} fallback odom back {target:.3f}m",
+                f"undock {waypoint_id} fallback odom back {odom_budget:.3f}m",
             )
         step_max = float(os.environ.get("PICK_SHELF_UNDOCK_STEP_M", "0.20"))
-        remaining = target
+        remaining = odom_budget
         moved_sum = 0.0
-        max_steps = max(4, int(math.ceil(target / max(step_max, 0.05))) + 3)
+        max_steps = max(4, int(math.ceil(odom_budget / max(step_max, 0.05))) + 3)
         steps = 0
         while remaining > min_m and steps < max_steps:
             steps += 1
             if mission_id is not None:
                 self._ensure_not_aborted(mission_id)
+            if self._recovery_suppressed(device_code):
+                if mission_id is not None:
+                    self._mission_note(
+                        mission_id,
+                        f"undock {waypoint_id} aborted: emergency wait (no reverse)",
+                    )
+                break
             step = min(remaining, step_max)
             step_timeout = max(2.5, step / max(speed, 0.01) + 2.0)
             result = rel(
@@ -1107,7 +1210,7 @@ class OrdersService:
             except (TypeError, ValueError):
                 moved = step if result.get("success") else 0.0
             moved_sum += moved
-            remaining = max(0.0, target - moved_sum)
+            remaining = max(0.0, odom_budget - moved_sum)
             if not result.get("success") and moved < min_m:
                 break
             if moved < min_m:
@@ -1119,6 +1222,14 @@ class OrdersService:
             )
             self._set_waypoint(mission_id, waypoint_id, label_suffix="후진 완료")
 
+    def _recovery_suppressed(self, device_code: str) -> bool:
+        """True only while pose is on a peer's remaining NAVIGATING path.
+
+        Do not use last_wait_reason — emergency_wait flags were sticky and froze
+        carts after paths no longer overlapped, ending in mission failure.
+        """
+        return self.traffic.is_on_peer_active_path(device_code)
+
     def _emergency_wait_on_peer_path(
         self,
         device_code: str,
@@ -1126,20 +1237,103 @@ class OrdersService:
         *,
         waypoint_id: str | None = None,
     ) -> None:
-        """Stop in place when sitting on another robot's path (no reverse dodge)."""
-        try:
-            self.cart_port.stop_nav(device_code)
-        except Exception:
-            pass
-        wait_sec = float(os.environ.get("TRAFFIC_EMERGENCY_WAIT_SEC", "2.0"))
+        """비상대기: 피어 주행 경로 위면 W7로 회피 후 대기. 충돌/매대 대기와 병행하지 않음."""
+        poll_sec = float(os.environ.get("TRAFFIC_EMERGENCY_WAIT_SEC", "2.0"))
+        max_sec = float(os.environ.get("TRAFFIC_EMERGENCY_WAIT_MAX_SEC", "45"))
+        deadline = time.monotonic() + max(poll_sec, max_sec)
         wid = (waypoint_id or "").strip().upper() or "?"
+        staging_id = staging_waypoint_id()
+        staging = get_waypoint(staging_id)
+
         if mission_id is not None:
             self._mission_note(
                 mission_id,
-                f"emergency wait on peer path at {wid} ({wait_sec:.1f}s)",
+                f"emergency wait → {staging_id} (비상대기) for {wid}",
             )
-            self._set_waypoint(mission_id, wid, label_suffix="비상대기")
-        time.sleep(max(0.5, wait_sec))
+            self._set_waypoint(mission_id, staging_id, label_suffix="비상대기")
+
+        # Home pad: stay put (W7 hop from S1/S2 causes REJECT storms).
+        if self._near_device_home(device_code):
+            while time.monotonic() < deadline:
+                if mission_id is not None:
+                    try:
+                        self._ensure_not_aborted(mission_id)
+                    except Exception:
+                        break
+                try:
+                    self.cart_port.stop_nav(device_code, freeze=False)
+                except TypeError:
+                    try:
+                        self.cart_port.stop_nav(device_code)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                if not self.traffic.is_on_peer_active_path(device_code):
+                    break
+                time.sleep(max(0.5, poll_sec))
+            self.traffic.clear_stale_emergency_wait(device_code)
+            return
+
+        # Floor: move to W7 once, then hold until peer path clears.
+        # Use navigate_pose directly — _nav_or_fail would re-enter emergency wait.
+        if not self._near_waypoint(device_code, staging_id):
+            try:
+                self.cart_port.stop_nav(device_code, freeze=False)
+            except TypeError:
+                try:
+                    self.cart_port.stop_nav(device_code)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                result = self.cart_port.navigate_pose(
+                    device_code,
+                    staging.x,
+                    staging.y,
+                    staging.yaw,
+                    timeout_sec=min(
+                        60.0,
+                        float(os.environ.get("TRAFFIC_EMERGENCY_W7_NAV_SEC", "45")),
+                    ),
+                    require_yaw=False,
+                )
+                if mission_id is not None and result != "ARRIVED":
+                    detail = (
+                        getattr(self.cart_port, "last_nav_error", None) or result
+                    )
+                    self._mission_note(
+                        mission_id,
+                        f"emergency W7 nav incomplete: {detail}; hold at best effort",
+                    )
+            except Exception as exc:
+                if mission_id is not None:
+                    self._mission_note(
+                        mission_id,
+                        f"emergency W7 nav failed: {_short_error(exc)}; hold still",
+                    )
+
+        while time.monotonic() < deadline:
+            if mission_id is not None:
+                try:
+                    self._ensure_not_aborted(mission_id)
+                except Exception:
+                    break
+                self._set_waypoint(mission_id, staging_id, label_suffix="비상대기")
+            try:
+                self.cart_port.stop_nav(device_code, freeze=False)
+            except TypeError:
+                try:
+                    self.cart_port.stop_nav(device_code)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            if not self.traffic.is_on_peer_active_path(device_code):
+                break
+            time.sleep(max(0.5, poll_sec))
+        self.traffic.clear_stale_emergency_wait(device_code)
 
     def _retreat_from_obstacle(
         self,
@@ -1150,13 +1344,18 @@ class OrdersService:
         travel_m: float | None = None,
     ) -> None:
         """선반/벽에 박힌 채 Nav2 하면 error 102로 즉시 abort — cmd_vel 후진으로 빠져나온다."""
+        if self._recovery_suppressed(device_code):
+            self._emergency_wait_on_peer_path(
+                device_code, mission_id, waypoint_id=waypoint_id
+            )
+            return
         wid = (waypoint_id or "").strip().upper()
         if wid == "C":
             return
         fallback = float(os.environ.get("PICK_ABORT_BACKUP_M", "0.30"))
         total = 0.0
         if wid and shelf_undock_after_aruco(wid):
-            total = shelf_undock_distance_m(wid, travel_m)
+            total = shelf_undock_odom_travel_m(wid, travel_m)
         if total < 0.05:
             total = fallback
         max_m = float(os.environ.get("PICK_SHELF_UNDOCK_MAX_M", "0.80"))
@@ -1180,6 +1379,13 @@ class OrdersService:
             steps += 1
             if mission_id is not None:
                 self._ensure_not_aborted(mission_id)
+            if self._recovery_suppressed(device_code):
+                if mission_id is not None:
+                    self._mission_note(
+                        mission_id,
+                        "retreat aborted: emergency wait (no reverse)",
+                    )
+                break
             step = min(remaining, step_max)
             timeout = max(2.5, step / max(speed, 0.01) + 2.0)
             result = rel(
@@ -1229,11 +1435,18 @@ class OrdersService:
         waypoint_id: str,
         mission_id: int,
     ) -> None:
-        """접근 → 대기 3초 → 후진(측정 거리가 접근 전 마커 거리에 도달할 때까지)."""
-        travel = self._aruco_dock_or_fail(device_code, waypoint_id, mission_id)
+        """ArUco dock → (optional dwell) → undock. No OMX at C/P."""
+        travel, final_range = self._aruco_dock_or_fail(
+            device_code, waypoint_id, mission_id
+        )
+        # Dwell default 0 — do not insert a fixed 3s pause.
         self._dwell_at(device_code, mission_id, waypoint_id)
         self._undock_after_shelf_aruco(
-            device_code, waypoint_id, travel, mission_id
+            device_code,
+            waypoint_id,
+            travel,
+            mission_id,
+            final_range_m=final_range,
         )
 
     def _acquire_omx_arm(self, mission_id: int) -> None:
@@ -1257,13 +1470,26 @@ class OrdersService:
         waypoint_id: str,
         picks: list[tuple[str, int]],
     ) -> None:
-        """Run OMX pick for shelf waypoints; fallback to dwell in mock mode."""
+        """OMX pick then continue tour. No dwell pause.
+
+        Mock / no OMX URL / server unreachable → treat as success and proceed.
+        """
         if not picks:
-            self._dwell_at(device_code, mission_id, waypoint_id)
             return
         if not isinstance(self.station_port, OmxHttpStationAdapter):
-            self._dwell_at(device_code, mission_id, waypoint_id)
+            self._mission_note(
+                mission_id,
+                f"omx skip at {waypoint_id} (mock/no OMX_URL) — success",
+            )
             return
+        # Quick probe: if OMX HTTP is down, skip pick as success (no 3s wait).
+        if not self.station_port.is_server_reachable():
+            self._mission_note(
+                mission_id,
+                f"omx unreachable at {waypoint_id} — success override, continue",
+            )
+            return
+
         timeout = float(os.environ.get("OMX_PICK_TIMEOUT_SEC", "90"))
         self._acquire_omx_arm(mission_id)
         try:
@@ -1346,7 +1572,9 @@ class OrdersService:
         order_id: int,
         shelf_picks: list[tuple[str, int]],
     ) -> None:
-        travel = self._aruco_dock_or_fail(device_code, waypoint_id, mission_id)
+        travel, final_range = self._aruco_dock_or_fail(
+            device_code, waypoint_id, mission_id
+        )
         self._omx_pick_at_shelf(
             device_code,
             order_id,
@@ -1354,7 +1582,13 @@ class OrdersService:
             waypoint_id,
             shelf_picks,
         )
-        self._undock_after_shelf_aruco(device_code, waypoint_id, travel, mission_id)
+        self._undock_after_shelf_aruco(
+            device_code,
+            waypoint_id,
+            travel,
+            mission_id,
+            final_range_m=final_range,
+        )
 
     def _dwell_at(
         self,
@@ -1362,25 +1596,27 @@ class OrdersService:
         mission_id: int,
         waypoint_id: str,
     ) -> None:
-        """웨이포인트 도착 후 PICK_DWELL_SEC(기본 3s) 대기.
+        """Optional pause after arrive. Default PICK_DWELL_SEC=0 (disabled).
 
         stop_nav 를 호출하지 않는다. goal_wait 로 이미 도착한 뒤 stop 하면
         AMCL idle-freeze 가 걸리고, 그 사이 pose 조회 실패 시 홈 initialpose
         가 들어와 계산대 이동 중 대기장소로 점프한다.
         """
+        del device_code
         self._ensure_not_aborted(mission_id)
         dwell = max(0.0, float(self._dwell_sec))
+        if dwell <= 0:
+            return
         self._set_waypoint(
             mission_id,
             waypoint_id,
             label_suffix=f"대기 {dwell:g}초",
         )
         self._mission_note(mission_id, f"dwell start {waypoint_id} {dwell}s")
-        if dwell > 0:
-            end = time.time() + dwell
-            while time.time() < end:
-                self._ensure_not_aborted(mission_id)
-                time.sleep(min(0.25, end - time.time()))
+        end = time.time() + dwell
+        while time.time() < end:
+            self._ensure_not_aborted(mission_id)
+            time.sleep(min(0.25, end - time.time()))
         self._mission_note(mission_id, f"dwell end {waypoint_id}")
         self._set_waypoint(mission_id, waypoint_id)
 
@@ -1506,6 +1742,79 @@ class OrdersService:
             )
             self.conn.commit()
 
+    def _requeue_mission_for_peer_priority(
+        self,
+        order_id: int,
+        mission_id: int,
+        device_code: str,
+        reason: str,
+    ) -> None:
+        """Release cart and put this mission behind less-yielded orders."""
+        try:
+            self.cart_port.stop_nav(device_code, freeze=False)
+        except TypeError:
+            try:
+                self.cart_port.stop_nav(device_code)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            self.traffic.release_waypoint_zone(device_code)
+        except Exception:
+            pass
+        try:
+            self.traffic.release_nav_leg(device_code)
+        except Exception:
+            pass
+        self.traffic.interrupt_robot(device_code)
+
+        row = self.conn.execute(
+            "SELECT device_id, COALESCE(yield_count, 0) AS yc FROM missions WHERE id = ?",
+            (mission_id,),
+        ).fetchone()
+        device_id = int(row["device_id"]) if row and row["device_id"] else None
+        yc = int(row["yc"] if row else 0) + 1
+        ts = now_iso()
+        self.conn.execute(
+            """
+            UPDATE missions
+            SET status = 'QUEUED',
+                device_id = NULL,
+                current_waypoint = NULL,
+                current_waypoint_label = NULL,
+                yield_count = ?
+            WHERE id = ?
+            """,
+            (yc, mission_id),
+        )
+        self.conn.execute(
+            "UPDATE orders SET status = 'QUEUED', updated_at = ? WHERE id = ?",
+            (ts, order_id),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO mission_events (mission_id, from_status, to_status, note, created_at)
+            VALUES (?, 'PICKING', 'QUEUED', ?, ?)
+            """,
+            (
+                mission_id,
+                f"yield#{yc} for peer priority: {reason}"[:240],
+                ts,
+            ),
+        )
+        if device_id is not None:
+            self.conn.execute(
+                "UPDATE devices SET status = 'idle' WHERE id = ?",
+                (device_id,),
+            )
+        self.conn.commit()
+        self._mission_note(
+            mission_id,
+            f"requeued yield#{yc} ({device_code}): {reason}"[:240],
+            status="QUEUED",
+        )
+
     def _run_pick_tour(
         self, order_id: int, mission_id: int, device_code: str
     ) -> None:
@@ -1530,6 +1839,7 @@ class OrdersService:
 
             self.ai_port.request_pick_plan(order_id)
             self.cart_port.notify_assign(device_code, order_id)
+            # register_mission may already have run at dispatch (FIFO timestamp).
             self.traffic.register_mission(device_code, mission_id)
 
             # 현재 pose 기준 투어 시작. 홈 initialpose 는 넣지 않음
@@ -1586,11 +1896,15 @@ class OrdersService:
 
             self._set_status(order_id, mission_id, "PICKING", note="pick tour start")
 
-            for wp in tour:
+            pending = list(tour)
+            deferred_once: set[str] = set()
+            while pending:
                 self._ensure_not_aborted(mission_id)
+                wp = pending.pop(0)
                 self._set_waypoint(mission_id, wp.id)
-                self._acquire_waypoint_zone(device_code, wp.id, mission_id)
+                retain_zone_for_checkout = False
                 try:
+                    self._acquire_waypoint_zone(device_code, wp.id, mission_id)
                     self._nav_or_fail(
                         device_code,
                         wp.x,
@@ -1607,8 +1921,52 @@ class OrdersService:
                         order_id,
                         shelf_picks_by_waypoint.get(wp.id, []),
                     )
+                    # W6와 C는 동일 좌표 — 다음이 계산대면 구역 유지 후 즉시 계산대.
+                    if wp.id == "W6" and not pending:
+                        rem_after = (
+                            remaining[1:]
+                            if remaining and remaining[0] == "W6"
+                            else [w for w in remaining if w != "W6"]
+                        )
+                        if rem_after and rem_after[0] == "C":
+                            retain_zone_for_checkout = True
+                            self._mission_note(
+                                mission_id,
+                                "W6 zone retained for immediate checkout (shared C)",
+                            )
+                except TrafficYieldError as yield_exc:
+                    try:
+                        self.traffic.release_nav_leg(device_code)
+                    except Exception:
+                        pass
+                    reason = _short_error(yield_exc)
+                    # First conflict: defer this shelf so peer path/order can proceed.
+                    if wp.id not in deferred_once and pending:
+                        deferred_once.add(wp.id)
+                        pending.append(wp)
+                        if remaining and remaining[0] == wp.id:
+                            remaining = remaining[1:] + [wp.id]
+                        elif wp.id in remaining:
+                            remaining = [w for w in remaining if w != wp.id] + [
+                                wp.id
+                            ]
+                        self.traffic.update_remaining(device_code, remaining)
+                        self._mission_note(
+                            mission_id,
+                            f"path/zone yield at {wp.id}; defer shelf for peer: "
+                            f"{reason}",
+                        )
+                        continue
+                    self._requeue_mission_for_peer_priority(
+                        order_id,
+                        mission_id,
+                        device_code,
+                        reason,
+                    )
+                    raise MissionYielded(reason) from yield_exc
                 finally:
-                    self.traffic.release_waypoint_zone(device_code)
+                    if not retain_zone_for_checkout:
+                        self.traffic.release_waypoint_zone(device_code)
                 if remaining and remaining[0] == wp.id:
                     remaining = remaining[1:]
                 else:
@@ -1619,8 +1977,9 @@ class OrdersService:
             self._set_status(order_id, mission_id, "CHECKOUT", note="checkout")
             c = get_waypoint("C")
             self._set_waypoint(mission_id, "C")
-            self._acquire_waypoint_zone(device_code, "C", mission_id)
             try:
+                # W6 점유 유지 중이면 try_claim이 C로 업그레이드(동일 구역).
+                self._acquire_waypoint_zone(device_code, "C", mission_id)
                 self._nav_or_fail(
                     device_code,
                     c.x,
@@ -1632,6 +1991,19 @@ class OrdersService:
                     allow_retreat=False,
                 )
                 self._dock_dwell_undock(device_code, "C", mission_id)
+            except TrafficYieldError as yield_exc:
+                try:
+                    self.traffic.release_waypoint_zone(device_code)
+                except Exception:
+                    pass
+                reason = _short_error(yield_exc)
+                self._requeue_mission_for_peer_priority(
+                    order_id,
+                    mission_id,
+                    device_code,
+                    f"checkout:{reason}",
+                )
+                raise MissionYielded(reason) from yield_exc
             finally:
                 self.traffic.release_waypoint_zone(device_code)
             remaining = [w for w in remaining if w != "C"]
@@ -1660,6 +2032,9 @@ class OrdersService:
                 note="arrived wait spot — job done",
             )
             self._release_device(mission_id)
+        except MissionYielded:
+            # Already requeued + device idle; do not mark FAILED or force home.
+            pass
         except Exception as exc:
             if self._is_aborted(mission_id):
                 # 운영자 정지: 이미 FAILED 처리됨 — 그 자리 유지, 홈 복귀 안 함

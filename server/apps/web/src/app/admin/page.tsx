@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "@/lib/api";
+import { api, getApiUrl, getToken } from "@/lib/api";
 import { OccupancyNavMap } from "@/components/OccupancyNavMap";
 
 type RobotHealth = {
@@ -61,11 +61,23 @@ type NavState = {
   path?: { x: number; y: number }[];
 };
 
-type Device = {
-  id: number;
-  code: string;
-  type: string;
-  status: string;
+type OmxHealth = {
+  success?: boolean;
+  status?: string;
+  configured?: boolean;
+  reachable?: boolean;
+  url?: string | null;
+  latencyMs?: number;
+  message?: string;
+  robotConnected?: boolean;
+  busy?: boolean;
+  rig?: {
+    ok?: boolean;
+    meanShiftPx?: number;
+    maxShiftPx?: number;
+    matchRatio?: number;
+    error?: string;
+  };
 };
 
 type OrderAssignment = {
@@ -314,7 +326,7 @@ function CartStatusPanel({
 
 export default function AdminRobotPage() {
   const [robots, setRobots] = useState<RobotMonitor[]>([]);
-  const [devices, setDevices] = useState<Device[]>([]);
+  const [omx, setOmx] = useState<OmxHealth | null>(null);
   const [missions, setMissions] = useState<MissionListItem[]>([]);
   const [queueLength, setQueueLength] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -324,6 +336,7 @@ export default function AdminRobotPage() {
   const [logMission, setLogMission] = useState<MissionDetail | null>(null);
   const [logLoading, setLogLoading] = useState(false);
   const [logError, setLogError] = useState<string | null>(null);
+  const [omxStreamToken, setOmxStreamToken] = useState<string>("");
   const mapColRef = useRef<HTMLDivElement>(null);
   const sideColRef = useRef<HTMLDivElement>(null);
 
@@ -368,9 +381,18 @@ export default function AdminRobotPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [res, d, m] = await Promise.all([
+      const [res, o, m] = await Promise.all([
         api<RobotsResponse>("/admin/robots"),
-        api<Device[]>("/admin/robot/devices").catch(() => [] as Device[]),
+        api<OmxHealth>("/admin/omx/health").catch(
+          (err: unknown): OmxHealth => ({
+            success: false,
+            status: "ERROR",
+            configured: false,
+            reachable: false,
+            message:
+              err instanceof Error ? err.message : "OMX health 요청 실패",
+          }),
+        ),
         api<MissionListItem[]>("/admin/robot/missions").catch(
           () => [] as MissionListItem[],
         ),
@@ -378,10 +400,11 @@ export default function AdminRobotPage() {
       const list = res.robots || [];
       setRobots(list);
       setQueueLength(res.queueLength ?? 0);
-      setDevices(d);
+      setOmx(o);
       setMissions(Array.isArray(m) ? m : []);
       setError(null);
       setUpdatedAt(new Date().toLocaleTimeString("ko-KR"));
+      setOmxStreamToken(getToken() || "");
       setControlRobotId((prev) => {
         if (prev && list.some((r) => r.id === prev)) return prev;
         return list[0]?.id || "";
@@ -651,35 +674,110 @@ export default function AdminRobotPage() {
         </div>
       ) : null}
 
-      <section className="robot-block robot-block-devices">
+      <section className="robot-block robot-block-omx">
         <header className="robot-block-head">
-          <h2 className="robot-block-title">디바이스 (Controller)</h2>
+          <div>
+            <h2 className="robot-block-title">OMX 로봇팔</h2>
+            <p className="robot-block-url muted">
+              {omx?.url || "OMX_URL 미설정"}
+              {typeof omx?.latencyMs === "number"
+                ? ` · ${omx.latencyMs}ms`
+                : ""}
+            </p>
+          </div>
+          <span
+            className={`robot-block-status ${
+              omx?.reachable ? "status-ok" : "status-bad"
+            }`}
+          >
+            {omx?.reachable
+              ? "네트워크 연결됨"
+              : omx?.configured === false
+                ? "미설정"
+                : "연결 불가"}
+          </span>
         </header>
-        <table className="table">
-          <thead>
-            <tr>
-              <th>코드</th>
-              <th>타입</th>
-              <th>상태</th>
-            </tr>
-          </thead>
-          <tbody>
-            {devices.map((d) => (
-              <tr key={d.id}>
-                <td>{d.code}</td>
-                <td>{d.type}</td>
-                <td>{d.status}</td>
-              </tr>
-            ))}
-            {!devices.length ? (
-              <tr>
-                <td colSpan={3} className="muted">
-                  디바이스 없음
-                </td>
-              </tr>
-            ) : null}
-          </tbody>
-        </table>
+
+        <dl className="monitor-dl omx-net-dl">
+          <div>
+            <dt>상태</dt>
+            <dd>{omx?.status || "—"}</dd>
+          </div>
+          <div>
+            <dt>로봇 연결</dt>
+            <dd>
+              {omx?.reachable
+                ? omx.robotConnected
+                  ? "연결됨"
+                  : "미연결"
+                : "—"}
+            </dd>
+          </div>
+          <div>
+            <dt>픽업</dt>
+            <dd>
+              {omx?.reachable ? (omx.busy ? "작업 중" : "대기") : "—"}
+            </dd>
+          </div>
+          <div>
+            <dt>리그</dt>
+            <dd>
+              {omx?.rig?.error
+                ? omx.rig.error
+                : omx?.rig?.ok === true
+                  ? "OK"
+                  : omx?.rig?.ok === false
+                    ? "어긋남"
+                    : "—"}
+            </dd>
+          </div>
+        </dl>
+        {omx?.message ? (
+          <p className="muted" style={{ margin: "0.5rem 0 0", fontSize: "0.85rem" }}>
+            {omx.message}
+          </p>
+        ) : null}
+
+        <div className="omx-cam-grid">
+          <figure className="omx-cam">
+            {omx?.reachable && omxStreamToken ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={`${getApiUrl()}/admin/omx/stream?cam=camera1&fps=10&token=${encodeURIComponent(omxStreamToken)}`}
+                alt="OMX front (top) camera"
+              />
+            ) : (
+              <div className="omx-cam-placeholder muted">
+                {omx?.reachable
+                  ? "인증 토큰 대기…"
+                  : "스트림 없음 (OMX 연결 필요)"}
+              </div>
+            )}
+            <figcaption>
+              <span className="omx-cam-tag">front</span> 탑뷰 · camera1 · 10
+              fps
+            </figcaption>
+          </figure>
+          <figure className="omx-cam">
+            {omx?.reachable && omxStreamToken ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={`${getApiUrl()}/admin/omx/stream?cam=camera2&fps=10&token=${encodeURIComponent(omxStreamToken)}`}
+                alt="OMX wrist camera"
+              />
+            ) : (
+              <div className="omx-cam-placeholder muted">
+                {omx?.reachable
+                  ? "인증 토큰 대기…"
+                  : "스트림 없음 (OMX 연결 필요)"}
+              </div>
+            )}
+            <figcaption>
+              <span className="omx-cam-tag">wrist</span> 손목 · camera2 · 10
+              fps
+            </figcaption>
+          </figure>
+        </div>
       </section>
 
       {logLoading || logMission || logError ? (

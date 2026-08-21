@@ -324,6 +324,23 @@ def path_intersects_zones(
     return False
 
 
+def path_goal_in_zones(
+    path: list[tuple[float, float]],
+    zones: list[tuple[float, float, float]],
+) -> bool:
+    """True when the path endpoint (goal) lies inside any zone disc."""
+    if not path or not zones:
+        return False
+    gx, gy = float(path[-1][0]), float(path[-1][1])
+    for cx, cy, radius_m in zones:
+        r = max(0.0, float(radius_m))
+        dx = gx - float(cx)
+        dy = gy - float(cy)
+        if dx * dx + dy * dy <= r * r:
+            return True
+    return False
+
+
 def find_path_conflicts(
     path1: list[tuple[float, float]],
     path2: list[tuple[float, float]],

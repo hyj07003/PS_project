@@ -100,6 +100,24 @@ STAGING_WAYPOINT_ID = "W7"
 
 ZONE_OCCUPIABLE_IDS = frozenset({"W1", "W2", "W3", "W4", "W5", "W6", "C", "P"})
 
+# W6(샌드위치)와 C(계산대)는 맵상 동일 좌표 — 한쪽 점유 = 양쪽 점유.
+ZONE_EQUIVALENTS: dict[str, frozenset[str]] = {
+    "W6": frozenset({"W6", "C"}),
+    "C": frozenset({"W6", "C"}),
+}
+
+
+def zone_equivalent_ids(waypoint_id: str) -> frozenset[str]:
+    wid = (waypoint_id or "").strip().upper()
+    return ZONE_EQUIVALENTS.get(wid, frozenset({wid}) if wid else frozenset())
+
+
+def zones_overlap(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
+    return bool(zone_equivalent_ids(a) & zone_equivalent_ids(b))
+
+
 # product slug → shelf waypoint
 SLUG_TO_WAYPOINT: dict[str, str] = {
     "cake": "W1",
@@ -156,7 +174,7 @@ def waypoint_zone_radius_m(waypoint_id: str | None = None) -> float:
 
 
 def waypoint_zone_center(waypoint_id: str) -> tuple[float, float]:
-    """Zone center by waypoint id (W6/C share XY but separate zone keys)."""
+    """Zone center by waypoint id (W6/C share XY — treat as one footprint)."""
     wp = get_waypoint(waypoint_id.strip().upper())
     return (float(wp.x), float(wp.y))
 
@@ -276,3 +294,26 @@ def shelf_undock_distance_m(
         marker_m = 0.0
     max_m = float(os.environ.get("PICK_SHELF_UNDOCK_MAX_M", "0.80"))
     return min(marker_m, max_m)
+
+
+def shelf_undock_odom_travel_m(
+    waypoint_id: str,
+    approach_range_m: float | None,
+    *,
+    final_range_m: float | None = None,
+) -> float:
+    """Odom fallback 후진량 = 접근 전 range − 도킹 후 range (range 전체를 미터로 쓰지 않음)."""
+    target = shelf_undock_distance_m(waypoint_id, approach_range_m)
+    if target <= 0.0:
+        return 0.0
+    max_m = float(os.environ.get("PICK_SHELF_UNDOCK_MAX_M", "0.80"))
+    slack = float(os.environ.get("PINKY_ARUCO_UNDOCK_TRAVEL_SLACK_M", "0.025"))
+    if final_range_m is not None:
+        try:
+            docked = max(0.0, float(final_range_m))
+        except (TypeError, ValueError):
+            docked = aruco_standoff_for_waypoint(waypoint_id)
+    else:
+        docked = aruco_standoff_for_waypoint(waypoint_id)
+    travel = max(0.0, target - docked) + max(0.0, slack)
+    return min(travel, max_m)

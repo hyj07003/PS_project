@@ -333,6 +333,7 @@ def migrate(conn: LockedConnection) -> None:
     conn.commit()
     _ensure_column(conn, "missions", "current_waypoint", "TEXT")
     _ensure_column(conn, "missions", "current_waypoint_label", "TEXT")
+    _ensure_column(conn, "missions", "yield_count", "INTEGER DEFAULT 0")
 
 
 def _ensure_column(

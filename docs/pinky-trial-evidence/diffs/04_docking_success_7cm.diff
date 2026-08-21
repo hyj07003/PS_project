@@ -1,0 +1,11 @@
+--- traffic_controller_DOCKING_NAV2_SUCCESS_FIX.py
++++ traffic_controller_DOCKING_NAV2_SUCCESS_7CM.py
+@@ -1695,7 +1695,7 @@
+         # Primary rule: trust Nav2's own successful result.
+         # Keep a loose 15 cm sanity bound so a stale/incorrect SUCCEEDED state
+         # cannot accept a robot that is obviously far from the docking goal.
+-        if action == "SUCCEEDED" and not navigating and dist <= 0.15:
++        if action == "SUCCEEDED" and not navigating and dist <= 0.07:
+             robot.phase = "DOCKED"
+             print(
+                 f"[DOCKED] {robot.name}: Nav2 SUCCEEDED, "

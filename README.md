@@ -26,7 +26,8 @@ Pinky 주행 로봇과 OMX 로봇팔을 활용한 **무인마트 자동화 시�
 10. [환경 변수](#10-환경-변수-핵심)
 11. [기동 순서](#11-기동-순서-요약)
 12. [설계 원칙](#12-설계-원칙-요약)
-13. [관련 문서](#13-관련-문서)
+13. [시행착오·교훈](#13-시행착오교훈)
+14. [관련 문서](#14-관련-문서)
 
 ---
 
@@ -699,7 +700,207 @@ POLICY=/path/to/ckpt ./scripts/start_server.sh
 
 ---
 
-## 13. 관련 문서
+## 13. 시행착오·교훈
+
+충돌·데드락·로컬라이즈 붕괴·픽 실패로 이어질 수 있었던 **크리티컬** 사례를,  
+**증상 → 원인 → 수정 → 근거자료 → 결과** 순으로 정리합니다.
+
+- **관제(Controller):** `server/.../traffic.py`, `traffic_paths.py`, `orders.py`
+- **Pinky 멀티로봇 현장 증거:** [`docs/pinky-trial-evidence/`](docs/pinky-trial-evidence/)  
+  (로그 · RViz 캡처 · [수정 diff](docs/pinky-trial-evidence/diffs/))
+
+### 13.0 대표 사례 한눈에
+
+| 시행착오 | 원인 | 대응 | 증거 |
+|----------|------|------|------|
+| 경로 충돌·동시 통로 사용 | 겹치는 구간을 한 덩어리/희소점으로만 처리 | segment 분리 + densify + WAIT/RELEASE | [로그 01](docs/pinky-trial-evidence/logs/01_docking_conflict_localization_jump.txt) |
+| 우선순위 역전 | conflict마다 owner 재계산 | Sticky Priority | [diff 02](docs/pinky-trial-evidence/diffs/02_sticky_priority_dock_pose_lock.diff) |
+| 208 `NO_VALID_PATH` 후 후진/벽 접근 | 유효 path 없이 NavigateToPose fallback | Direct Goal fallback 제거 · WAIT | [이미지 02](docs/pinky-trial-evidence/images/02_rviz_wall_like_path.png) |
+| Localization Pose Jump | 도킹 성공 오판 → goal 재전송 → AMCL 점프 | 7 cm DOCKED 판정 + watchdog + STOP BOTH | [이미지 01](docs/pinky-trial-evidence/images/01_rviz_cart2_pose_jump.png) |
+| RViz 경로 잔상 | TRANSIENT_LOCAL path 미삭제 | HOLD/도착/미션 종료 시 path 정리 | [이미지 03](docs/pinky-trial-evidence/images/03_rviz_home_path_ghost.png) |
+| 교통 타임아웃 fail-open | 대기 만료 후 강제 출발 | `TrafficTimeoutError` (강제 통과 없음) | 관제 `traffic.py` |
+| 경로 위 후진 / X자 데드락 | peer path 위 후진·WAITING끼리 emergency_wait | 제자리 대기 · NAVIGATING일 때만 path 점유 | 관제 `orders.py` / `traffic.py` |
+| 로컬라이즈 깨진 채 후진 | TF/AMCL 실패에도 retreat | 후진 조건 화이트리스트 | `_nav_error_needs_retreat` |
+| 단일 OMX 동시 pick | 팔 1대에 카트 2 스레드 | `_omx_arm_lock` + 409 재시도 | `orders.py` |
+
+---
+
+### 13.1 충돌 segment 분리와 WAIT / RELEASE
+
+**배경.** 두 Pinky가 동일 통로를 동시에 쓰면 Nav2 단독으로는 좁은 맵에서 우회가 거의 안 된다. 교통 계층이 경로를 먼저 뽑아 충돌을 보고, owner만 goal을 보낸다.
+
+**잘못된 시도.** 겹침을 “한 줄짜리 긴 충돌”로만 보거나, 경로 **꼭짓점만** 비교하면 세그먼트 중간 교차가 빠진다(관제 densify 이슈와 동일 계열).
+
+**현장 증상·로그.** 실제 세션에서 conflict가 **2개 segment**로 쪼개지고, owner가 EXIT+margin을 지난 뒤에야 waiter가 RELEASE·REPLAN 된다.
+
+```text
+[PATH CONFLICT] CART-1 <-> CART-2 segments=2 clearance=0.200m
+[ACTIVE CONFLICT] segment 1/2 only; clear gaps stay CLEAR
+[WAIT] CART-2
+[EXIT] CART-1 passed current conflict EXIT + 0.20m
+[POST-SEGMENT CONFLICT] remaining=1
+[REPLAN OK] ...
+[RELEASE] CART-2
+```
+
+전문: [`logs/01_docking_conflict_localization_jump.txt`](docs/pinky-trial-evidence/logs/01_docking_conflict_localization_jump.txt)
+
+**관제 쪽 대응.** `find_path_conflicts` + densify, grant 시 sticky / `can_clear` / progress / FIFO. 타임아웃 시 **fail-open 금지** → `TrafficTimeoutError`(§13.7).
+
+---
+
+### 13.2 Sticky Priority (우선순위 역전)
+
+**배경.** 충돌 segment가 바뀔 때마다 “EXIT에 더 가까운 쪽” 등으로 owner를 다시 고르면, 이미 달리던 로봇이 갑자기 WAIT로 떨어지고 뒤쪽이 선행하는 **우선순위 역전**이 난다.
+
+**대응.**
+
+```text
+한 번 owner가 된 로봇
+→ 관련 conflict에서도 우선권 유지(sticky)
+→ owner가 막히거나 경로 실패일 때만 재선정
+```
+
+증거: [`diffs/02_sticky_priority_dock_pose_lock.diff`](docs/pinky-trial-evidence/diffs/02_sticky_priority_dock_pose_lock.diff)  
+관제 `TrafficCoordinator`의 `conflict_owner_sticky`와 같은 정책 계열이다.
+
+---
+
+### 13.3 208 `NO_VALID_PATH`와 Direct Goal fallback 제거
+
+**배경.** `/nav/plan`(ComputePathToPose)이 `errorCode=208`을 반복하면, 과거에는 “그래도 움직여 보라”며 **NavigateToPose를 직접** 보냈다.
+
+**잘못된 시도·위험.**
+
+```text
+ComputePathToPose 실패
+→ NavigateToPose 직접 전송
+→ Nav2 recovery(후진 등)
+→ 벽 접근 / 맵상 벽을 통과하는 것처럼 보이는 path
+```
+
+**현장 증거 (RViz).** 유효한 자유공간 경로가 아닌데 goal이 나가면, 계획이 벽을 가로지르는 것처럼 보인다.
+
+![RViz — 벽을 통과하는 것처럼 보인 path](docs/pinky-trial-evidence/images/02_rviz_wall_like_path.png)
+
+**개선 후 로그.**
+
+```text
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH)
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path;
+robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[STATIONARY FALLBACK CHECK] ... SINGLE PATH WAIT ... no goal sent
+```
+
+전문: [`logs/02_208_wait_stationary_conflict.txt`](docs/pinky-trial-evidence/logs/02_208_wait_stationary_conflict.txt)  
+Diff: [`diffs/01_direct_goal_fallback_removed.diff`](docs/pinky-trial-evidence/diffs/01_direct_goal_fallback_removed.diff)
+
+**결과.** 유효 Nav2 path가 생기기 전에는 goal을 보내지 않는다. 관제의 “fail-open 금지”·“경로 위 후진 금지”와 같은 안전 철학이다.
+
+---
+
+### 13.4 도킹 성공 오판 → Localization Hard Jump
+
+**배경.** CART-2가 HOME에 약 **0.061 m**까지 접근하고 Nav2가 `SUCCEEDED`를 반환했는데, 기존 로직이 거리 판정 때문에 **실패로 오판**하고 goal을 재전송했다.
+
+**연쇄.**
+
+```text
+[DOCKING OWNER NAV BLOCKED] ... (action=SUCCEEDED); retry 1
+[DOCKING OWNER RETRY] CART-2 -> HOME goal resent
+[LOCALIZATION HARD JUMP] CART-2: 1.709m in 2.000s (0.855m/s > 0.750m/s)
+[LOCALIZATION LOST]
+[SAFETY FAULT] ...
+[STOP BOTH]
+```
+
+**현장 증거 (RViz).** AMCL pose가 실제 이동과 무관한 거리로 점프한 순간.
+
+![RViz — CART-2 localization pose jump](docs/pinky-trial-evidence/images/01_rviz_cart2_pose_jump.png)
+
+**대응.**
+
+```text
+Nav2 action == SUCCEEDED
+AND navigating == false
+AND distance <= 0.07 m
+→ DOCKED
+```
+
++ localization watchdog(비현실적 속도·점프 시 `/nav/stop` both)  
++ 도킹 완료 Pose Lock  
+
+Diff: [`diffs/04_docking_success_7cm.diff`](docs/pinky-trial-evidence/diffs/04_docking_success_7cm.diff)  
+로그 동일: [`logs/01_...`](docs/pinky-trial-evidence/logs/01_docking_conflict_localization_jump.txt)
+
+**관제 쪽 연관.** 로컬라이즈/TF 실패 메시지에서는 **후진 회복을 하지 않는다**(§13.8). pose가 틀린 상태에서 `cmd_vel`을 주면 벽으로 밀린다.
+
+---
+
+### 13.5 RViz 경로 잔상
+
+**배경.** 사용이 끝난 TRANSIENT_LOCAL reference path가 RViz에 굵게 남아, **현재 쓸 경로와 혼동**됐다. 디버깅·데모 모두에서 “왜 저쪽으로 가라고 했지?” 오판을 유발한다.
+
+![RViz — 홈 복귀 시 경로 잔상](docs/pinky-trial-evidence/images/03_rviz_home_path_ghost.png)
+
+**대응.** Replan 시 이전 path 교체 · HOLD/목적지 도착 시 해당 path 삭제 · 미션 종료 시 path/conflict/reservation 전체 정리.
+
+Diff: [`diffs/03_rviz_path_lifecycle_release.diff`](docs/pinky-trial-evidence/diffs/03_rviz_path_lifecycle_release.diff)
+
+---
+
+### 13.6 HOME 순차 진입 · 서비스 지점 점유
+
+**HOME (S1/S2).** 대기장소가 가까워 두 대가 동시에 붙으면 footprint가 겹친다. 로그상 owner가 DOCKED될 때까지 다른 카트는 HOLD, 이후 순차 HOME.
+
+**서비스 웨이포인트 (W*).** 한 대가 정차한 뒤 다른 대의 계획이 정지 로봇에 **~수 cm**까지 붙으면:
+
+```text
+[STATIONARY ROBOT CONFLICT]
+[PATH BLOCKED] / [SINGLE PATH WAIT]
+```
+
+정책 방향: 장소 상태 `FREE → APPROACHING → DOCKING → OCCUPIED → LEAVING → FREE`, 점유 중이면 다른 대는 SERVICE_HOLD.  
+관제의 **존(zone) claim / W7 스테이징**이 같은 문제를 제품 투어에서 담당한다.
+
+---
+
+### 13.7 관제: 교통 타임아웃 fail-open · densify · emergency_wait
+
+**fail-open.** 대기 상한 후 “그냥 출발”은 교차로 동시 진입을 만든다 → `TrafficTimeoutError`만 허용, 강제 통과 없음.
+
+**희소 점 충돌.** 꼭짓점만 비교하면 세그먼트 교차 false-negative → `densify_path` + 점·세그먼트 거리.
+
+**경로 위 후진.** peer active path 위에서 후진하면 상대 통행을 더 막음 → `_emergency_wait_on_peer_path`(제자리).
+
+**X자 데드락.** WAITING끼리도 emergency_wait를 걸면 상호 고정 → **peer가 `NAVIGATING`이고 `active_path`가 있을 때만** 경로 점유로 판정.
+
+---
+
+### 13.8 관제: 로컬라이즈 실패 시 후진 금지 · OMX 직렬화
+
+**후진.** `_nav_error_needs_retreat`는 `error_code=102/105/108`, `aborted`, `no_valid_path` 등만 허용. `no_tf` / `localization` / `amcl seed` / `map→base` 는 금지(§13.4와 동일 교훈).
+
+**OMX.** 팔 1대에 카트 투어 스레드가 동시에 `/pick` → 409·미션 실패. `_omx_arm_lock` + busy 재시도로 임계구역 직렬화.
+
+---
+
+### 13.9 증거자료 인덱스
+
+| 파일 | 내용 |
+|------|------|
+| [images/01_rviz_cart2_pose_jump.png](docs/pinky-trial-evidence/images/01_rviz_cart2_pose_jump.png) | Localization hard jump |
+| [images/02_rviz_wall_like_path.png](docs/pinky-trial-evidence/images/02_rviz_wall_like_path.png) | 벽 통과처럼 보이는 path |
+| [images/03_rviz_home_path_ghost.png](docs/pinky-trial-evidence/images/03_rviz_home_path_ghost.png) | 홈 복귀 경로 잔상 |
+| [logs/01_...](docs/pinky-trial-evidence/logs/01_docking_conflict_localization_jump.txt) | segment RELEASE + pose jump |
+| [logs/02_...](docs/pinky-trial-evidence/logs/02_208_wait_stationary_conflict.txt) | 208 WAIT + NO DIRECT GOAL |
+| [diffs/](docs/pinky-trial-evidence/diffs/) | fallback 제거 · sticky · path lifecycle · 7 cm dock |
+
+패키지 안내: [`docs/pinky-trial-evidence/README.md`](docs/pinky-trial-evidence/README.md)
+
+---
+
+## 14. 관련 문서
 
 | 문서 | 내용 |
 |------|------|
@@ -707,3 +908,4 @@ POLICY=/path/to/ckpt ./scripts/start_server.sh
 | [pinky/README.md](pinky/README.md) | Nav/ArUco API·ROS2 기동 |
 | [omx/README.md](omx/README.md) | OMX 배치 |
 | [omx/OMX_service_TS_Project/API.md](omx/OMX_service_TS_Project/API.md) | Pick API 규격 |
+| [docs/pinky-trial-evidence/](docs/pinky-trial-evidence/) | Pinky 멀티로봇 시행착오 증거(이미지·로그·diff) |

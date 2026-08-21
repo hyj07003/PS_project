@@ -1,0 +1,183 @@
+python3 tools/traffic_controller.py \
+  --cart1 http://192.168.129.33:4200 \
+  --cart2 http://192.168.129.27:4200 \
+  --cart1-goal-x 0.6507310400275261 \
+  --cart1-goal-y -2.094829182972384 \
+  --cart1-goal-yaw -1.5863988018711392 \
+  --cart2-goal-x 0.2132442625034366 \
+  --executeinterval 1.0 \t 30 \ \3 \5 \
+[SESSION] c8b38c44-0893-4e8a-9795-0bc68cc3e64a visuals reset; old paths/conflict cleared
+[MODE] EXECUTE: real robots may move
+[PATH AUTHORITY] Both robots are planned and published before traffic decisions; replans replace the displayed reference path.
+[PRIORITY POLICY] Already inside conflict > closer to EXIT > closer to ENTRY > --priority tie-break.
+[FINAL] CART-1: x=0.651, y=-2.095, yaw=-1.586 rad
+[FINAL] CART-2: x=0.213, y=-1.931, yaw=3.123 rad
+[POSE UNSTABLE] waiting for localization convergence
+[POSE STABLE] CART-1
+[POSE STABLE] CART-2
+[PLAN] CART-1: 500 points start=(0.043999995082616816, 0.013999942779541197) goal=(0.6507310400275261, -2.094829182972384)
+[PLAN] CART-2: 500 points start=(0.19399999172985555, -0.13600005386769753) goal=(0.2132442625034366, -1.9311329088412792)
+[PATH AUTHORITY READY] both current-session references are published
+[PATH CONFLICT] CART-1 <-> CART-2 segments=2 clearance=0.200m
+  segment 1: ENTRY=(0.118,-0.052) EXIT=(0.422,-0.525)
+  segment 2: ENTRY=(0.148,-0.955) EXIT=(0.303,-1.981)
+[DYNAMIC PRIORITY] owner=CART-1 waiter=CART-2: both can clear; CART1 is closer to EXIT
+[PRIORITY METRIC] CART-1: inside=true toENTRY=0.000m toEXIT=0.925m releaseAvailable=0.210m canClear=true index=0
+[PRIORITY METRIC] CART-2: inside=true toENTRY=0.000m toEXIT=1.028m releaseAvailable=0.205m canClear=true index=0
+[ACTIVE CONFLICT] segment 1/2 only; clear gaps stay CLEAR
+[START HOLD] CART-2 will remain at its current pose
+[TRAFFIC] owner=CART-1 waiter=CART-2
+[WAIT] CART-2
+[START HOLD POSE] CART-2: x=0.192, y=-0.152, yaw=-0.011 rad
+[MARGINS] hold=0.350m release=0.200m release_index=181
+[WOULD SEND] CART-1 -> TRANSIT GOAL: x=0.651, y=-2.095, yaw=-0.919 rad
+[WOULD NOT SEND] CART-2 -> waiting at start
+[RELEASE] CART-1 must pass EXIT + 0.20m
+[AFTER RELEASE] CART-2 -> FINAL GOAL
+[DRY-RUN] release-time replan is not executed because the owner has not physically moved
+[DRY-RUN] after EXIT + 0.20m: CART-2 would replan current pose -> final goal
+[DRY-RUN] CART-2 would be released after plan success
+[GO] CART-1
+[COMMAND] CART-1 -> final goal
+[START HOLD] CART-2 remains stationary; no goal sent
+[EXIT] CART-1 passed current conflict EXIT + 0.20m
+[POST-SEGMENT CONFLICT] remaining=1
+[NEXT CONFLICT] segment 1/1 owner=CART-1 waiter=CART-2
+[CLEAR GAP GO] CART-2 -> next HOLD
+[STATE] CART-2: HOLDING
+[EXIT] CART-1 passed current conflict EXIT + 0.20m
+[POST-SEGMENT CONFLICT] remaining=1
+[NEXT CONFLICT] segment 1/1 owner=CART-1 waiter=CART-2
+[CLEAR GAP GO] CART-2 -> next HOLD
+[STATE] CART-2: HOLDING
+[EXIT] CART-1 passed current conflict EXIT + 0.20m
+[POST-SEGMENT CONFLICT] remaining=0
+[RELEASE CHECK] CART-2
+[RELEASE STATE] ready=true tfValid=true scanFresh=true navigating=false
+[RELEASE POSE] CART-2 x=0.112 y=-1.550 yaw=-1.584
+[REPLAN] CART-2 attempt 1/3
+[REPLAN OK] pointCount=97
+[RELEASE] CART-2
+[GO] CART-2
+[COMMAND] CART-2 -> final goal
+[NAV BLOCKED] CART-1 stopped before verified release (action=UNKNOWN)
+[RUNTIME REPLAN] attempt 1: replanning both robots from live poses
+[RUNTIME PLAN OK] CART-1: 3 points; RViz reference replaced
+[RUNTIME PLAN OK] CART-2: 89 points; RViz reference replaced
+[RUNTIME CONFLICT] segments=0 clearance=0.200m
+[RECOVERY GO] CART-1: fresh paths are clear
+[RECOVERY GO] CART-2: fresh paths are clear
+[DONE] mission complete
+(ID: 31)kim:~/Downloads/PS_project_senario_test/PS_project-multirobot-path-v2-rviz/PS_project-main$ 
+python3 tools/traffic_controller.py \
+  --cart1 http://192.168.129.33:4200 \
+  --cart2 http://192.168.129.27:4200 \
+  --cart1-goal-x 0.009931882239292611 \
+  --cart1-goal-y 0.021114122581406713 \
+  --cart1-goal-yaw 0.01045265830576832 \
+  --cart2-goal-x 0.04742698442363813 \
+  --execute \terval 1.0 \t 30 \ \3 \1645 \
+[SESSION] 14c9e574-e9c1-4561-a130-6dd92b0a25d2 visuals reset; old paths/conflict cleared
+[MODE] EXECUTE: real robots may move
+[PATH AUTHORITY] Both robots are planned and published before traffic decisions; replans replace the displayed reference path.
+[PRIORITY POLICY] Already inside conflict > closer to EXIT > closer to ENTRY > --priority tie-break.
+[FINAL] CART-1: x=0.010, y=0.021, yaw=0.010 rad
+[FINAL] CART-2: x=0.047, y=-0.202, yaw=-0.005 rad
+[POSE UNSTABLE] waiting for localization convergence
+[POSE STABLE] CART-1
+[POSE STABLE] CART-2
+[PLAN] CART-1: 500 points start=(0.6339999818950892, -2.0960000100582836) goal=(0.009931881121705517, -0.018885877642110707)
+[PLAN] CART-2: 500 points start=(0.20399999150633813, -1.9260000138580797) goal=(0.04742698330605104, -0.18226078723592348)
+[PATH AUTHORITY READY] both current-session references are published
+[PATH CONFLICT] CART-1 <-> CART-2 segments=1 clearance=0.200m
+  segment 1: ENTRY=(0.483,-0.607) EXIT=(0.029,-0.101)
+[DYNAMIC PRIORITY] owner=CART-2 waiter=CART-1: both can clear; CART2 is closer to conflict ENTRY
+[PRIORITY METRIC] CART-1: inside=false toENTRY=1.876m toEXIT=2.938m releaseAvailable=0.000m canClear=false index=0
+[PRIORITY METRIC] CART-2: inside=false toENTRY=1.737m toEXIT=2.819m releaseAvailable=0.000m canClear=false index=0
+[ACTIVE CONFLICT] segment 1/1 only; clear gaps stay CLEAR
+[TERMINAL CONFLICT] CART-2 conflict reaches final dock; release will require DOCKED state
+[DOCKING PAIR] approved S1/S2 terminal section; final release requires validated non-overlapping footprints
+[DOCKING FOOTPRINT] half_length=0.060m half_width=0.060m margin=0.030m minimum=0.130m endpoint=0.187m
+[INITIAL DIRECT PATH CHECK] BLOCKED: moving footprint overlaps parked footprint
+[REPLAN POLICY] owner DOCKED -> DIRECT REPLAN; alternate is considered only if direct is BLOCKED
+[TRAFFIC] owner=CART-2 waiter=CART-1
+[WAIT] CART-1
+[HOLD] CART-1: x=0.611, y=-1.016, yaw=2.384 rad
+[HOME] CART-1 HOLD
+[HOME] CART-2 -> its home goal
+[MARGINS] hold=0.350m terminal_release=DOCKED
+[VALID] CART-1 HOLD point is Nav2-plannable
+[WOULD SEND] CART-1 -> HOLD POINT: x=0.611, y=-1.016, yaw=2.384 rad
+[WOULD SEND] CART-2 -> HOME GOAL: x=0.047, y=-0.202, yaw=-0.005 rad
+[RELEASE] CART-2 must reach its docking goal, stop navigating, and be within goal tolerance
+[AFTER DOCKED] [DOCKING BLOCKED] CART-1 remains WAIT
+[DOCKING PHASE 1] CART-1 -> HOLD
+[HOME] CART-1 HOLD
+[COMMAND] CART-1 -> HOLD point
+[DOCKING HOLD WAIT] CART-1: distance=1.079m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=1.079m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=1.088m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=1.051m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=1.003m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.899m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.822m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.751m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.669m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.590m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.523m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.453m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.406m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.369m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.336m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.291m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.240m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.173m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.107m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.045m navigating=true action=UNKNOWN
+[DOCKING HOLD WAIT] CART-1: distance=0.002m navigating=true action=UNKNOWN
+[DOCKING HOLD REACHED] CART-1: distance=0.000m action=UNKNOWN
+[STATE] CART-1: HOLDING
+[DOCKING PHASE 2] CART-2 -> HOME
+[HOME] CART-2 -> its home goal
+[COMMAND] CART-2 -> final goal
+[DOCKING OWNER WAIT] CART-2: distance=1.728m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=1.704m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=1.682m navigating=true action=EXECUTING stalledFor=0.4s
+[DOCKING OWNER WAIT] CART-2: distance=1.589m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=1.395m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=1.318m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=1.237m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=1.068m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.954m navigating=true action=EXECUTING stalledFor=0.3s
+[DOCKING OWNER WAIT] CART-2: distance=0.894m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.870m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.883m navigating=true action=EXECUTING stalledFor=0.3s
+[DOCKING OWNER WAIT] CART-2: distance=0.898m navigating=true action=EXECUTING stalledFor=0.3s
+[DOCKING OWNER WAIT] CART-2: distance=0.877m navigating=true action=EXECUTING stalledFor=0.4s
+[DOCKING OWNER WAIT] CART-2: distance=0.831m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.778m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.701m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.637m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.568m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.485m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.462m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.440m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.343m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.231m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.174m navigating=true action=EXECUTING stalledFor=0.0s
+[DOCKING OWNER WAIT] CART-2: distance=0.139m navigating=true action=EXECUTING stalledFor=0.5s
+[DOCKING OWNER WAIT] CART-2: distance=0.094m navigating=true action=EXECUTING stalledFor=0.3s
+[DOCKING OWNER WAIT] CART-2: distance=0.063m navigating=true action=EXECUTING stalledFor=0.8s
+[DOCKING OWNER WAIT] CART-2: distance=0.063m navigating=true action=EXECUTING stalledFor=0.8s
+[DOCKING OWNER WAIT] CART-2: distance=0.061m navigating=true action=EXECUTING stalledFor=1.8s
+[DOCKING OWNER NAV BLOCKED] CART-2 stopped before HOME (action=SUCCEEDED); retry 1
+[DOCKING OWNER REPLAN OK] CART-2: 10 points; RViz reference replaced
+[DOCKING OWNER RETRY] CART-2 -> HOME goal resent
+[LOCALIZATION HARD JUMP] CART-2: 1.709m in 2.000s (0.855m/s > 0.750m/s)
+[LOCALIZATION LOST]
+[SAFETY FAULT] localization/TF/sensor state is invalid
+[STOP BOTH]
+[STOP] CART-2
+[STOP] CART-1
+[SAFE STOP] CART-2: AMCL hard jump 1.709m at 0.855m/s exceeds plausible motion
+[SAFE STOP] Localization watchdog blocked release/new goals; /nav/stop was requested for both robots.

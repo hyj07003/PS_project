@@ -299,7 +299,7 @@ class Ros2Backend(RobotBackend):
         threading.Timer(max(0.5, delay), self._boot_home_pose_loop).start()
 
     def _amcl_idle_freeze_enabled(self) -> bool:
-        flag = os.environ.get("PINKY_AMCL_IDLE_FREEZE", "1").lower().strip()
+        flag = os.environ.get("PINKY_AMCL_IDLE_FREEZE", "0").lower().strip()
         return flag not in ("0", "false", "off", "no")
 
     def _amcl_node_name(self) -> str:
@@ -952,13 +952,16 @@ class Ros2Backend(RobotBackend):
             )
 
     def _invalidate_pending_freeze(self) -> None:
-        """Bump session id so scheduled idle-freeze timers become no-ops."""
+        """Bump freeze-timer generation without tearing down an active nav session."""
         with self._lock:
-            self._nav_session_id += 1
-            self._nav_session_active = False
-            self._nav_session_saw_active = False
+            # Keep _nav_session_id if a navigate_to_wait session is live — bumping
+            # it here used to desync sid and trigger reject/cancel storms.
+            if not self._nav_session_active:
+                self._nav_session_id += 1
+                self._nav_session_saw_active = False
             # 새 ensure/goal 직전: 옛 status 기반 navigating 잔상 제거
-            # (곧 _start_nav_session 이 True 로 다시 켠다)
+            if not self._nav_session_active:
+                self._is_navigating = False
 
     def _start_nav_session(self) -> int:
         self._boot_home_cancel.set()
@@ -968,7 +971,9 @@ class Ros2Backend(RobotBackend):
             sid = self._nav_session_id
             self._nav_session_active = True
             self._nav_session_saw_active = False
-            self._is_navigating = True
+            # Do NOT mark navigating until Nav2 accepts — otherwise every reject
+            # retry thinks we are busy and cancel↔REJECT loops forever.
+            self._is_navigating = False
             self._localization_idle_frozen = False
             # 주행 시작 시 pose hold 해제 — 안 하면 TF 갱신이 멈춤
             self._pose_hold_until = 0.0
@@ -1765,10 +1770,12 @@ class Ros2Backend(RobotBackend):
                 if navigating:
                     self._nav_session_saw_active = True
                     self._is_navigating = True
-                else:
-                    # replan/recovery 중 status 가 잠깐 idle 이어도 세션 유지.
-                    # (여기서 freeze 하면 AMCL off → 재activate 시 홈 점프)
+                elif self._nav_session_saw_active:
+                    # Was executing; brief idle during replan — keep flag.
                     self._is_navigating = True
+                else:
+                    # Goal not accepted yet / rejected / canceled before execute.
+                    self._is_navigating = False
             else:
                 self._is_navigating = navigating
         # idle freeze 는 navigate_to_wait/_finish · cancel · async result 콜백만
@@ -2054,11 +2061,13 @@ class Ros2Backend(RobotBackend):
                 self._node.get_logger().warn(f"ensure localization: {exc}")
 
         # 이전 goal 이 실제로 돌 때만 cancel (항상 cancel 하면 새 goal REJECT 레이스)
-        if self.is_navigating():
+        if self._nav_action_busy() or self.is_navigating():
             try:
-                self._cancel_nav_sync(timeout_sec=2.0)
+                self._cancel_nav_sync(timeout_sec=2.5)
             except Exception:
                 pass
+        else:
+            self._wait_nav_action_idle(1.0)
 
         if self._wait_usable_tf(1.5) is None:
             return {
@@ -2233,12 +2242,37 @@ class Ros2Backend(RobotBackend):
                     arrive_yaw=arrive_yaw,
                 )
 
-        # 잔여 goal cancel — Nav2는 이전 goal이 남아 있으면 새 goal 을 REJECT
-        try:
-            self._cancel_nav_sync(timeout_sec=2.0)
-        except Exception:
-            pass
-        self._wait_nav_action_idle(3.0)
+        # Default: do NOT cancel before a new goal. CancelGoal(empty) races and
+        # leaves bt_navigator rejecting with action_state=UNKNOWN/CANCELED.
+        cancel_before = (os.environ.get("PINKY_NAV_CANCEL_BEFORE_GOAL") or "0").strip().lower() in (
+            "1",
+            "true",
+            "on",
+            "yes",
+        )
+        if cancel_before:
+            pre_state = ""
+            with self._lock:
+                pre_state = (self._navigation_action_state or "").upper()
+            if pre_state in ("ACCEPTED", "EXECUTING", "CANCELING"):
+                try:
+                    self._cancel_nav_sync(timeout_sec=2.5)
+                except Exception:
+                    pass
+                self._wait_nav_action_idle(
+                    float(os.environ.get("PINKY_NAV_PRE_GOAL_IDLE_SEC", "3.0"))
+                )
+        else:
+            # Soft wait only if something is clearly executing.
+            with self._lock:
+                pre_state = (self._navigation_action_state or "").upper()
+            if pre_state in ("ACCEPTED", "EXECUTING", "CANCELING"):
+                self._wait_nav_action_idle(
+                    float(os.environ.get("PINKY_NAV_PRE_GOAL_IDLE_SEC", "5.0"))
+                )
+            with self._lock:
+                self._navigation_action_state = "UNKNOWN"
+                self._is_navigating = False
 
         if self._wait_usable_tf(1.5) is None:
             return {
@@ -2249,6 +2283,38 @@ class Ros2Backend(RobotBackend):
                     "check AMCL/lidar/map (Nav2 rejects goals without robot pose)"
                 ),
             }
+
+        if not self._nav_client.wait_for_server(timeout_sec=5.0):
+            return {
+                "success": False,
+                "status": "UNAVAILABLE",
+                "message": "navigate_to_pose Action Server not available",
+            }
+
+        # Idle-freeze may have deactivated AMCL after ensure — Nav2 then REJECTS.
+        try:
+            self._amcl_activate()
+        except Exception as exc:
+            if self._node:
+                self._node.get_logger().warn(f"pre-goal AMCL activate: {exc}")
+        settle_amcl = float(os.environ.get("PINKY_LOCALIZE_SETTLE_AFTER_FREEZE_SEC", "1.5"))
+        if settle_amcl > 0:
+            time.sleep(min(3.0, settle_amcl))
+        if self._wait_usable_tf(2.0) is None:
+            # One more ensure if TF still missing after activate.
+            try:
+                self._ensure_localization_for_drive(x, y, yaw)
+            except Exception:
+                pass
+            if self._wait_usable_tf(2.0) is None:
+                return {
+                    "success": False,
+                    "status": "NO_TF",
+                    "message": (
+                        "no map→base TF after AMCL activate — "
+                        "set initialpose / check lidar+AMCL"
+                    ),
+                }
 
         sid = self._start_nav_session()
 
@@ -2310,37 +2376,45 @@ class Ros2Backend(RobotBackend):
             goal_handle = _wait_accept(send_future)
             if goal_handle is not None and getattr(goal_handle, "accepted", False):
                 break
+            amcl_lbl = self._amcl_get_state_label()
+            tf_ok = self._lookup_tf_pose() is not None
             with self._lock:
                 action_state = self._navigation_action_state
             if self._node:
                 self._node.get_logger().warn(
                     f"NavigateToPose rejected try {attempt}/{max_accept} "
-                    f"action_state={action_state}"
+                    f"action_state={action_state} amcl={amcl_lbl} tf={tf_ok}"
                 )
+            # Re-activate AMCL between rejects (idle freeze / lifecycle flake).
             try:
-                self._cancel_nav_sync(timeout_sec=2.0)
+                self._amcl_activate()
             except Exception:
                 pass
-            self._wait_nav_action_idle(2.5)
-            time.sleep(min(0.8, 0.2 * attempt))
-            if attempt < max_accept:
-                try:
-                    self._ensure_localization_for_drive()
-                except Exception:
-                    pass
+            settle = float(os.environ.get("PINKY_NAV_REJECT_SETTLE_SEC", "2.0"))
+            time.sleep(max(0.5, settle) + 0.25 * attempt)
+            try:
+                self._nav_client.wait_for_server(timeout_sec=3.0)
+            except Exception:
+                pass
+            with self._lock:
+                self._navigation_action_state = "UNKNOWN"
+                self._is_navigating = False
             goal_handle = None
 
         if goal_handle is None or not getattr(goal_handle, "accepted", False):
             with self._lock:
                 action_state = self._navigation_action_state
+            amcl_lbl = self._amcl_get_state_label()
+            tf_ok = self._lookup_tf_pose() is not None
             return _finish(
                 {
                     "success": False,
                     "status": "REJECTED",
                     "message": (
-                        f"goal rejected (Nav2) action_state={action_state}. "
-                        "Wait for previous goal to finish canceling; "
-                        "check bt_navigator is active and a single Nav2 instance"
+                        f"goal rejected (Nav2) action_state={action_state} "
+                        f"amcl={amcl_lbl} tf={tf_ok}. "
+                        "If amcl!=active: set PINKY_AMCL_IDLE_FREEZE=0 or check initialpose. "
+                        "If duplicate bt_navigator WARNING: pkill nav2 and restart run.py once"
                     ),
                 }
             )
@@ -2456,31 +2530,50 @@ class Ros2Backend(RobotBackend):
         """Wait until bt_navigator is ready to accept a new NavigateToPose."""
         deadline = time.time() + max(0.2, float(timeout_sec))
         while time.time() < deadline:
-            if not self._nav_action_busy():
-                time.sleep(0.2)
-                if not self._nav_action_busy():
+            if not self._nav_action_busy() and not self.is_navigating():
+                # Double-check after a short settle — CANCELING often flashes UNKNOWN.
+                time.sleep(0.15)
+                if not self._nav_action_busy() and not self.is_navigating():
                     return True
             time.sleep(0.05)
-        return not self._nav_action_busy()
+        return not self._nav_action_busy() and not self.is_navigating()
 
     def _cancel_nav_sync(self, timeout_sec: float = 2.0) -> dict[str, Any]:
-        """Cancel NavigateToPose and wait briefly for the cancel service response."""
+        """Cancel NavigateToPose and wait until the action is no longer CANCELING."""
         if not self._nav_enabled or self._cancel_client is None:
             self._end_nav_session()
             return {"success": False, "message": "navigation not enabled"}
         from action_msgs.srv import CancelGoal
 
+        settle = float(os.environ.get("PINKY_NAV_CANCEL_SETTLE_SEC", "0.6"))
+        idle_wait = float(os.environ.get("PINKY_NAV_CANCEL_IDLE_SEC", "4.0"))
+
+        # Already idle — avoid cancel storms that leave bt_navigator rejecting goals.
+        if not self._nav_action_busy() and not self.is_navigating():
+            self._end_nav_session()
+            return {"success": True, "message": "already idle"}
+
         if not self._cancel_client.wait_for_service(timeout_sec=1.0):
             self._end_nav_session()
             return {"success": False, "message": "cancel service not available"}
+
+        with self._lock:
+            self._navigation_action_state = "CANCELING"
+
         req = CancelGoal.Request()
         fut = self._cancel_client.call_async(req)
         deadline = time.time() + max(0.2, float(timeout_sec))
         while not fut.done() and time.time() < deadline:
             time.sleep(0.05)
         self._end_nav_session()
-        # cancel 직후 서버가 새 goal 을 받을 틈
-        time.sleep(0.15)
+        # Give Nav2 time to leave CANCELING before a new goal (REJECT race).
+        time.sleep(max(0.15, settle))
+        self._wait_nav_action_idle(idle_wait)
+        with self._lock:
+            if (self._navigation_action_state or "").upper() == "CANCELING":
+                # Status topic stuck; clear so we can retry send.
+                self._navigation_action_state = "CANCELED"
+                self._is_navigating = False
         return {"success": True, "message": "cancel requested"}
 
     def cancel_navigation(self, *, freeze: bool = True) -> dict[str, Any]:

@@ -339,7 +339,7 @@ erDiagram
 - NestJS 관제를 **Flask**로 교체 (HTTP·JSON·SQLite 계약은 BFF와 동일하게 유지)
 - 주문 생성 시 미션을 **FIFO 큐(`CREATED`)** 에 넣고, **idle 카트**에만 할당
 - 할당 후 맵 웨이포인트 피킹 순회: 매대(W*) 가까운 순 → 계산대(C) → 운송대기(P) → 홈(S1/S2)
-- 매대(W1–W6)는 도착 후 **OMX 픽업 완료(DONE)** 를 기다린 뒤 다음 작업 진행, C/P/S1/S2는 기존 **dwell** 유지 (`PICK_DWELL_SEC`)
+- 매대(W1–W6)는 도착 후 **OMX 픽업 완료(DONE)** 를 기다린 뒤 다음 작업 진행 (고정 dwell 없음). OMX 서버 미통신·mock·`OMX_URL` 없음은 성공으로 처리 후 즉시 계속. C/P는 dwell 기본 0 (`PICK_DWELL_SEC`)
 - Pinky: `POST /nav/goal_wait` (Nav2 도착 대기). URL은 `PINKY_ROBOTS` / `PINKY_URL`+`PINKY_URL_2`
 - 2대 동시 미션: `TrafficCoordinator`가 leg 전송 전 경로 충돌 검사·progress/sticky owner(`can_clear`·`releaseIndex`)·동점 시 mission FIFO·홈 복귀(S1/S2) 순차 제어 (`GET /traffic/state` 모니터링)
 - 웨이포인트 **zone 점유**: 매대/계산대/운송대기 도킹~언독(C는 dwell 후) 구간을 disc로 등록; 다른 로봇 경로가 zone을 지나면 leg grant 보류
@@ -524,7 +524,7 @@ pnpm dev:web          # Next.js :3000
 | `OMX_CONNECT_TIMEOUT_SEC` | OMX HTTP 연결 타임아웃 초 (기본 `5`, LAN/원격)                    |
 | `OMX_POLL_SEC`         | OMX `/pick/state` 폴링 주기 초 (기본 `0.5`)                        |
 | `OMX_PICK_TIMEOUT_SEC` | OMX 픽업 1회 타임아웃 초 (기본 `90`)                               |
-| `PICK_DWELL_SEC`       | C/P/S1/S2 도착 후 대기 초 (기본 `3`)                              |
+| `PICK_DWELL_SEC`       | C/P/홈 도착 후 대기 초 (기본 `0`, 비활성)                           |
 | `PICK_NAV_TIMEOUT_SEC` | Nav2 goal_wait 타임아웃 초 (기본 `180`)                          |
 | `TRAFFIC_ENABLED`      | 다중 로봇 교통 제어 on/off (기본 `1`, `PINKY_ROBOTS` 2대 이상일 때 적용) |
 | `TRAFFIC_CLEARANCE_M`  | 경로 충돌 판정 거리 m (기본 `0.20`)                              |
@@ -680,7 +680,7 @@ stateDiagram-v2
 - 대기 큐: `missions.status=CREATED` and `device_id IS NULL` (FIFO)
 - idle `cart-*`만 할당. 두 대 busy면 큐에 대기
 - 웨이포인트: `app/waypoints.py` (S1/S2 홈, W1–W6 매대, C 계산대, P 운송대기)
-- 매대(W1–W6)는 OMX 픽업 완료 기반 진행, C/P/S1/S2는 dwell 기본 3초 (`PICK_DWELL_SEC`)
+- 매대(W1–W6)는 OMX 픽업 완료 기반 진행(미통신 시 성공 처리), C/P dwell 기본 0 (`PICK_DWELL_SEC`)
 - 작업 종료 시점: **대기장소(S1/S2) 도착 완료** 후 `COMPLETED` (모니터링 할당 해제). 복귀 중은 `RETURNING`
 - 중도 실패 시에도 대기장소 복귀 시도 후 `FAILED`
 - 각 전이는 `mission_events`에 기록. 모니터링은 `current_waypoint` 표시

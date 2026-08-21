@@ -662,17 +662,16 @@ def run_aruco_dock(
     us_last: float | None = None
     pre_approach_marker_m: float | None = None
 
-    def _capture_pre_approach_range() -> None:
-        """접근 시작 직전 마커(또는 초음파) 거리를 한 번만 저장. 후진 거리로 쓴다."""
+    def _capture_pre_approach_range(*, force: bool = False) -> None:
+        """접근 시작 직전 마커(또는 초음파) 거리를 한 번만 저장. 후진 목표 range로 쓴다."""
         nonlocal pre_approach_marker_m
-        if pre_approach_marker_m is not None:
+        if pre_approach_marker_m is not None and not force:
             return
         rng = z_last if z_last is not None else us_last
         if rng is not None and float(rng) > 0.0:
             pre_approach_marker_m = float(rng)
 
     def _undock_distance_m() -> float:
-        _capture_pre_approach_range()
         if pre_approach_marker_m is not None:
             return max(0.0, float(pre_approach_marker_m))
         rng = z_last if z_last is not None else us_last
@@ -680,7 +679,18 @@ def run_aruco_dock(
             return float(rng)
         return 0.0
 
+    def _begin_approach() -> None:
+        """FACE/SHIFT 종료 후 전진 전: 정지 → 거리 저장 → APPROACH."""
+        nonlocal phase, pose_ready_before_approach
+        stop()
+        time.sleep(0.05)
+        _capture_pre_approach_range()
+        phase = "APPROACH"
+        pose_ready_before_approach = True
+        _report("APPROACH", force=True)
+
     def _cmd_vel(linear_x: float, angular_z: float) -> Any:
+        # 전진 직전에만 저장(이미 있으면 유지). ARRIVED의 짧은 거리는 절대 덮지 않음.
         if phase in ("APPROACH", "US_APPROACH") and float(linear_x) > 0.0:
             _capture_pre_approach_range()
         return drive(linear_x, angular_z)
@@ -795,7 +805,8 @@ def run_aruco_dock(
     def _report(phase_name: str, *, force: bool = False) -> None:
         nonlocal last_status, last_progress_t
         last_status = phase_name
-        if phase_name in ("APPROACH", "US_APPROACH", "ARRIVED"):
+        # APPROACH 진입 직후에만 미저장이면 보완. ARRIVED(standoff)로는 절대 캡처하지 않음.
+        if phase_name in ("APPROACH", "US_APPROACH"):
             _capture_pre_approach_range()
         if on_progress is None:
             return
@@ -1150,18 +1161,14 @@ def run_aruco_dock(
                         tx_cmd = _tx_for_shift(tx)
                         if tx_cmd is None:
                             # 부호 흔들림 — 횡이 애매하면 접근으로 진행 (파킹 정체 방지)
-                            phase = "APPROACH"
-                            pose_ready_before_approach = True
-                            _report("APPROACH", force=True)
+                            _begin_approach()
                             time.sleep(0.04)
                             continue
                         if _start_shift(tx_cmd):
                             time.sleep(0.04)
                             continue
                         # iter 한도·오버슈트 가드 — 자세 최대한 맞춘 뒤 APPROACH
-                        phase = "APPROACH"
-                        pose_ready_before_approach = True
-                        _report("APPROACH", force=True)
+                        _begin_approach()
                         time.sleep(0.05)
                         continue
                     # 정자세 OK. 이미 standoff 안이면 여기서 도착 (위에서 놓친 경우)
@@ -1188,14 +1195,12 @@ def run_aruco_dock(
                             "phaseLabel": phase_label_ko("ARRIVED"),
                             "approachTravelM": _undock_distance_m(),
                         }
-                    phase = "APPROACH"
+                    _begin_approach()
                     if lat_ready:
                         shift_iters = 0
                         # 오버슈트 가드(shift_stop_further)는 유지 — 같은 방향 재SHIFT 방지
                         if not shift_stop_further:
                             shift_tx_before = None
-                    pose_ready_before_approach = True
-                    _report("APPROACH", force=True)
                     time.sleep(0.05)
                     continue
 
@@ -1208,12 +1213,11 @@ def run_aruco_dock(
                         continue
                     # exhausted: keep creeping while trimmed
 
-                phase = "APPROACH"
+                if phase != "APPROACH":
+                    _begin_approach()
                 if lat_ready and not shift_stop_further:
                     shift_iters = 0
                     shift_tx_before = None
-                pose_ready_before_approach = True
-                _report("APPROACH")
                 # 접근 중에도 자세 깨지면 전진 중단 → FACE
                 if not center_ok or (
                     not lat_ready
@@ -1350,7 +1354,11 @@ def run_aruco_undock(
     range_tol_m: float | None = None,
     mock: bool = False,
 ) -> dict[str, Any]:
-    """Reverse slowly until marker/ultrasonic range reaches target_range_m (pre-approach)."""
+    """Reverse until marker/ultrasonic range reaches target_range_m (pre-approach).
+
+    Hard-caps odometry travel to ~(target - start_range) so a lost marker or
+    noisy range cannot keep reversing past the saved approach distance.
+    """
     target = max(0.0, float(target_range_m))
     speed = abs(float(speed_mps if speed_mps is not None else _env_float("PICK_SHELF_UNDOCK_SPEED_MPS", 0.02)))
     timeout = float(
@@ -1358,7 +1366,7 @@ def run_aruco_undock(
         if timeout_sec is not None
         else _env_float("PINKY_ARUCO_UNDOCK_TIMEOUT_SEC", 30.0)
     )
-    max_travel = float(
+    max_travel_cfg = float(
         max_travel_m
         if max_travel_m is not None
         else _env_float("PICK_SHELF_UNDOCK_MAX_M", 0.80)
@@ -1368,6 +1376,7 @@ def run_aruco_undock(
         if range_tol_m is not None
         else _env_float("PINKY_ARUCO_UNDOCK_RANGE_TOL_M", 0.015)
     )
+    slack = max(0.0, _env_float("PINKY_ARUCO_UNDOCK_TRAVEL_SLACK_M", 0.025))
     marker_len = _env_float("PINKY_ARUCO_MARKER_LENGTH_M", 0.037)
     width = _env_int("PINKY_CAMERA_WIDTH", 640)
     height = _env_int("PINKY_CAMERA_HEIGHT", 480)
@@ -1514,14 +1523,46 @@ def run_aruco_undock(
                     "targetRangeM": target,
                     "distanceSource": last_source,
                     "movedM": _odom_travel(),
+                    "maxTravelM": max_travel,
                 }
             )
         except Exception:
             pass
 
+    # Seed start range (docked) before moving — used for odom travel budget.
+    start_range: float | None = None
+    try:
+        for _ in range(8):
+            ok, frame = source.read()
+            if ok and frame is not None:
+                rng, src = _read_range(frame)
+                if rng is not None:
+                    start_range = float(rng)
+                    last_range = start_range
+                    last_source = src
+                    break
+            us = _read_ultrasonic_m(get_ultrasonic)
+            if us is not None:
+                start_range = float(us)
+                last_range = start_range
+                last_source = "ultrasonic"
+                break
+            time.sleep(0.05)
+    except Exception:
+        pass
+
+    if start_range is not None and target > start_range:
+        expected_travel = (target - start_range) + slack
+    else:
+        # 도킹 직후 마커가 안 보이면 standoff≈수 cm 가정 — range 전체를 odom으로 쓰지 않음
+        assumed_dock = max(0.04, min(target * 0.25, 0.12))
+        expected_travel = max(0.04, (target - assumed_dock) + slack)
+    max_travel = max(0.04, min(max_travel_cfg, expected_travel))
+
     try:
         stop()
         _report(force=True)
+        miss_reads = 0
         while time.time() < deadline:
             if should_cancel is not None:
                 try:
@@ -1535,6 +1576,7 @@ def run_aruco_undock(
                             "targetRangeM": target,
                             "distanceM": last_range,
                             "movedM": _odom_travel(),
+                            "maxTravelM": max_travel,
                         }
                 except Exception:
                     pass
@@ -1549,7 +1591,10 @@ def run_aruco_undock(
                 if us is not None:
                     rng, src = float(us), "ultrasonic"
 
+            traveled = _odom_travel()
+
             if rng is not None:
+                miss_reads = 0
                 last_range = rng
                 last_source = src
                 _report()
@@ -1563,20 +1608,33 @@ def run_aruco_undock(
                         "targetRangeM": target,
                         "distanceM": float(rng),
                         "distanceSource": src,
-                        "movedM": _odom_travel(),
+                        "movedM": traveled,
+                        "maxTravelM": max_travel,
+                        "startRangeM": start_range,
                     }
+            else:
+                miss_reads += 1
 
-            traveled = _odom_travel()
+            # Odom hard stop: never reverse beyond the approach budget.
             if traveled >= max_travel:
                 stop()
+                near_ok = (
+                    last_range is not None
+                    and float(last_range) + tol * 2.0 >= target * 0.85
+                )
                 return {
-                    "success": False,
-                    "status": "MAX_TRAVEL",
-                    "message": f"undock max travel {max_travel:.3f}m reached",
+                    "success": bool(near_ok or last_range is None or miss_reads >= 5),
+                    "status": "UNDOCKED" if near_ok or miss_reads >= 5 else "MAX_TRAVEL",
+                    "message": (
+                        f"undock odom cap {max_travel:.3f}m "
+                        f"(targetRange={target:.3f} start={start_range})"
+                    ),
                     "markerId": int(marker_id),
                     "targetRangeM": target,
                     "distanceM": last_range,
                     "movedM": traveled,
+                    "maxTravelM": max_travel,
+                    "startRangeM": start_range,
                 }
 
             gap = target - (last_range if last_range is not None else 0.0)
@@ -1591,11 +1649,15 @@ def run_aruco_undock(
                     "distanceM": last_range,
                     "distanceSource": last_source,
                     "movedM": traveled,
+                    "maxTravelM": max_travel,
+                    "startRangeM": start_range,
                 }
 
-            v_cmd = speed
+            # Remaining odom budget shrinks speed near the end.
+            remain_odom = max(0.0, max_travel - traveled)
+            v_cmd = min(speed, max(0.01, 0.55 * remain_odom))
             if last_range is not None and gap > 0.0:
-                v_cmd = min(speed, max(0.01, 0.45 * gap))
+                v_cmd = min(v_cmd, max(0.01, 0.45 * gap))
             try:
                 drive(-v_cmd, 0.0)
             except TypeError:
@@ -1611,6 +1673,8 @@ def run_aruco_undock(
             "targetRangeM": target,
             "distanceM": last_range,
             "movedM": _odom_travel(),
+            "maxTravelM": max_travel,
+            "startRangeM": start_range,
         }
     finally:
         stop()

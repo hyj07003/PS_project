@@ -10,6 +10,7 @@ import {
   Post,
   Put,
   Query,
+  Req,
   Res,
   UploadedFile,
   UseGuards,
@@ -17,7 +18,7 @@ import {
 } from "@nestjs/common";
 import { FileInterceptor } from "@nestjs/platform-express";
 import { JwtService } from "@nestjs/jwt";
-import type { Response } from "express";
+import type { Request, Response } from "express";
 import type {
   AuthLoginInput,
   AuthRegisterInput,
@@ -29,6 +30,7 @@ import type {
 } from "@smartshop/shared";
 import * as fs from "fs";
 import * as path from "path";
+import { Readable } from "stream";
 import { diskStorage } from "multer";
 import { AdminGuard, AuthGuard, CurrentUser, type AuthPayload } from "./auth";
 import { controllerJson } from "./controller-client";
@@ -39,6 +41,7 @@ import {
   pinkyJson,
   resolvePinkyUrl,
 } from "./pinky-client";
+import { omxConfigured, omxFetch, omxJson, omxUrl } from "./omx-client";
 
 function parseNavPath(raw: unknown): { x: number; y: number }[] {
   if (!raw || typeof raw !== "object") return [];
@@ -778,6 +781,154 @@ export class AppController {
       return await controllerJson("/robot/telemetry");
     } catch (err) {
       wrapError(err);
+    }
+  }
+
+  /** OMX LAN reachability + health (robotConnected, busy, rig). */
+  @Get("admin/omx/health")
+  @UseGuards(AdminGuard)
+  async omxHealth() {
+    const url = omxUrl();
+    if (!omxConfigured() || !url) {
+      return {
+        success: false,
+        status: "UNCONFIGURED",
+        configured: false,
+        reachable: false,
+        url: null,
+        message: "OMX_URL 미설정 (server/.env)",
+      };
+    }
+    const started = Date.now();
+    try {
+      const health = await omxJson<Record<string, unknown>>("/health");
+      return {
+        ...health,
+        configured: true,
+        reachable: true,
+        url,
+        latencyMs: Date.now() - started,
+      };
+    } catch (err) {
+      const e = err as Error & { status?: number };
+      return {
+        success: false,
+        status: "UNREACHABLE",
+        configured: true,
+        reachable: false,
+        url,
+        latencyMs: Date.now() - started,
+        message: e.message || "OMX 서버에 연결할 수 없습니다",
+        httpStatus: e.status || 0,
+      };
+    }
+  }
+
+  /**
+   * MJPEG proxy. `<img>` cannot send Authorization — pass `?token=<jwt>`.
+   * cam=camera1 (front/top) | camera2 (wrist), fps default 10.
+   */
+  @Get("admin/omx/stream")
+  async omxStream(
+    @Query("cam") cam: string | undefined,
+    @Query("fps") fps: string | undefined,
+    @Query("token") token: string | undefined,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    this.assertAdminToken(req, token);
+    if (!omxConfigured()) {
+      throw new HttpException("OMX_URL is not configured", 503);
+    }
+    const camId =
+      cam === "camera2" || cam === "wrist" ? "camera2" : "camera1";
+    const rate = Math.min(30, Math.max(1, Number(fps) || 10));
+    try {
+      const upstream = await omxFetch(
+        `/stream?cam=${encodeURIComponent(camId)}&fps=${rate}`,
+      );
+      const ct =
+        upstream.headers.get("content-type") ||
+        "multipart/x-mixed-replace; boundary=frame";
+      res.status(200);
+      res.setHeader("Content-Type", ct);
+      res.setHeader("Cache-Control", "no-store, no-cache");
+      res.setHeader("Connection", "close");
+      const body = upstream.body;
+      if (!body) {
+        res.end();
+        return;
+      }
+      // Node 20+: Web ReadableStream → Node stream
+      const nodeStream = Readable.fromWeb(
+        body as import("stream/web").ReadableStream,
+      );
+      nodeStream.on("error", () => {
+        try {
+          res.destroy();
+        } catch {
+          /* ignore */
+        }
+      });
+      req.on("close", () => {
+        try {
+          nodeStream.destroy();
+        } catch {
+          /* ignore */
+        }
+      });
+      nodeStream.pipe(res);
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  /** Single JPEG frame (Bearer or ?token=) — fallback if MJPEG fails. */
+  @Get("admin/omx/frame.jpg")
+  async omxFrame(
+    @Query("cam") cam: string | undefined,
+    @Query("token") token: string | undefined,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    this.assertAdminToken(req, token);
+    if (!omxConfigured()) {
+      throw new HttpException("OMX_URL is not configured", 503);
+    }
+    const camId =
+      cam === "camera2" || cam === "wrist" ? "camera2" : "camera1";
+    try {
+      const upstream = await omxFetch(
+        `/frame.jpg?cam=${encodeURIComponent(camId)}`,
+      );
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.setHeader(
+        "Content-Type",
+        upstream.headers.get("content-type") || "image/jpeg",
+      );
+      res.setHeader("Cache-Control", "no-store");
+      res.send(buf);
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
+  private assertAdminToken(req: Request, queryToken?: string) {
+    const header = req.headers.authorization;
+    const raw =
+      (header?.startsWith("Bearer ") ? header.slice(7) : "") ||
+      (queryToken || "").trim();
+    if (!raw) {
+      throw new HttpException("missing token", 401);
+    }
+    try {
+      const payload = this.jwt.verify<AuthPayload>(raw);
+      if (payload.role !== "admin") {
+        throw new HttpException("admin only", 403);
+      }
+    } catch (err) {
+      if (err instanceof HttpException) throw err;
+      throw new HttpException("invalid token", 401);
     }
   }
 }

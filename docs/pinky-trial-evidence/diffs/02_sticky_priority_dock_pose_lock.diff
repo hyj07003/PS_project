@@ -1,0 +1,117 @@
+--- traffic_controller_PATH_LIFECYCLE_RELEASE_FIX.py
++++ traffic_controller_STICKY_OWNER_DOCK_LOCK_FIX.py
+@@ -1546,6 +1546,7 @@
+     release_margin: float,
+     allow_terminal_docking: bool = False,
+     tie_distance_m: float = 0.05,
++    preferred_owner_key: str | None = None,
+ ) -> tuple[str, str, dict[str, Any]]:
+     """Choose a conflict owner that can actually clear the reservation.
+ 
+@@ -1620,7 +1621,18 @@
+             f"required={release_margin:.3f}m; WAIT/replan required"
+         )
+ 
+-    if len(selectable) == 1:
++    # Sticky-owner policy:
++    # Once a robot owns a conflict chain, keep that authority for subsequent
++    # conflict segments as long as it can still clear the selected segment.
++    # Authority is re-arbitrated only when the owner is no longer selectable
++    # (e.g. blocked / cannot clear / recovery path changed).
++    if preferred_owner_key in selectable:
++        owner_key = str(preferred_owner_key)
++        reason = (
++            f"sticky owner {owner_key.upper()} retained for the next conflict "
++            "segment; authority changes only on blockage/failure"
++        )
++    elif len(selectable) == 1:
+         owner_key = selectable[0]
+         reason = (
+             f"{owner_key.upper()} is the only robot that can clear conflict EXIT "
+@@ -2009,6 +2021,31 @@
+         states: dict[str, dict[str, Any]] = {}
+         try:
+             for robot in contexts:
++                if terminal_docking and robot.phase == "DOCKED":
++                    # Freeze the already-validated parked pose.  A parked cart
++                    # no longer needs live AMCL to release the other cart; its
++                    # collision footprint remains reserved at HOME.  This also
++                    # prevents an AMCL relocalization jump from teleporting the
++                    # parked marker in RViz.
++                    robot.last_valid_pose = {
++                        "x": float(robot.final_goal.x),
++                        "y": float(robot.final_goal.y),
++                        "yaw": float(robot.final_goal.yaw),
++                    }
++                    robot.last_pose_time = now
++                    states[robot.name] = {
++                        "pose": dict(robot.last_valid_pose),
++                        "navigating": False,
++                        "navigationAction": {"state": "SUCCEEDED"},
++                        "nav2Readiness": {
++                            "ready": True,
++                            "tfValid": True,
++                            "scanFresh": True,
++                            "failures": [],
++                        },
++                    }
++                    continue
++
+                 state = get_state(robot, http_timeout)
+                 states[robot.name] = state
+                 validate_localization_state(
+@@ -2199,6 +2236,16 @@
+             )
+             if owner_cleared:
+                 owner.phase = "DOCKED"
++                owner.last_valid_pose = {
++                    "x": float(owner.final_goal.x),
++                    "y": float(owner.final_goal.y),
++                    "yaw": float(owner.final_goal.yaw),
++                }
++                owner.last_pose_time = now
++                print(
++                    f"[DOCK POSE LOCK] {owner.name}: validated HOME pose frozen "
++                    "for traffic/RViz while the other cart returns"
++                )
+                 if path_update_callback:
+                     path_update_callback(owner, [])
+                     print(f"[RVIZ PATH CLEAR] {owner.name}: HOME path completed")
+@@ -2414,6 +2461,11 @@
+                 f"[RUNTIME PRIORITY] owner={new_owner.name} waiter={new_waiter.name}: "
+                 f"{decision['reason']}"
+             )
++            if new_owner.name != owner.name:
++                print(
++                    f"[PRIORITY SWITCH] {owner.name} -> {new_owner.name}: "
++                    "runtime blockage/recovery requires re-arbitration"
++                )
+ 
+             # The newly selected waiter must be stationary at its current pose.
+             if navigating_state(get_state(new_waiter, http_timeout), new_waiter.name):
+@@ -2498,8 +2550,16 @@
+                     print(f"[POST-SEGMENT CONFLICT] remaining={len(remaining)}")
+                     if remaining:
+                         try:
++                            current_owner_key = (
++                                "cart1" if owner.name == "CART-1" else "cart2"
++                            )
+                             next_owner_key, next_waiter_key, next_decision = select_conflict_priority(
+-                                by_key, remaining, fallback_priority, release_margin, False
++                                by_key,
++                                remaining,
++                                fallback_priority,
++                                release_margin,
++                                False,
++                                preferred_owner_key=current_owner_key,
+                             )
+                         except PathBlockedError as exc:
+                             print(f"[TRAFFIC WAIT] {exc}")
+@@ -2511,6 +2571,7 @@
+                             f"{len(remaining)} owner={by_key[next_owner_key].name} "
+                             f"waiter={by_key[next_waiter_key].name}"
+                         )
++                        print(f"[STICKY PRIORITY] {next_decision['reason']}")
+                         next_owner = by_key[next_owner_key]
+                         next_waiter = by_key[next_waiter_key]
+                         # Stop a robot only if authority switches and it is currently moving.

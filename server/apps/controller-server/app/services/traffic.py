@@ -17,7 +17,7 @@ from .traffic_paths import (
     has_passed_path_index,
     nearest_path_index,
     path_distance_between,
-    path_intersects_zones,
+    path_goal_in_zones,
     path_points,
     pose_near_path,
     retreat_path_index,
@@ -67,9 +67,22 @@ class RobotTrafficState:
     remaining_waypoints: list[str] = field(default_factory=list)
     conflict_owner_sticky: str | None = None
     last_wait_reason: str | None = None
+    wait_started_at: float = 0.0
 
 
 class TrafficTimeoutError(RuntimeError):
+    pass
+
+
+class TrafficYieldError(TrafficTimeoutError):
+    """Soft wait limit: yield this leg so a peer order/path can proceed."""
+
+    pass
+
+
+class TrafficEmergencyWaitError(TrafficTimeoutError):
+    """On peer NAV path — stage at W7 (비상대기). Not 충돌대기."""
+
     pass
 
 
@@ -94,10 +107,16 @@ class TrafficCoordinator:
         self._plan_timeout = float(os.environ.get("TRAFFIC_PLAN_TIMEOUT_SEC", "10"))
         self._poll_hz = float(os.environ.get("TRAFFIC_POLL_HZ", "2.0"))
         self._mission_timeout = float(os.environ.get("TRAFFIC_MISSION_TIMEOUT", "300"))
+        # Soft yield before hard mission timeout — frees stuck waiters for peer work.
+        self._yield_sec = float(os.environ.get("TRAFFIC_YIELD_SEC", "60"))
         self._goal_tolerance = float(os.environ.get("TRAFFIC_GOAL_TOLERANCE_M", "0.10"))
+        self._wait_replan_sec = float(os.environ.get("TRAFFIC_WAIT_REPLAN_SEC", "3.0"))
         self._home_priority = (
             os.environ.get("TRAFFIC_HOME_PRIORITY", "fifo").strip().lower()
         )
+        # S1/S2 are ~0.22m apart — serialize leaving the pad so paths don't clash.
+        self._home_clear_m = float(os.environ.get("TRAFFIC_HOME_CLEAR_M", "0.55"))
+        self._home_depart_owner: str | None = None
         from ..waypoints import staging_waypoint_id, waypoint_zone_radius_m
 
         self._zone_radius_m = waypoint_zone_radius_m()
@@ -107,10 +126,160 @@ class TrafficCoordinator:
         flag = (os.environ.get("TRAFFIC_ENABLED") or "1").strip().lower()
         if flag in ("0", "false", "off", "no"):
             return False
-        return len(self._robot_codes) >= 2
+        if len(self._robot_codes) < 2:
+            return False
+        # Only coordinate when two carts both have active missions.
+        # One order / one robot with two URLs registered must not hit stop_nav.
+        with self._lock:
+            active_missions = sum(
+                1 for st in self._robots.values() if st.mission_id is not None
+            )
+        if active_missions < 2:
+            return False
+        reachable = 0
+        for code in self._robot_codes:
+            try:
+                if self._cart_port.is_reachable(code):
+                    reachable += 1
+            except Exception:
+                continue
+        return reachable >= 2
+
+    def last_wait_reason(self, device_code: str) -> str | None:
+        code = device_code.strip().lower()
+        with self._lock:
+            state = self._robots.get(code)
+            return state.last_wait_reason if state else None
+
+    def _pose_near_point(
+        self, pose: dict[str, float] | None, xy: tuple[float, float], radius_m: float
+    ) -> bool:
+        if not pose or pose.get("x") is None or pose.get("y") is None:
+            return False
+        try:
+            dx = float(pose["x"]) - float(xy[0])
+            dy = float(pose["y"]) - float(xy[1])
+        except (TypeError, ValueError):
+            return False
+        return (dx * dx + dy * dy) ** 0.5 <= radius_m
+
+    def _device_home_xy(self, device_code: str) -> tuple[float, float]:
+        from ..waypoints import home_for_device
+
+        home = home_for_device(device_code)
+        return (home.x, home.y)
+
+    def _pose_near_own_home(
+        self, device_code: str, pose: dict[str, float] | None
+    ) -> bool:
+        return self._pose_near_point(
+            pose, self._device_home_xy(device_code), self._home_clear_m
+        )
+
+    def _pose_clear_of_home_pads(self, pose: dict[str, float] | None) -> bool:
+        """True when pose is outside both S1 and S2 clearance bubbles."""
+        from ..waypoints import WAYPOINTS
+
+        if not pose:
+            return False
+        for wid in ("S1", "S2"):
+            wp = WAYPOINTS[wid]
+            if self._pose_near_point(pose, (wp.x, wp.y), self._home_clear_m):
+                return False
+        return True
+
+    def _release_home_depart_if_clear(self, device_code: str) -> None:
+        code = device_code.strip().lower()
+        with self._lock:
+            if self._home_depart_owner != code:
+                return
+        try:
+            pose = self._cart_port.get_pose(code)
+        except Exception:
+            pose = None
+        if self._pose_clear_of_home_pads(pose):
+            with self._lock:
+                if self._home_depart_owner == code:
+                    self._home_depart_owner = None
+                    self._cond.notify_all()
+                    LOGGER.info("traffic home-depart released %s (cleared pad)", code)
+
+    def _try_claim_home_departure(
+        self,
+        device_code: str,
+        self_pose: dict[str, float] | None,
+        other_poses: dict[str, dict[str, float] | None],
+    ) -> tuple[bool, str]:
+        """Serialize leaving S1/S2. Returns (ok, reason)."""
+        code = device_code.strip().lower()
+        # Already off the pad — no departure lock needed; free slot if we held it.
+        if not self._pose_near_own_home(code, self_pose):
+            with self._lock:
+                if self._home_depart_owner == code:
+                    self._home_depart_owner = None
+                    self._cond.notify_all()
+            return True, "home_clear"
+
+        with self._lock:
+            self_state = self._robots.get(code)
+            owner = self._home_depart_owner
+            if owner and owner != code:
+                owner_pose = other_poses.get(owner)
+                owner_st = self._robots.get(owner)
+                owner_gone = (
+                    owner_st is None
+                    or owner_st.mission_id is None
+                    or owner_st.phase in ("IDLE",)
+                    or self._pose_clear_of_home_pads(owner_pose)
+                )
+                if owner_gone:
+                    self._home_depart_owner = None
+                    owner = None
+
+            if self._home_depart_owner == code:
+                return True, "home_depart_owner"
+
+            if self._home_depart_owner is not None:
+                return False, "wait_home_depart"
+
+            # Both still on pads: earlier mission leaves first.
+            candidates: list[tuple[float, str]] = [
+                (
+                    self_state.mission_assigned_at if self_state else 0.0,
+                    code,
+                )
+            ]
+            for other, st in self._robots.items():
+                if other == code or st.mission_id is None:
+                    continue
+                opose = other_poses.get(other)
+                if self._pose_near_own_home(other, opose):
+                    candidates.append((st.mission_assigned_at, other))
+            candidates.sort(key=lambda t: (t[0], t[1]))
+            winner = candidates[0][1]
+            if winner != code:
+                return False, "wait_home_depart"
+            self._home_depart_owner = code
+            LOGGER.info("traffic home-depart claimed by %s", code)
+            return True, "home_depart_owner"
+
+    def clear_stale_emergency_wait(self, device_code: str) -> None:
+        """Drop sticky emergency_wait when pose is no longer on a peer NAV path."""
+        code = device_code.strip().lower()
+        if self.is_on_peer_active_path(code):
+            return
+        with self._lock:
+            state = self._robots.get(code)
+            if state is not None and state.last_wait_reason == "emergency_wait":
+                state.last_wait_reason = None
+                self._cond.notify_all()
 
     def is_on_peer_active_path(self, device_code: str) -> bool:
-        """True when pose overlaps a peer that is actually NAVIGATING on a path."""
+        """True when pose overlaps a peer that is actually NAVIGATING on remaining path.
+
+        Only the path *ahead of* the peer (from their current index) counts — sitting
+        near the start of a long reserved path must not freeze forever.
+        """
         if not self.enabled():
             return False
         code = device_code.strip().lower()
@@ -119,6 +288,10 @@ class TrafficCoordinator:
         except Exception:
             pose = None
         if not pose:
+            return False
+        # Parked on own S1/S2: home-depart serialization handles this — do not
+        # enter emergency hold loops that cancel Nav2 forever.
+        if self._pose_near_own_home(code, pose):
             return False
         with self._lock:
             navigating = [
@@ -129,20 +302,32 @@ class TrafficCoordinator:
                 and st.phase == "NAVIGATING"
                 and st.active_path
             ]
-        for _peer, path in navigating:
+        for peer, path in navigating:
+            try:
+                peer_pose = self._cart_port.get_pose(peer)
+            except Exception:
+                peer_pose = None
             dense = self._densify_for_traffic(path)
-            if pose_near_path(pose, dense, self._clearance_m):
+            if not dense:
+                continue
+            # Remaining path from peer progress (not the already-cleared tail).
+            start_idx = nearest_path_index(dense, peer_pose) if peer_pose else 0
+            remaining = dense[max(0, start_idx) :]
+            if len(remaining) < 2:
+                remaining = dense[-2:] if len(dense) >= 2 else dense
+            if pose_near_path(pose, remaining, self._clearance_m):
                 return True
         return False
 
     def register_mission(self, device_code: str, mission_id: int) -> None:
-        if not self.enabled():
-            return
+        # Always record assignment (enabled() depends on active mission count).
         code = device_code.strip().lower()
         with self._lock:
             state = self._robots.setdefault(code, RobotTrafficState(device_code=code))
             state.mission_id = int(mission_id)
-            state.mission_assigned_at = time.monotonic()
+            # Keep the first assignment time (dispatch) for FIFO home-depart.
+            if state.mission_assigned_at <= 0.0:
+                state.mission_assigned_at = time.monotonic()
 
     def unregister_mission(self, device_code: str) -> None:
         code = device_code.strip().lower()
@@ -161,6 +346,9 @@ class TrafficCoordinator:
             state.remaining_waypoints = []
             state.conflict_owner_sticky = None
             state.last_wait_reason = None
+            state.wait_started_at = 0.0
+            if self._home_depart_owner == code:
+                self._home_depart_owner = None
             self._cond.notify_all()
 
     def interrupt_robot(self, device_code: str) -> None:
@@ -180,8 +368,11 @@ class TrafficCoordinator:
                 state.remaining_waypoints = []
                 state.conflict_owner_sticky = None
                 state.last_wait_reason = None
+                state.wait_started_at = 0.0
             if self._home_owner == code:
                 self._home_owner = None
+            if self._home_depart_owner == code:
+                self._home_depart_owner = None
             self._cond.notify_all()
 
     def update_remaining(self, device_code: str, waypoint_ids: list[str]) -> None:
@@ -194,22 +385,31 @@ class TrafficCoordinator:
             self._cond.notify_all()
 
     def try_claim_waypoint_zone(self, device_code: str, waypoint_id: str) -> bool:
-        """Atomically claim zone; False if another robot already holds it."""
+        """Atomically claim zone; False if another robot already holds it.
+
+        W6 and C share one footprint — peer holding either blocks the other.
+        Same robot may upgrade W6↔C without releasing (checkout after sandwich).
+        """
         if not self.enabled():
             return True
-        from ..waypoints import is_zone_occupiable
+        from ..waypoints import is_zone_occupiable, zones_overlap
 
         wid = (waypoint_id or "").strip().upper()
         if not is_zone_occupiable(wid):
             return True
         code = device_code.strip().lower()
         with self._lock:
+            state = self._robots.setdefault(code, RobotTrafficState(device_code=code))
+            # Already holding equivalent zone (W6→C or C→W6): just retarget claim.
+            if zones_overlap(state.occupied_waypoint, wid):
+                state.occupied_waypoint = wid
+                self._cond.notify_all()
+                return True
             for other_code, other_state in self._robots.items():
                 if other_code == code:
                     continue
-                if other_state.occupied_waypoint == wid:
+                if zones_overlap(other_state.occupied_waypoint, wid):
                     return False
-            state = self._robots.setdefault(code, RobotTrafficState(device_code=code))
             state.occupied_waypoint = wid
             self._cond.notify_all()
             return True
@@ -249,43 +449,61 @@ class TrafficCoordinator:
     def conflicting_waypoints(
         self, device_code: str, shelf_ids: list[str]
     ) -> set[str]:
-        """Shelf ids to defer: other occupancy + remaining overlap (waiter loses)."""
+        """Shelf ids to defer — only peers *currently occupying* that zone.
+
+        Do NOT defer just because a peer still lists the shelf in
+        ``remaining_waypoints`` (next work). That made carts wait for each
+        other's entire tour even when paths never overlapped.
+        Live path conflicts are handled by ``acquire_nav_leg``.
+        """
         if not self.enabled():
             return set()
         code = device_code.strip().lower()
         targets = {s.strip().upper() for s in shelf_ids}
         defer: set[str] = set()
+        from ..waypoints import zone_equivalent_ids
+
         with self._lock:
-            self_state = self._robots.get(code)
-            self_remaining = set(self_state.remaining_waypoints) if self_state else set()
             for other_code, other_state in self._robots.items():
                 if other_code == code or other_state.mission_id is None:
                     continue
-                if other_state.occupied_waypoint in targets:
-                    defer.add(other_state.occupied_waypoint)
-                overlap = targets & set(other_state.remaining_waypoints)
-                if not overlap:
+                occ = other_state.occupied_waypoint
+                if not occ:
                     continue
-                if self_state is None:
-                    defer.update(overlap)
-                    continue
-                if self_state.mission_assigned_at > other_state.mission_assigned_at:
-                    defer.update(overlap)
-                elif self_state.mission_assigned_at == other_state.mission_assigned_at:
-                    if code > other_code:
-                        defer.update(overlap)
+                occ_eq = zone_equivalent_ids(occ)
+                for tid in targets:
+                    if zone_equivalent_ids(tid) & occ_eq:
+                        defer.add(tid)
         return defer
 
     def waypoint_access_granted(self, device_code: str, waypoint_id: str) -> bool:
+        """True when this cart may claim/approach the waypoint zone.
+
+        Only blocks on *real* zone use:
+        - peer currently occupies the same waypoint zone, or
+        - target is P and peer is returning home (shared corridor).
+
+        Do NOT block just because the peer still lists this shelf in
+        ``remaining_waypoints`` — that caused "충돌 대기" freezes while paths
+        did not overlap and nobody was on the peer path.
+        Spatial conflicts are handled by ``acquire_nav_leg`` / path grant;
+        simultaneous claim races by ``try_claim_waypoint_zone``.
+        """
         if not self.enabled():
             return True
-        from ..waypoints import is_zone_occupiable
+        from ..waypoints import is_zone_occupiable, zones_overlap
 
         wid = (waypoint_id or "").strip().upper()
         if not is_zone_occupiable(wid):
             return True
         code = device_code.strip().lower()
         with self._lock:
+            self_state = self._robots.get(code)
+            # Already hold W6 or C → grant the other (same footprint).
+            if self_state is not None and zones_overlap(
+                self_state.occupied_waypoint, wid
+            ):
+                return True
             for other_code, other_state in self._robots.items():
                 if other_code == code:
                     continue
@@ -293,24 +511,7 @@ class TrafficCoordinator:
                     return False
                 if other_state.mission_id is None:
                     continue
-                if other_state.occupied_waypoint == wid:
-                    return False
-            self_state = self._robots.get(code)
-            if self_state is None:
-                return True
-            for other_code, other_state in self._robots.items():
-                if other_code == code or other_state.mission_id is None:
-                    continue
-                if wid not in other_state.remaining_waypoints:
-                    continue
-                if wid not in self_state.remaining_waypoints:
-                    continue
-                # Earlier mission assignment = owner for overlapping shelves.
-                if self_state.mission_assigned_at > other_state.mission_assigned_at:
-                    return False
-                if self_state.mission_assigned_at < other_state.mission_assigned_at:
-                    continue
-                if code > other_code:
+                if zones_overlap(other_state.occupied_waypoint, wid):
                     return False
         return True
 
@@ -363,6 +564,7 @@ class TrafficCoordinator:
                     state.mission_id = int(mission_id)
                     state.planned_goal = goal
                     state.phase = "NAVIGATING"
+                    state.last_wait_reason = None
             return
         code = device_code.strip().lower()
         deadline = time.monotonic() + self._mission_timeout
@@ -383,16 +585,81 @@ class TrafficCoordinator:
         else:
             planned = self._fallback_path(code, goal)
 
+        last_replan = time.monotonic()
+        replan_every = max(0.5, self._wait_replan_sec)
+        wait_started: float | None = None
+        yield_sec = max(5.0, self._yield_sec)
+
         while time.monotonic() < deadline:
             with self._lock:
                 if int(self._abort_gen.get(code, 0)) != start_gen:
                     raise TrafficTimeoutError(f"traffic interrupted for {code}")
+
+            now = time.monotonic()
+            # Soft yield: blocked waiter frees the corridor for peer work / other orders.
+            if wait_started is not None and (now - wait_started) >= yield_sec:
+                with self._lock:
+                    st = self._robots[code]
+                    st.phase = "WAITING"
+                    st.active_path = []
+                    st.wait_started_at = 0.0
+                    reason = st.last_wait_reason or "wait"
+                    st.conflict_owner_sticky = None
+                    for other in self._robots.values():
+                        if other.device_code == code:
+                            continue
+                        if other.conflict_owner_sticky == code:
+                            other.conflict_owner_sticky = None
+                LOGGER.info(
+                    "traffic yield %s after %.1fs (%s) -> (%.3f, %.3f)",
+                    code,
+                    yield_sec,
+                    reason,
+                    goal.x,
+                    goal.y,
+                )
+                raise TrafficYieldError(
+                    f"traffic yield for {code} after {yield_sec:.0f}s ({reason}) "
+                    f"-> ({goal.x:.3f}, {goal.y:.3f})"
+                )
+
+            # While waiting (or after wait_blocked), refresh plan from live pose so
+            # both carts can escape stale-path mutual freezes.
+            if others_busy and (now - last_replan) >= replan_every:
+                with self._lock:
+                    self._robots[code].phase = "PLANNING"
+                planned = self._plan_leg(code, goal)
+                last_replan = time.monotonic()
+                LOGGER.info(
+                    "traffic replan while waiting %s -> (%.3f, %.3f) points=%d",
+                    code,
+                    goal.x,
+                    goal.y,
+                    len(planned),
+                )
+
             other_paths = self._collect_other_paths(code)
             other_poses = self._collect_other_poses(code)
             try:
                 other_poses[code] = self._cart_port.get_pose(code)
             except Exception:
                 other_poses[code] = None
+
+            # S1/S2: earlier-assigned mission leaves first; later cart stays on pad.
+            home_ok, home_reason = self._try_claim_home_departure(
+                code, other_poses.get(code), other_poses
+            )
+            if not home_ok:
+                with self._lock:
+                    state = self._robots[code]
+                    state.phase = "WAITING"
+                    state.active_path = []
+                    state.last_wait_reason = home_reason
+                # Stay put at S1/S2 — do not soft-yield / do not force W7.
+                wait_started = None
+                self._sleep_poll()
+                continue
+
             with self._lock:
                 grant, wait_reason = self._evaluate_leg_grant(
                     code, planned, other_paths, other_poses
@@ -401,12 +668,46 @@ class TrafficCoordinator:
                     state = self._robots[code]
                     state.phase = "NAVIGATING"
                     state.active_path = list(planned)
+                    state.last_wait_reason = None
+                    state.wait_started_at = 0.0
                     self._cond.notify_all()
                     return
                 state = self._robots[code]
                 state.phase = "WAITING"
+                # Do NOT reserve the planned path while WAITING — mutual reserved
+                # paths caused both carts to freeze indefinitely.
+                state.active_path = []
+                state.last_wait_reason = wait_reason
+                if wait_reason == "wait_home_depart":
+                    wait_started = None
+                elif wait_started is None:
+                    wait_started = now
+                    state.wait_started_at = now
+            # Emergency: leave acquire loop so orders can stage W7 (비상대기).
+            # Do not soft-yield / 충돌대기 here — that would stack with emergency.
+            if wait_reason == "emergency_wait":
+                if not self._pose_near_own_home(code, other_poses.get(code)):
+                    try:
+                        self._cart_port.stop_nav(code, freeze=False)
+                    except TypeError:
+                        try:
+                            self._cart_port.stop_nav(code)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                raise TrafficEmergencyWaitError(
+                    f"emergency_wait for {code} — stage at W7"
+                )
             self._sleep_poll()
-            if wait_reason == "owner_passed":
+            if wait_reason in (
+                "owner_passed",
+                "wait_blocked",
+                "wait_owner_idle",
+                "wait_home_depart",
+            ):
+                # Force an immediate replan so we leave from the current pose.
+                last_replan = 0.0
                 continue
         LOGGER.warning(
             "traffic wait timed out for %s -> (%.3f, %.3f); conflict still active",
@@ -433,7 +734,17 @@ class TrafficCoordinator:
             state.planned_goal = None
             state.conflict_owner_sticky = None
             state.last_wait_reason = None
+            state.wait_started_at = 0.0
+            # Peers tagged emergency_wait for this owner must not stay frozen.
+            for other in self._robots.values():
+                if other.device_code == code:
+                    continue
+                if other.last_wait_reason == "emergency_wait":
+                    other.last_wait_reason = None
+                if other.conflict_owner_sticky == code:
+                    other.conflict_owner_sticky = None
             self._cond.notify_all()
+        self._release_home_depart_if_clear(code)
 
     def mark_returning_home(self, device_code: str) -> None:
         """Flag P→home motion so the other cart waits at W7 before entering P."""
@@ -537,6 +848,8 @@ class TrafficCoordinator:
                 "zoneRadiusM": self._zone_radius_m,
                 "stagingWaypoint": self._staging_waypoint,
                 "homeOwner": self._home_owner,
+                "homeDepartOwner": self._home_depart_owner,
+                "homeClearM": self._home_clear_m,
                 "robots": robots,
             }
 
@@ -677,7 +990,32 @@ class TrafficCoordinator:
 
         sticky = self_state.conflict_owner_sticky or other_state.conflict_owner_sticky
         if sticky in selectable:
+            # Prefer the cart that is actually driving over a sticky WAITING owner.
+            if sticky == self_code and other_state.phase == "NAVIGATING" and (
+                self_state.phase != "NAVIGATING"
+            ):
+                if other_code in selectable:
+                    return other_code
+            if sticky == other_code and self_state.phase == "NAVIGATING" and (
+                other_state.phase != "NAVIGATING"
+            ):
+                if self_code in selectable:
+                    return self_code
             return sticky
+
+        # Prefer a peer already NAVIGATING so their order keeps progressing.
+        if (
+            other_state.phase == "NAVIGATING"
+            and other_code in selectable
+            and self_state.phase != "NAVIGATING"
+        ):
+            return other_code
+        if (
+            self_state.phase == "NAVIGATING"
+            and self_code in selectable
+            and other_state.phase != "NAVIGATING"
+        ):
+            return self_code
 
         if len(selectable) == 1:
             return selectable[0]
@@ -738,8 +1076,43 @@ class TrafficCoordinator:
 
         self_state = self._robots[device_code]
         self_pose = other_poses.get(device_code)
+
+        # Emergency wait (on peer remaining path) takes priority over zone/path
+        # conflict waits — never stack "충돌대기" with "비상대기".
+        for other_code, other_state in others:
+            other_path = dense_others.get(other_code) or self._densify_for_traffic(
+                other_paths.get(other_code) or list(other_state.active_path)
+            )
+            if not other_path:
+                continue
+            if other_state.phase == "NAVIGATING" and other_path:
+                other_pose = other_poses.get(other_code)
+                start_idx = (
+                    nearest_path_index(other_path, other_pose) if other_pose else 0
+                )
+                remaining = other_path[max(0, start_idx) :]
+                if len(remaining) < 2:
+                    remaining = other_path[-2:] if len(other_path) >= 2 else other_path
+                if pose_near_path(self_pose, remaining, self._clearance_m):
+                    if self._pose_near_own_home(device_code, self_pose):
+                        self_state.last_wait_reason = "wait_home_depart"
+                        return False, "wait_home_depart"
+                    sticky = (
+                        self_state.conflict_owner_sticky
+                        or other_state.conflict_owner_sticky
+                    )
+                    if sticky != device_code:
+                        other_state.conflict_owner_sticky = other_code
+                        self_state.conflict_owner_sticky = other_code
+                        self_state.last_wait_reason = "emergency_wait"
+                        return False, "emergency_wait"
+            elif self_state.last_wait_reason == "emergency_wait":
+                self_state.last_wait_reason = None
+
         occupied_zones = self.occupied_zones(exclude_device=device_code)
-        if occupied_zones and path_intersects_zones(planned_path, occupied_zones):
+        # Only block when our *goal* sits in a peer-occupied zone — not when the
+        # planned path merely grazes a distant shelf the peer is working.
+        if occupied_zones and path_goal_in_zones(planned_path, occupied_zones):
             self_state.last_wait_reason = "wait_zone"
             return False, "wait_zone"
 
@@ -749,23 +1122,6 @@ class TrafficCoordinator:
             )
             if not other_path:
                 continue
-
-            # Only emergency-wait when peer is actually driving on that path.
-            # Waiting/planning peers must not freeze both robots at an X-crossing.
-            if (
-                other_state.phase == "NAVIGATING"
-                and other_state.active_path
-                and pose_near_path(self_pose, other_path, self._clearance_m)
-            ):
-                sticky = (
-                    self_state.conflict_owner_sticky
-                    or other_state.conflict_owner_sticky
-                )
-                if sticky != device_code:
-                    other_state.conflict_owner_sticky = other_code
-                    self_state.conflict_owner_sticky = other_code
-                    self_state.last_wait_reason = "emergency_wait"
-                    return False, "emergency_wait"
 
             conflict = find_path_conflicts(
                 dense_planned,
@@ -792,6 +1148,10 @@ class TrafficCoordinator:
             )
 
             if not self_metrics["canClearConflict"] and not other_metrics["canClearConflict"]:
+                # Stale sticky with neither able to clear → mutual WAIT; drop sticky
+                # so the next replan cycle can re-pick once a path clears.
+                self_state.conflict_owner_sticky = None
+                other_state.conflict_owner_sticky = None
                 self_state.last_wait_reason = "wait_blocked"
                 return False, "wait_blocked"
 
@@ -804,6 +1164,8 @@ class TrafficCoordinator:
                 other_state,
             )
             if owner_code is None:
+                self_state.conflict_owner_sticky = None
+                other_state.conflict_owner_sticky = None
                 self_state.last_wait_reason = "wait_blocked"
                 return False, "wait_blocked"
 
@@ -812,13 +1174,25 @@ class TrafficCoordinator:
                 # instead of either robot reversing to dodge.
                 other_pose = other_poses.get(other_code)
                 if pose_near_path(other_pose, dense_planned, self._clearance_m):
-                    if other_state.phase == "NAVIGATING":
+                    if self._pose_near_own_home(other_code, other_pose):
+                        # Peer still on S1/S2 — leave them parked; do not cancel Nav2.
+                        if other_state.phase == "NAVIGATING":
+                            other_state.phase = "WAITING"
+                        other_state.last_wait_reason = "wait_home_depart"
+                    elif other_state.phase == "NAVIGATING":
                         try:
-                            self._cart_port.stop_nav(other_code)
+                            self._cart_port.stop_nav(other_code, freeze=False)
+                        except TypeError:
+                            try:
+                                self._cart_port.stop_nav(other_code)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
                         other_state.phase = "WAITING"
-                    other_state.last_wait_reason = "emergency_wait"
+                        other_state.last_wait_reason = "emergency_wait"
+                    else:
+                        other_state.last_wait_reason = "emergency_wait"
                 self_state.release_index = nearest_path_index(
                     planned_path,
                     {
@@ -838,9 +1212,45 @@ class TrafficCoordinator:
             owner_pose = other_poses.get(other_code)
             if owner_state.phase == "IDLE":
                 return True, "owner_done"
+            # Sticky/selected owner is not actually driving — drop sticky and let
+            # this cart take ownership if it can clear (avoids mutual WAIT freeze).
             if owner_state.phase != "NAVIGATING" or not owner_state.active_path:
-                self_state.last_wait_reason = "wait_owner"
-                return False, "wait_owner"
+                self_state.conflict_owner_sticky = None
+                other_state.conflict_owner_sticky = None
+                if self_metrics["canClearConflict"]:
+                    other_pose = other_poses.get(other_code)
+                    if pose_near_path(other_pose, dense_planned, self._clearance_m):
+                        if self._pose_near_own_home(other_code, other_pose):
+                            if other_state.phase == "NAVIGATING":
+                                other_state.phase = "WAITING"
+                            other_state.last_wait_reason = "wait_home_depart"
+                        else:
+                            try:
+                                self._cart_port.stop_nav(other_code, freeze=False)
+                            except TypeError:
+                                try:
+                                    self._cart_port.stop_nav(other_code)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            if other_state.phase == "NAVIGATING":
+                                other_state.phase = "WAITING"
+                            other_state.last_wait_reason = "emergency_wait"
+                    self_state.release_index = nearest_path_index(
+                        planned_path,
+                        {
+                            "x": dense_planned[int(self_metrics["releaseIndex"])][0],
+                            "y": dense_planned[int(self_metrics["releaseIndex"])][1],
+                        },
+                    )
+                    self_state.conflict_owner_sticky = device_code
+                    other_state.conflict_owner_sticky = device_code
+                    self_state.hold_index = None
+                    self_state.last_wait_reason = None
+                    return True, "owner_takeover"
+                self_state.last_wait_reason = "wait_owner_idle"
+                return False, "wait_owner_idle"
 
             release_idx = owner_state.release_index
             if release_idx is None:
@@ -907,7 +1317,11 @@ class TrafficCoordinator:
                 live = []
             if live:
                 return live
-        return list(state.active_path)
+        # WAITING/PLANNING reserved paths used to deadlock both carts; only the
+        # actively navigating path (or empty) participates in conflict checks.
+        if state.phase == "NAVIGATING":
+            return list(state.active_path)
+        return []
 
     def _cart1_home_complete(self) -> bool:
         from ..waypoints import home_for_device

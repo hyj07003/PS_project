@@ -581,6 +581,65 @@ img {
   margin-top: 1.5rem;
 }
 
+.robot-block-omx {
+  margin-top: 1.5rem;
+}
+
+.omx-net-dl {
+  margin-top: 0.85rem;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.omx-cam-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.omx-cam {
+  margin: 0;
+}
+
+.omx-cam img,
+.omx-cam-placeholder {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  display: block;
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.omx-cam-placeholder {
+  display: grid;
+  place-items: center;
+  font-size: 0.88rem;
+  text-align: center;
+  padding: 1rem;
+}
+
+.omx-cam figcaption {
+  margin-top: 0.45rem;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.omx-cam-tag {
+  font-family: var(--font-display);
+  font-weight: 700;
+  color: var(--ink);
+  margin-right: 0.35rem;
+}
+
+.status-ok {
+  color: #2f6b45;
+}
+
+.status-bad {
+  color: #8a3b2f;
+}
+
 .robot-block-head {
   display: flex;
   justify-content: space-between;
@@ -1226,6 +1285,14 @@ img {
   .monitor-side-col {
     height: auto !important;
     min-height: 0;
+  }
+
+  .omx-net-dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .omx-cam-grid {
+    grid-template-columns: 1fr;
   }
 
   .order-list-panel {

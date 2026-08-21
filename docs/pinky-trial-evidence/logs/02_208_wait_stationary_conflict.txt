@@ -1,0 +1,144 @@
+python3 tools/mission_runner.py   --cart1 W5,W2,W3   --cart2 W1,W4,W6   --home-after   --execute
+[MISSION QUEUE]
+  CART-1: W5 -> W2 -> W3 -> S1
+  CART-2: W1 -> W4 -> W6 -> S2
+
+[STAGE 1/4] CART-1->W5 CART-2->W1
+[SESSION] c86ebc90-db8d-454f-a6e5-0f8d3cc9520e visuals reset; old paths/conflict cleared
+[MODE] EXECUTE: real robots may move
+[PATH AUTHORITY] Both robots are planned and published before traffic decisions; replans replace the displayed reference path.
+[PRIORITY POLICY] Already inside conflict > closer to EXIT > closer to ENTRY > --priority tie-break.
+[FINAL] CART-1: x=0.464, y=-1.067, yaw=-1.577 rad
+[FINAL] CART-2: x=0.247, y=-1.038, yaw=3.110 rad
+[POSE UNSTABLE] waiting for localization convergence
+[POSE STABLE] CART-1
+[POSE STABLE] CART-2
+[PLAN] CART-1: 277 points start=(0.11399999351799489, -0.01600005654990655) goal=(0.46365843764447773, -1.0666614320651615)
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PATH UNAVAILABLE] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.164m required=0.200m
+[SINGLE PATH WAIT] CART-1 route is too close to stationary CART-2; no goal sent
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.175m required=0.200m
+[SINGLE PATH WAIT] CART-1 route is too close to stationary CART-2; no goal sent
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.152m required=0.200m
+[SINGLE PATH WAIT] CART-1 route is too close to stationary CART-2; no goal sent
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.177m required=0.200m
+[SINGLE PATH WAIT] CART-1 route is too close to stationary CART-2; no goal sent
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.189m required=0.200m
+[SINGLE PATH WAIT] CART-1 route is too close to stationary CART-2; no goal sent
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.187m required=0.200m
+[SINGLE PATH WAIT] CART-1 route is too close to stationary CART-2; no goal sent
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.214m required=0.200m
+[SINGLE-PATH GO] CART-1; CART-2=STATIONARY WAIT/REPLAN
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.238m required=0.200m
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[LOCALIZATION MOTION] CART-1: 0.527m in 5.805s accepted (0.091m/s <= 0.750m/s)
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.267m required=0.200m
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.309m required=0.200m
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 3/3
+[PERSISTENT REPLAN WAIT] CART-2: CART-2 initial plan remained blocked after 3 attempts: HTTP 502 http://192.168.129.27:4200/nav/plan: {"actionStatus":6,"errorCode":208,"errorMsg":"","message":"path planning ended with status 6","success":false}
+
+[STATIONARY FALLBACK CHECK] CART-1 path -> CART-2 min=0.326m required=0.200m
+[SINGLE-PATH COMPLETE] CART-1; now published as stationary occupancy
+[NO DIRECT GOAL FALLBACK] CART-2: ComputePathToPose has no valid path; robot remains WAIT. No NavigateToPose goal is sent until a valid Nav2 path exists.
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 1/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 2/3
+[TEMPORARY PLAN BLOCKED] CART-2: errorCode=208 (NO_VALID_PATH) attempt 2/3
+[INITIAL PLAN RETRY] CART-2 WAIT 1.00s before attempt 3/3
+[INITIAL PLAN RECOVERED] CART-2 on attempt 3/3
+[PERSISTENT REPLAN OK] CART-2: 244 points; RViz updated
+[PATH AUTHORITY RECOVERED] both current-session paths are available
+[PATH AUTHORITY READY] both current-session references are published
+[STATIONARY ROBOT CONFLICT] CART-2 route passes 0.037m from CART-1; required=0.200m
+[PATH BLOCKED] CART-2 route intersects stationary CART-1; WAIT for Nav2 to produce a route around it
+[WAIT] retry budget exhausted; no emergency stop was issued.
+[RVIZ CLEAR] terminal WAIT/STOP; stale paths/conflict/reservation removed
+[MISSION ABORT] stage 1 failed, returncode=2

@@ -1,0 +1,189 @@
+--- traffic_controller_STICKY_OWNER_DOCK_LOCK_FIX.py
++++ traffic_controller_NO_SERVICE_GOAL_FALLBACK.py
+@@ -3340,65 +3340,22 @@
+                     args.localization_hard_jump,
+                 )
+ 
+-            # If a robot was allowed to use NavigateToPose directly after repeated
+-            # ComputePathToPose 207/208 failures, do not keep hammering /nav/plan
+-            # while it is moving.  Nav2's BT owns recovery/replanning for this leg.
++            # Direct service-goal fallback disabled for safety.
+             if direct_goal_fallback_key is not None:
+                 fallback_robot = carts[direct_goal_fallback_key]
+-                fallback_state = get_state(fallback_robot, args.http_timeout)
+-                fallback_navigating = navigating_state(
+-                    fallback_state, fallback_robot.name
+-                )
+-                fallback_at_goal = (
+-                    fallback_robot.last_valid_pose is not None
+-                    and distance_to_point(
+-                        fallback_robot.last_valid_pose,
+-                        (fallback_robot.final_goal.x, fallback_robot.final_goal.y),
+-                    ) <= args.goal_tolerance
+-                )
+-                if fallback_at_goal and not fallback_navigating:
+-                    fallback_robot.phase = "COMPLETE"
+-                    fallback_robot.idle = True
+-                    pose = fallback_robot.last_valid_pose or {
+-                        "x": fallback_robot.final_goal.x,
+-                        "y": fallback_robot.final_goal.y,
+-                        "yaw": fallback_robot.final_goal.yaw,
+-                    }
+-                    fallback_robot.original_planned_path = [
+-                        (float(pose["x"]), float(pose["y"]))
+-                    ]
+-                    authority["pathStatus"][direct_goal_fallback_key] = (
+-                        "GOAL_FALLBACK_COMPLETE"
+-                    )
+-                    ros_runtime.node.publish_reference(
+-                        direct_goal_fallback_key,
+-                        fallback_robot.original_planned_path,
+-                    )
+-                    print(
+-                        f"[GOAL FALLBACK COMPLETE] {fallback_robot.name}; "
+-                        "published as stationary occupancy"
+-                    )
+-                    direct_goal_fallback_key = None
+-                    ros_runtime.node.publish_state(force=True)
+-                    continue
+-                if fallback_navigating:
+-                    authority["pathStatus"][direct_goal_fallback_key] = (
+-                        "NAV2_GOAL_FALLBACK_ACTIVE"
+-                    )
+-                    ros_runtime.node.publish_state(force=True)
+-                    time.sleep(max(0.05, args.replan_interval))
+-                    continue
+-
+-                # Goal ended without reaching the target.  Return to preflight
+-                # retries; a later pass may recover a reference path or retry the
+-                # direct goal after the peer remains safely parked.
+-                print(
+-                    f"[GOAL FALLBACK ENDED] {fallback_robot.name} is not navigating "
+-                    "and has not reached the goal; returning to WAIT/replan"
+-                )
++                try:
++                    fallback_robot.client.post("/nav/stop", {}, timeout_sec=args.http_timeout)
++                except Exception:
++                    pass
+                 fallback_robot.final_command_sent = False
+                 fallback_robot.command_time = None
+                 fallback_robot.phase = "WAIT"
++                authority["pathStatus"][direct_goal_fallback_key] = "PATH_BLOCKED_WAIT"
++                ros_runtime.node.publish_reference(direct_goal_fallback_key, [])
++                print(
++                    f"[DIRECT GOAL FALLBACK DISABLED] {fallback_robot.name}: "
++                    "stopped and returned to WAIT"
++                )
+                 direct_goal_fallback_key = None
+ 
+             # Retry every missing robot once per recovery pass.
+@@ -3526,90 +3483,29 @@
+                         )
+                         single_path_runner_key = None
+ 
+-            # ComputePathToPose can return 207/208 even when NavigateToPose can
+-            # succeed through its BT recovery pipeline.  Never launch two
+-            # pathless robots together.  But when exactly one active robot is
+-            # still pathless and every peer is already stationary/complete, allow
+-            # that robot to try its real Nav2 goal.  Endpoint/current separation
+-            # is checked here; the moving robot's own Nav2 sensors remain the
+-            # runtime obstacle authority because no reference path is available.
++            # Safety policy for normal service missions:
++            # If ComputePathToPose repeatedly returns 207/208, DO NOT bypass the
++            # planner with a direct NavigateToPose goal.  The previous fallback
++            # only checked peer separation, not walls/static-map feasibility,
++            # so Nav2 recovery behavior could back the robot into nearby walls
++            # while AMCL/RViz pose drifted.
+             missing_active_paths = [
+                 key for key, robot in carts.items()
+                 if not robot.idle and not robot.original_planned_path
+             ]
+-            if (
+-                direct_goal_fallback_key is None
+-                and single_path_runner_key is None
+-                and len(missing_active_paths) == 1
+-            ):
+-                fallback_key = missing_active_paths[0]
+-                fallback_robot = carts[fallback_key]
+-                peer_items = [
+-                    (key, robot) for key, robot in carts.items()
+-                    if key != fallback_key
+-                ]
+-                peers_stationary = all(
+-                    peer.idle or peer.phase in {"IDLE", "COMPLETE"}
+-                    for _, peer in peer_items
+-                )
+-                if peers_stationary and fallback_robot.last_valid_pose is not None:
+-                    safe = True
+-                    for peer_key, peer in peer_items:
+-                        peer_pose = peer.last_valid_pose
+-                        if peer_pose is None:
+-                            safe = False
+-                            print(
+-                                f"[GOAL FALLBACK WAIT] {peer.name} stationary pose "
+-                                "is unavailable"
+-                            )
+-                            break
+-                        current_sep = math.hypot(
+-                            float(fallback_robot.last_valid_pose["x"]) - float(peer_pose["x"]),
+-                            float(fallback_robot.last_valid_pose["y"]) - float(peer_pose["y"]),
+-                        )
+-                        goal_sep = math.hypot(
+-                            fallback_robot.final_goal.x - float(peer_pose["x"]),
+-                            fallback_robot.final_goal.y - float(peer_pose["y"]),
+-                        )
+-                        print(
+-                            f"[GOAL FALLBACK SAFETY] {fallback_robot.name} vs "
+-                            f"stationary {peer.name}: current={current_sep:.3f}m "
+-                            f"goal={goal_sep:.3f}m required={args.clearance:.3f}m"
+-                        )
+-                        if (
+-                            current_sep + 1e-9 < args.clearance
+-                            or goal_sep + 1e-9 < args.clearance
+-                        ):
+-                            safe = False
+-                            print(
+-                                f"[GOAL FALLBACK WAIT] {fallback_robot.name}: "
+-                                f"stationary {peer.name} is too close"
+-                            )
+-                            break
+-                    if safe:
+-                        if dry_run:
+-                            print(
+-                                f"[WOULD NAV2 GOAL FALLBACK] {fallback_robot.name}: "
+-                                "preflight path unavailable; peer is stationary"
+-                            )
+-                        else:
+-                            fallback_robot.start_hold = False
+-                            fallback_robot.hold_goal = None
+-                            send_goal_once(
+-                                fallback_robot,
+-                                fallback_robot.final_goal,
+-                                final=True,
+-                                timeout_sec=args.http_timeout,
+-                            )
+-                            direct_goal_fallback_key = fallback_key
+-                            authority["pathStatus"][fallback_key] = (
+-                                "NAV2_GOAL_FALLBACK_ACTIVE"
+-                            )
+-                            print(
+-                                f"[NAV2 GOAL FALLBACK] {fallback_robot.name}: "
+-                                "ComputePathToPose remained 207/208, but all peers "
+-                                "are stationary and clear; NavigateToPose goal sent"
+-                            )
++            if missing_active_paths:
++                for fallback_key in missing_active_paths:
++                    fallback_robot = carts[fallback_key]
++                    fallback_robot.phase = "WAIT"
++                    fallback_robot.final_command_sent = False
++                    fallback_robot.command_time = None
++                    authority["pathStatus"][fallback_key] = "PATH_BLOCKED_WAIT"
++                    ros_runtime.node.publish_reference(fallback_key, [])
++                    print(
++                        f"[NO DIRECT GOAL FALLBACK] {fallback_robot.name}: "
++                        "ComputePathToPose has no valid path; robot remains WAIT. "
++                        "No NavigateToPose goal is sent until a valid Nav2 path exists."
++                    )
+ 
+             ros_runtime.node.publish_state(force=True)
+             time.sleep(max(0.05, args.replan_interval))

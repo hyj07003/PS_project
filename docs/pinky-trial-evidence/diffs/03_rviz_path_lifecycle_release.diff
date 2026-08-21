@@ -1,0 +1,135 @@
+--- traffic_controller_DOCKING_NAV2_SUCCESS_7CM.py
++++ traffic_controller_PATH_LIFECYCLE_RELEASE_FIX.py
+@@ -1119,18 +1119,32 @@
+     action_state: str,
+     navigating: bool,
+ ) -> bool:
+-    """Pure safety gate used before a docked owner can release its waiter."""
++    """Unified gate before a docked owner can release its waiter.
++
++    Primary rule:
++      Nav2 SUCCEEDED + stopped + within 7 cm => DOCKED.
++
++    Fallback rule for backends that report UNKNOWN:
++      strict position/yaw/stability checks.
++    """
+     if pose is None:
+         return False
+-    position_ok = distance_to_point(pose, (goal.x, goal.y)) <= position_tolerance
++
++    distance = distance_to_point(pose, (goal.x, goal.y))
++    action = str(action_state).upper()
++
++    if action == "SUCCEEDED" and not navigating and distance <= 0.07:
++        return True
++
++    if action != "UNKNOWN":
++        return False
++
++    position_ok = distance <= position_tolerance
+     yaw_ok = yaw_error(float(pose.get("yaw", 0.0)), goal.yaw) <= yaw_tolerance
+-    action = str(action_state).upper()
+-    action_ok = action in ("SUCCEEDED", "UNKNOWN")
+     return bool(
+         position_ok
+         and yaw_ok
+         and pose_stable
+-        and action_ok
+         and not navigating
+     )
+ 
+@@ -2158,6 +2172,9 @@
+             if at_hold and not waiter_navigating:
+                 waiter.phase = "HOLDING"
+                 print(f"[STATE] {waiter.name}: HOLDING")
++                if path_update_callback:
++                    path_update_callback(waiter, [])
++                    print(f"[RVIZ PATH CLEAR] {waiter.name}: HOLD path completed")
+             elif (
+                 waiter.command_time is not None
+                 and now - waiter.command_time > grace_sec
+@@ -2182,6 +2199,9 @@
+             )
+             if owner_cleared:
+                 owner.phase = "DOCKED"
++                if path_update_callback:
++                    path_update_callback(owner, [])
++                    print(f"[RVIZ PATH CLEAR] {owner.name}: HOME path completed")
+                 if not docking_result_logged:
+                     print(f"[DOCKED] {owner.name}")
+                     print(f"[HOME] {owner.name} PARKED")
+@@ -2504,8 +2524,50 @@
+                             next_waiter, next_waiter_key, next_segment, hold_margin, http_timeout
+                         )
+                         if not next_waiter.start_hold and next_waiter.hold_goal is not None:
+-                            send_goal_once(next_waiter, next_waiter.hold_goal, final=False, timeout_sec=http_timeout)
++                            if path_update_callback:
++                                try:
++                                    next_hold_path = plan_leg(
++                                        next_waiter,
++                                        next_waiter.hold_goal,
++                                        plan_timeout,
++                                    )
++                                except TrafficControllerError as exc:
++                                    # Fall back to the still-valid immutable route slice
++                                    # so RViz never keeps the already-used full path.
++                                    print(
++                                        f"[CLEAR GAP PATH FALLBACK] {next_waiter.name}: "
++                                        f"{exc}"
++                                    )
++                                    current_i = nearest_path_index(
++                                        next_waiter.original_planned_path,
++                                        next_waiter.last_valid_pose,
++                                    )
++                                    hold_pose = {
++                                        "x": next_waiter.hold_goal.x,
++                                        "y": next_waiter.hold_goal.y,
++                                    }
++                                    hold_i = nearest_path_index(
++                                        next_waiter.original_planned_path,
++                                        hold_pose,
++                                    )
++                                    lo, hi = sorted((current_i, hold_i))
++                                    next_hold_path = next_waiter.original_planned_path[lo:hi + 1]
++                                path_update_callback(next_waiter, next_hold_path)
++                                print(
++                                    f"[RVIZ PATH REPLACE] {next_waiter.name}: "
++                                    "current -> next HOLD only"
++                                )
++
++                            next_waiter.command_sent = False
++                            next_waiter.final_command_sent = False
++                            send_goal_once(
++                                next_waiter,
++                                next_waiter.hold_goal,
++                                final=False,
++                                timeout_sec=http_timeout,
++                            )
+                             print(f"[CLEAR GAP GO] {next_waiter.name} -> next HOLD")
++                            print(f"[COMMAND] {next_waiter.name} -> next HOLD")
+                         else:
+                             print(f"[NEXT WAIT] {next_waiter.name} holds at current pose")
+                         # Ensure the next owner is allowed to continue/go.
+@@ -4056,6 +4118,9 @@
+                 ),
+                 args.hold_margin,
+             )
++        ros_runtime.node.reset_session_visuals()
++        ros_runtime.node.publish_state(force=True)
++        print("[RVIZ CLEAR] mission complete; old paths/conflict/reservation removed")
+         print("[DONE] mission complete")
+         return 0
+     except (TrafficControllerError, ValueError) as exc:
+@@ -4087,6 +4152,12 @@
+                 "[SAFE STOP] No automatic release/resume or /nav/stop was issued.",
+                 file=sys.stderr,
+             )
++        try:
++            ros_runtime.node.reset_session_visuals()
++            ros_runtime.node.publish_state(force=True)
++            print("[RVIZ CLEAR] terminal WAIT/STOP; stale paths/conflict/reservation removed")
++        except Exception as cleanup_exc:
++            print(f"[RVIZ CLEAR WARN] {cleanup_exc}", file=sys.stderr)
+         return 2
+     finally:
+         ros_runtime.close()
