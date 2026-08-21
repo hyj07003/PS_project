@@ -162,13 +162,21 @@ export default function CartPage() {
                     <input
                       type="number"
                       min={1}
+                      max={Math.max(
+                        1,
+                        Math.min(3, line.product?.stock ?? 3),
+                      )}
                       value={line.quantity}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const max = Math.max(
+                          1,
+                          Math.min(3, line.product?.stock ?? 3),
+                        );
                         void changeQty(
                           line.productId,
-                          Math.max(1, Number(e.target.value) || 1),
-                        )
-                      }
+                          Math.max(1, Math.min(max, Number(e.target.value) || 1)),
+                        );
+                      }}
                       style={{ width: 72, padding: "0.35rem" }}
                     />
                   </td>

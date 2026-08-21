@@ -33,6 +33,13 @@ def create_app() -> Flask:
     seed_if_empty(conn)
 
     products = ProductsService(conn)
+    # Demo shelf restock: every controller restart resets all product stock to 3.
+    reset = products.reset_all_stock()
+    logger.info(
+        "product stock reset on startup: stock=%s updated=%s",
+        reset.get("stock"),
+        reset.get("updated"),
+    )
     users = UsersService(conn)
     carts = CartsService(conn, products)
     orders = OrdersService(conn, carts)

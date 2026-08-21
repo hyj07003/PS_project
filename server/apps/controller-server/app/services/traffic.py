@@ -19,6 +19,7 @@ from .traffic_paths import (
     path_distance_between,
     path_intersects_zones,
     path_points,
+    pose_near_path,
     retreat_path_index,
 )
 
@@ -107,6 +108,32 @@ class TrafficCoordinator:
         if flag in ("0", "false", "off", "no"):
             return False
         return len(self._robot_codes) >= 2
+
+    def is_on_peer_active_path(self, device_code: str) -> bool:
+        """True when pose overlaps a peer that is actually NAVIGATING on a path."""
+        if not self.enabled():
+            return False
+        code = device_code.strip().lower()
+        try:
+            pose = self._cart_port.get_pose(code)
+        except Exception:
+            pose = None
+        if not pose:
+            return False
+        with self._lock:
+            navigating = [
+                (peer, list(st.active_path))
+                for peer, st in self._robots.items()
+                if peer != code
+                and st.mission_id is not None
+                and st.phase == "NAVIGATING"
+                and st.active_path
+            ]
+        for _peer, path in navigating:
+            dense = self._densify_for_traffic(path)
+            if pose_near_path(pose, dense, self._clearance_m):
+                return True
+        return False
 
     def register_mission(self, device_code: str, mission_id: int) -> None:
         if not self.enabled():
@@ -661,7 +688,9 @@ class TrafficCoordinator:
             return self_code
 
         if self_metrics["insideConflict"] != other_metrics["insideConflict"]:
-            return self_code if self_metrics["insideConflict"] else other_code
+            # Robot already sitting in the shared corridor waits in place;
+            # the peer that still needs the corridor keeps working.
+            return other_code if self_metrics["insideConflict"] else self_code
 
         if self_metrics["insideConflict"] and other_metrics["insideConflict"]:
             delta = float(self_metrics["distanceToExitM"]) - float(
@@ -720,6 +749,24 @@ class TrafficCoordinator:
             )
             if not other_path:
                 continue
+
+            # Only emergency-wait when peer is actually driving on that path.
+            # Waiting/planning peers must not freeze both robots at an X-crossing.
+            if (
+                other_state.phase == "NAVIGATING"
+                and other_state.active_path
+                and pose_near_path(self_pose, other_path, self._clearance_m)
+            ):
+                sticky = (
+                    self_state.conflict_owner_sticky
+                    or other_state.conflict_owner_sticky
+                )
+                if sticky != device_code:
+                    other_state.conflict_owner_sticky = other_code
+                    self_state.conflict_owner_sticky = other_code
+                    self_state.last_wait_reason = "emergency_wait"
+                    return False, "emergency_wait"
+
             conflict = find_path_conflicts(
                 dense_planned,
                 other_path,
@@ -761,6 +808,17 @@ class TrafficCoordinator:
                 return False, "wait_blocked"
 
             if owner_code == device_code:
+                # Peer parked on our path: freeze them in place so we keep working
+                # instead of either robot reversing to dodge.
+                other_pose = other_poses.get(other_code)
+                if pose_near_path(other_pose, dense_planned, self._clearance_m):
+                    if other_state.phase == "NAVIGATING":
+                        try:
+                            self._cart_port.stop_nav(other_code)
+                        except Exception:
+                            pass
+                        other_state.phase = "WAITING"
+                    other_state.last_wait_reason = "emergency_wait"
                 self_state.release_index = nearest_path_index(
                     planned_path,
                     {

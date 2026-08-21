@@ -183,7 +183,7 @@ def _insert_demo_products(conn, admin_id: int | None, ts: str) -> None:
                 """
                 UPDATE products SET
                   category_id = ?, name = ?, description = ?, price = ?,
-                  stock = CASE WHEN stock < 50 THEN 50 ELSE stock END,
+                  stock = CASE WHEN stock > 3 THEN 3 ELSE stock END,
                   image_full_url = ?, image_zoom_url = ?,
                   is_featured = ?, is_active = 1, updated_at = ?
                 WHERE slug = ?
@@ -215,7 +215,7 @@ def _insert_demo_products(conn, admin_id: int | None, ts: str) -> None:
                     p["slug"],
                     p["description"],
                     p["price"],
-                    50,
+                    3,
                     placeholder(p["name"], "full"),
                     placeholder(f"{p['name']}+", "zoom"),
                     p["featured"],

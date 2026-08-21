@@ -68,22 +68,29 @@ export default function ProductDetailPage() {
           </h1>
           <p className="hero-price">{formatPriceKrw(product.price)}</p>
           <p className="muted">{product.description}</p>
+          <p className="muted">재고 · {product.stock}</p>
           <label>
             수량
             <input
               type="number"
               min={1}
+              max={Math.max(1, Math.min(3, product.stock))}
               value={qty}
-              onChange={(e) => setQty(Number(e.target.value) || 1)}
+              onChange={(e) => {
+                const max = Math.max(0, Math.min(3, product.stock));
+                const next = Number(e.target.value) || 1;
+                setQty(Math.max(1, Math.min(max || 1, next)));
+              }}
               style={{ marginLeft: "0.75rem", width: 80, padding: "0.4rem" }}
             />
           </label>
           <button
             type="button"
             className="btn"
+            disabled={product.stock < 1}
             onClick={() => void addToCart(product.id, qty)}
           >
-            장바구니 담기
+            {product.stock < 1 ? "품절" : "장바구니 담기"}
           </button>
         </div>
       </div>

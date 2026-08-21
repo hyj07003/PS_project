@@ -16,6 +16,7 @@ from ..adapters import (
     parse_omx_url,
     parse_pinky_robot_urls,
 )
+from ..constants import PRODUCT_MAX_STOCK
 from ..db import now_iso
 from ..errors import ApiError
 from ..waypoints import (
@@ -112,6 +113,12 @@ class OrdersService:
         self._abort_lock = threading.Lock()
         self._returning_home: set[str] = set()
         self._tour_locks: dict[str, threading.Lock] = {}
+        # Single physical OMX arm — serialize picks across carts.
+        self._omx_arm_lock = threading.Lock()
+        self._omx_busy_retries = max(
+            1, int(os.environ.get("OMX_BUSY_RETRIES", "8"))
+        )
+        self._omx_busy_retry_sec = float(os.environ.get("OMX_BUSY_RETRY_SEC", "1.0"))
 
     def _device_tour_lock(self, device_code: str) -> threading.Lock:
         code = (device_code or "").strip()
@@ -343,6 +350,28 @@ class OrdersService:
         )
 
         with self.conn.transaction() as db:
+            for item in cart["items"]:
+                qty = int(item["quantity"])
+                if qty < 1:
+                    raise ApiError(400, "quantity must be >= 1")
+                if qty > PRODUCT_MAX_STOCK:
+                    raise ApiError(
+                        400,
+                        f"quantity exceeds max stock ({PRODUCT_MAX_STOCK})",
+                    )
+                row = db.execute(
+                    "SELECT id, name, stock FROM products WHERE id = ? AND is_active = 1",
+                    (item["productId"],),
+                ).fetchone()
+                if not row:
+                    raise ApiError(400, f"product {item['productId']} not available")
+                if int(row["stock"]) < qty:
+                    raise ApiError(
+                        400,
+                        f"insufficient stock for {row['name']} "
+                        f"(have {row['stock']}, need {qty})",
+                    )
+
             cur = db.execute(
                 """
                 INSERT INTO orders (user_id, status, total_price, created_at, updated_at)
@@ -353,6 +382,20 @@ class OrdersService:
             order_id = cur.lastrowid
 
             for item in cart["items"]:
+                qty = int(item["quantity"])
+                updated = db.execute(
+                    """
+                    UPDATE products
+                    SET stock = stock - ?, updated_at = ?
+                    WHERE id = ? AND stock >= ?
+                    """,
+                    (qty, ts, item["productId"], qty),
+                )
+                if updated.rowcount == 0:
+                    raise ApiError(
+                        400,
+                        f"insufficient stock for product {item['productId']}",
+                    )
                 db.execute(
                     """
                     INSERT INTO order_items (order_id, product_id, product_name, unit_price, quantity)
@@ -363,7 +406,7 @@ class OrdersService:
                         item["productId"],
                         item["product"]["name"],
                         item["product"]["price"],
-                        item["quantity"],
+                        qty,
                     ),
                 )
 
@@ -683,11 +726,20 @@ class OrdersService:
                     )
                 if attempt < attempts:
                     if allow_retreat and _nav_error_needs_retreat(detail):
-                        self._retreat_from_obstacle(
-                            device_code,
-                            mission_id,
-                            waypoint_id=waypoint_id,
-                        )
+                        # Peer path overlap: stay put (emergency wait) instead of
+                        # reversing to dodge. W7 staging is unchanged elsewhere.
+                        if self.traffic.is_on_peer_active_path(device_code):
+                            self._emergency_wait_on_peer_path(
+                                device_code,
+                                mission_id,
+                                waypoint_id=waypoint_id,
+                            )
+                        else:
+                            self._retreat_from_obstacle(
+                                device_code,
+                                mission_id,
+                                waypoint_id=waypoint_id,
+                            )
                     time.sleep(0.4)
                     continue
                 raise RuntimeError(
@@ -1067,6 +1119,28 @@ class OrdersService:
             )
             self._set_waypoint(mission_id, waypoint_id, label_suffix="후진 완료")
 
+    def _emergency_wait_on_peer_path(
+        self,
+        device_code: str,
+        mission_id: int | None,
+        *,
+        waypoint_id: str | None = None,
+    ) -> None:
+        """Stop in place when sitting on another robot's path (no reverse dodge)."""
+        try:
+            self.cart_port.stop_nav(device_code)
+        except Exception:
+            pass
+        wait_sec = float(os.environ.get("TRAFFIC_EMERGENCY_WAIT_SEC", "2.0"))
+        wid = (waypoint_id or "").strip().upper() or "?"
+        if mission_id is not None:
+            self._mission_note(
+                mission_id,
+                f"emergency wait on peer path at {wid} ({wait_sec:.1f}s)",
+            )
+            self._set_waypoint(mission_id, wid, label_suffix="비상대기")
+        time.sleep(max(0.5, wait_sec))
+
     def _retreat_from_obstacle(
         self,
         device_code: str,
@@ -1162,6 +1236,19 @@ class OrdersService:
             device_code, waypoint_id, travel, mission_id
         )
 
+    def _acquire_omx_arm(self, mission_id: int) -> None:
+        """Wait for the single OMX arm; abortable while waiting."""
+        waited = False
+        while True:
+            self._ensure_not_aborted(mission_id)
+            if self._omx_arm_lock.acquire(timeout=0.5):
+                if waited:
+                    self._mission_note(mission_id, "omx arm acquired")
+                return
+            if not waited:
+                self._mission_note(mission_id, "omx arm wait")
+                waited = True
+
     def _omx_pick_at_shelf(
         self,
         device_code: str,
@@ -1178,51 +1265,78 @@ class OrdersService:
             self._dwell_at(device_code, mission_id, waypoint_id)
             return
         timeout = float(os.environ.get("OMX_PICK_TIMEOUT_SEC", "90"))
-        for slug, qty in picks:
-            self._ensure_not_aborted(mission_id)
-            self._set_waypoint(
-                mission_id,
-                waypoint_id,
-                label_suffix=f"{slug} 0/{qty}",
-            )
-            self._mission_note(mission_id, f"omx pick start {slug} x{qty}")
-
-            def _on_progress(done: int, total: int) -> None:
+        self._acquire_omx_arm(mission_id)
+        try:
+            for slug, qty in picks:
+                self._ensure_not_aborted(mission_id)
+                qty = max(1, min(int(qty), PRODUCT_MAX_STOCK))
                 self._set_waypoint(
                     mission_id,
                     waypoint_id,
-                    label_suffix=f"{slug} {done}/{total}",
+                    label_suffix=f"{slug} 0/{qty}",
                 )
-                self._mission_note(mission_id, f"omx pick {slug} {done}/{total}")
+                self._mission_note(mission_id, f"omx pick start {slug} x{qty}")
 
-            result = self.station_port.pick(
-                device_code=device_code,
-                slug=slug,
-                quantity=qty,
-                order_id=order_id,
-                timeout_sec=timeout,
-                should_abort=lambda: self._is_aborted(mission_id),
-                on_progress=_on_progress,
-                force_success_on_unreachable=True,
-            )
-            done = int(self.station_port.last_state.get("done") or 0)
-            if result == "DONE":
-                if self.station_port.last_error:
+                def _on_progress(done: int, total: int) -> None:
+                    self._set_waypoint(
+                        mission_id,
+                        waypoint_id,
+                        label_suffix=f"{slug} {done}/{total}",
+                    )
+                    self._mission_note(mission_id, f"omx pick {slug} {done}/{total}")
+
+                result = "FAILED"
+                detail = "unknown"
+                done = 0
+                for attempt in range(self._omx_busy_retries):
+                    self._ensure_not_aborted(mission_id)
+                    result = self.station_port.pick(
+                        device_code=device_code,
+                        slug=slug,
+                        quantity=qty,
+                        order_id=order_id,
+                        timeout_sec=timeout,
+                        should_abort=lambda: self._is_aborted(mission_id),
+                        on_progress=_on_progress,
+                        force_success_on_unreachable=True,
+                    )
+                    done = int(self.station_port.last_state.get("done") or 0)
+                    detail = self.station_port.last_error or "unknown"
+                    busy = (
+                        result == "FAILED"
+                        and (
+                            "409" in detail
+                            or "busy" in detail.lower()
+                            or "rejected" in detail.lower()
+                        )
+                    )
+                    if not busy or attempt + 1 >= self._omx_busy_retries:
+                        break
                     self._mission_note(
                         mission_id,
-                        f"omx-unreachable-override {slug} x{qty}: {self.station_port.last_error}",
+                        f"omx busy retry {attempt + 1}/{self._omx_busy_retries} {slug}",
                     )
-                else:
-                    self._mission_note(
-                        mission_id, f"omx pick done {slug} {done}/{qty}"
-                    )
-                continue
-            detail = self.station_port.last_error or "unknown"
-            self._mission_note(
-                mission_id,
-                f"omx pick {result} {slug} {done}/{qty}: {detail}",
-            )
-            raise RuntimeError(f"OMX pick {result} at {waypoint_id}: {detail}")
+                    time.sleep(self._omx_busy_retry_sec)
+
+                if result == "DONE":
+                    if self.station_port.last_error:
+                        self._mission_note(
+                            mission_id,
+                            f"omx-unreachable-override {slug} x{qty}: "
+                            f"{self.station_port.last_error}",
+                        )
+                    else:
+                        self._mission_note(
+                            mission_id, f"omx pick done {slug} {done}/{qty}"
+                        )
+                    continue
+                self._mission_note(
+                    mission_id,
+                    f"omx pick {result} {slug} {done}/{qty}: {detail}",
+                )
+                raise RuntimeError(f"OMX pick {result} at {waypoint_id}: {detail}")
+        finally:
+            self._omx_arm_lock.release()
 
     def _dock_pick_or_dwell_undock(
         self,

@@ -4,6 +4,7 @@ import sqlite3
 import time
 from typing import Any
 
+from ..constants import PRODUCT_MAX_STOCK
 from ..db import map_product, now_iso, resolve_product_images, slugify
 from ..errors import ApiError
 
@@ -12,6 +13,14 @@ PRODUCT_SELECT = """
   FROM products p
   JOIN categories c ON c.id = p.category_id
 """
+
+
+def clamp_stock(value: Any, default: int = PRODUCT_MAX_STOCK) -> int:
+    try:
+        stock = int(value if value is not None else default)
+    except (TypeError, ValueError):
+        stock = default
+    return max(0, min(PRODUCT_MAX_STOCK, stock))
 
 
 class ProductsService:
@@ -118,7 +127,7 @@ class ProductsService:
                 slug,
                 input_data.get("description"),
                 price,
-                input_data.get("stock", 0) or 0,
+                clamp_stock(input_data.get("stock", PRODUCT_MAX_STOCK)),
                 full,
                 zoom,
                 1 if input_data.get("isFeatured") else 0,
@@ -188,7 +197,10 @@ class ProductsService:
                 slug,
                 description,
                 input_data.get("price", current["price"]),
-                input_data.get("stock", current["stock"]),
+                clamp_stock(
+                    input_data.get("stock", current["stock"]),
+                    default=int(current["stock"] or 0),
+                ),
                 full,
                 zoom,
                 is_featured,
@@ -218,3 +230,14 @@ class ProductsService:
         self.conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
         self.conn.commit()
         return {"ok": True}
+
+    def reset_all_stock(self, stock: int = PRODUCT_MAX_STOCK) -> dict[str, Any]:
+        """Set every product's stock to the demo shelf capacity (default 3)."""
+        value = clamp_stock(stock, default=PRODUCT_MAX_STOCK)
+        ts = now_iso()
+        cur = self.conn.execute(
+            "UPDATE products SET stock = ?, updated_at = ?",
+            (value, ts),
+        )
+        self.conn.commit()
+        return {"ok": True, "stock": value, "updated": int(cur.rowcount)}

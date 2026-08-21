@@ -13,7 +13,7 @@ const emptyForm: CreateProductInput = {
   slug: "",
   description: "",
   price: 0,
-  stock: 10,
+  stock: 3,
   imageFullUrl: "",
   imageZoomUrl: "",
   isFeatured: false,
@@ -154,6 +154,19 @@ export default function AdminProductsPage() {
     }
   };
 
+  const resetStock = async () => {
+    if (!confirm("모든 상품 재고를 3개로 초기화할까요?")) return;
+    setError(null);
+    setMessage(null);
+    try {
+      await api("/admin/products/reset-stock", { method: "POST" });
+      setMessage("모든 상품 재고를 3개로 초기화했습니다.");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "재고 초기화 실패");
+    }
+  };
+
   if (loading || !user || user.role !== "admin") {
     return null;
   }
@@ -163,9 +176,15 @@ export default function AdminProductsPage() {
       <h1 className="hero-title" style={{ fontSize: "2.2rem" }}>
         상품 관리
       </h1>
-      <p className="muted">관리자만 접근 가능한 상품 등록/수정 화면입니다.</p>
+      <p className="muted">관리자만 접근 가능한 상품 등록/수정 화면입니다. 최대 재고는 3개입니다.</p>
       {error ? <p className="error">{error}</p> : null}
       {message ? <p>{message}</p> : null}
+
+      <div style={{ marginBottom: "1rem" }}>
+        <button type="button" className="btn secondary" onClick={() => void resetStock()}>
+          재고초기화
+        </button>
+      </div>
 
       <form className="form" style={{ maxWidth: 640 }} onSubmit={onSubmit}>
         <label>
@@ -215,12 +234,17 @@ export default function AdminProductsPage() {
           />
         </label>
         <label>
-          재고
+          재고 (최대 3)
           <input
             type="number"
+            min={0}
+            max={3}
             value={form.stock ?? 0}
             onChange={(e) =>
-              setForm({ ...form, stock: Number(e.target.value) || 0 })
+              setForm({
+                ...form,
+                stock: Math.max(0, Math.min(3, Number(e.target.value) || 0)),
+              })
             }
           />
         </label>
@@ -343,6 +367,7 @@ export default function AdminProductsPage() {
             <th>이름</th>
             <th>slug</th>
             <th>가격</th>
+            <th>재고</th>
             <th>히어로</th>
             <th>활성</th>
             <th />
@@ -357,6 +382,7 @@ export default function AdminProductsPage() {
                 <code style={{ fontSize: "0.85rem" }}>{p.slug}</code>
               </td>
               <td>{formatPriceKrw(p.price)}</td>
+              <td>{p.stock}</td>
               <td>{p.isFeatured ? "Y" : "-"}</td>
               <td>{p.isActive ? "Y" : "N"}</td>
               <td style={{ display: "flex", gap: "0.5rem" }}>

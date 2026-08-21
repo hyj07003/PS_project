@@ -85,6 +85,11 @@ def create_product():
     return jsonify(_products().create(body, created_by))
 
 
+@bp.post("/products/reset-stock")
+def reset_product_stock():
+    return jsonify(_products().reset_all_stock())
+
+
 @bp.put("/products/<int:product_id>")
 @bp.patch("/products/<int:product_id>")
 def update_product(product_id: int):

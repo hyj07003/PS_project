@@ -327,6 +327,16 @@ export class AppController {
     }
   }
 
+  @Post("admin/products/reset-stock")
+  @UseGuards(AdminGuard)
+  async adminResetStock() {
+    try {
+      return await controllerJson(`/products/reset-stock`, { method: "POST" });
+    } catch (err) {
+      wrapError(err);
+    }
+  }
+
   @Put("admin/products/:id")
   @UseGuards(AdminGuard)
   async adminUpdate(

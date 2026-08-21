@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from ..constants import PRODUCT_MAX_STOCK
 from ..db import map_product, now_iso
 from ..errors import ApiError
 from .products import ProductsService
@@ -34,6 +35,21 @@ class CartsService:
             (now_iso(), cart_id),
         )
         self.conn.commit()
+
+    def _product_stock(self, product_id: int) -> int:
+        product = self.products.get_by_id(product_id, active_only=True)
+        return int(product.get("stock") or 0)
+
+    def _assert_qty_within_stock(self, product_id: int, quantity: int) -> None:
+        if quantity < 1:
+            raise ApiError(400, "quantity must be >= 1")
+        stock = self._product_stock(product_id)
+        cap = min(stock, PRODUCT_MAX_STOCK)
+        if quantity > cap:
+            raise ApiError(
+                400,
+                f"quantity exceeds available stock ({cap})",
+            )
 
     def get_cart(self, user_id: int) -> dict[str, Any]:
         cart_id = self._ensure_cart(user_id)
@@ -80,10 +96,13 @@ class CartsService:
             (cart_id, product_id),
         ).fetchone()
 
+        new_qty = (existing["quantity"] + quantity) if existing else quantity
+        self._assert_qty_within_stock(product_id, new_qty)
+
         if existing:
             self.conn.execute(
                 "UPDATE cart_items SET quantity = ? WHERE id = ?",
-                (existing["quantity"] + quantity, existing["id"]),
+                (new_qty, existing["id"]),
             )
         else:
             self.conn.execute(
@@ -103,6 +122,7 @@ class CartsService:
                 (cart_id, product_id),
             )
         else:
+            self._assert_qty_within_stock(product_id, quantity)
             cur = self.conn.execute(
                 "UPDATE cart_items SET quantity = ? WHERE cart_id = ? AND product_id = ?",
                 (quantity, cart_id, product_id),

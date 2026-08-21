@@ -36,6 +36,32 @@ def distance_to_point(
         return math.inf
 
 
+def pose_near_path(
+    pose: dict[str, float] | None,
+    path: list[tuple[float, float]],
+    clearance_m: float,
+) -> bool:
+    """True when pose lies within clearance_m of any path vertex or segment."""
+    if not path or not isinstance(pose, dict):
+        return False
+    try:
+        px = float(pose["x"])
+        py = float(pose["y"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    clearance = max(0.0, float(clearance_m))
+    if clearance <= 0.0:
+        return False
+    if len(path) == 1:
+        return math.hypot(px - path[0][0], py - path[0][1]) <= clearance
+    for i in range(len(path) - 1):
+        x0, y0 = path[i]
+        x1, y1 = path[i + 1]
+        if _dist_point_to_segment_sq(px, py, x0, y0, x1, y1) <= clearance * clearance:
+            return True
+    return False
+
+
 def path_heading(path: list[tuple[float, float]], index: int) -> float:
     if not path:
         return 0.0
