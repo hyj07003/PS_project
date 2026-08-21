@@ -1,15 +1,18 @@
-# OMX 로봇팔 — 픽업 정책
+# OMX 로봇팔 — 픽업 · 포장 정책
 
-> **이 저장소는 [PS_project](https://github.com/hyj07003/PS_project) 의 `omx/` 부분이다.**
-> 팀 저장소에 직접 푸시할 권한이 아직 없어 따로 올려 둔 것이고, 내용은 같다.
+> **관제서버 담당자에게** — 픽업과 포장은 **별개 서버**입니다. 포트가 다릅니다.
 >
-> **관제서버 담당자에게** — 두 가지만 보시면 됩니다:
-> - **[`API.md`](API.md)** — 어떤 요청을 어떻게 보내는지 (규격)
-> - **[`scripts/controller_patch/`](scripts/controller_patch/)** — controller-server 에
->   무엇을 추가하고 어디를 고칠지 (적용 방법 + 붙여넣을 코드)
+> | | 규격 | 적용 방법 |
+> |---|---|---|
+> | **픽업** `:8080` | [`API.md`](API.md) | [`scripts/controller_patch/`](scripts/controller_patch/) |
+> | **포장** `:8081` | [`API_PACK.md`](API_PACK.md) | [`scripts/controller_patch_pack/`](scripts/controller_patch_pack/) |
 >
-> 팀 저장소에 합칠 때는 이 저장소 전체를 `PS_project/omx/` 아래로 옮기면 된다.
-> 그 구조를 전제로 경로가 잡혀 있다.
+> 각 `controller_patch*/` 에 붙여넣을 어댑터 코드와 `orders.py` 수정 위치가
+> 들어 있습니다.
+>
+> **두 팔은 별개 하드웨어라 동시에 돌 수 있습니다** — 같은 락으로 묶지
+> 마십시오. 실행 환경도 다릅니다(픽업 lerobot 0.4.4 / 포장 0.6.1). 두
+> 프로세스를 각각 띄워야 합니다.
 
 
 무인 마트에서 관제서버의 요청을 받아 진열대의 상품을 집어 카트 적재함에 담는다.
