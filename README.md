@@ -265,7 +265,99 @@ try_claim_waypoint_zone → 원자적 점유
 | 홈 출발 | `TRAFFIC_HOME_CLEAR_M` + FIFO 할당 시각으로 직렬화 |
 | P 진입 | 상대 `returning_home`이면 P 진입 카트는 W7 대기 |
 
-### 2.7 OMX 로봇팔 (진열대 pick / 계산대 pack)
+### 2.7 OMX 모방학습 (진열대 SmolVLA · 계산대 ACT)
+
+구현: `omx/OMX_service_TS_Project/` — 진열대 `omx_yolo/` · 계산대 `omx_pack/`  
+두 팔은 **별개 하드웨어·별개 프로세스·별개 LeRobot 버전**이다 (픽업 0.4.4 / 포장 0.6.1).
+
+| | 진열대 pick `:8080` | 계산대 pack `:8081` |
+|--|---------------------|---------------------|
+| 정책 | **SmolVLA** (언어 조건 O) | **ACT** (언어 조건 X) |
+| 시각 전처리 | 탑뷰에 **YOLO 검출 박스** 주석 | 원본 프레임 (주석 없음) |
+| 데이터 | teleop 원본 → `convert.py`로 YOLO 가공 데이터셋 | 바구니별 teleop → ACT 학습 |
+| 조건 입력 | task 문자열 (`Pick up … place it in the boxN`) | **체크포인트 선택** (yellow / mint) |
+| 완료 판정 | 홈 복귀(`success.py`) + 적재함 개수 증가 | 탑뷰 ROI 비움(`boxcheck.py`) |
+| 체크포인트 예 | `v1_yolo/checkpoints/…/pretrained_model` | `my_act_*_CART_YELLOW/MINT_MODEL` |
+| 검출기 | `omx_goods_yolo11n.pt` (YOLO11n) | — |
+
+#### 진열대 — YOLO 가공 데이터셋 → SmolVLA
+
+핵심 설계: **학습 변환과 실시간 추론이 같은 주석 코드(`annotate.Annotator`)를 공유**한다. 픽셀 단위로라도 어긋나면 정책이 조용히 실패한다.
+
+```text
+[데이터]
+teleop LeRobotDataset (원본)
+  → omx_yolo.convert
+       · 탑뷰만 Annotator로 YOLO 박스 렌더 (손목은 원본)
+       · front=탑뷰 / wrist=손목 스트림 정규화
+       · task 문자열 정규화 (단일 픽업 형식)
+  → *_yolo 데이터셋
+  → LeRobot SmolVLA 학습 (rename_map: front→camera1, wrist→camera2)
+
+[추론 · omx_yolo.server]
+POST /pick {slug, quantity, deviceCode}
+  → slug→클래스, deviceCode→box1|box2, build_task()
+  → camera1 = yolo_opencv (탑뷰+주석), camera2 = opencv (손목)
+  → SmolVLA predict_action 루프
+  → HomeDetector로 종료 · BoxCounter/kinematic으로 성공 판정
+  → quantity만큼 반복 (1회라도 실패 시 전체 FAILED)
+```
+
+| 모듈 | 역할 |
+|------|------|
+| `annotate.py` | YOLO 박스·상품 색·`CONTROLLER_SLUG`·task 문구. 학습/추론 단일 출처 |
+| `convert.py` | 원본→주석 데이터셋 오프라인 변환 (원본 미수정) |
+| `camera.py` | LeRobot에 `yolo_opencv` 카메라 타입 등록 (`read()`마다 주석) |
+| `server.py` | HTTP `/pick` · 정책 로드 · 제어 루프 |
+| `success.py` / `kinematic.py` | 종료·성공 판정 (정책은 종료 신호를 학습하지 않음) |
+| `record.py` / `evaluate.py` | 롤아웃 기록·조건별 성공률 채점 |
+| `geometry.py` | 진열·box1/box2 고정 ROI (적재함은 YOLO 클래스 없음) |
+
+- 상품 6종: sandwich · milk · icecream · cake · biscuit · roll (`coke`/`yogurt` 제외).
+- 관제 slug ↔ 지시문 표기는 `annotate.CONTROLLER_SLUG` / `PRODUCT_PHRASE`만 본다 (예: `milk` → `"milk carton"`).
+- 카메라 키는 추론 시 `camera1`/`camera2`로 맞춤 — 학습 시 rename_map과 일치해야 이미지가 정책에 들어간다.
+- `YOLO_AUTOINSTALL=false` 필수 (제어 루프 중 ultralytics의 런타임 `pip install` 방지).
+
+#### 계산대 — ACT 모방학습
+
+ACT는 **지시문 입력이 없다**. “무엇을 어디에 담을지”는 바구니별 **전용 체크포인트**로만 결정된다.
+
+```text
+[데이터·학습]
+바구니별 teleop 에피소드
+  → ACT ~50,000 step (YELLOW / MINT 각각)
+
+[추론 · omx_pack.server / PackArm]
+POST /pack {deviceCode, maxAttempts}
+  → deviceCode → yellow|mint (vocab.CONTROLLER_DEVICE_BASKET)
+  → 해당 ACT 체크포인트 로드
+  → predict_action 루프 (카메라 원본, YOLO 없음)
+  → 시도 종료 후 boxcheck로 적재함 비움 여부 확인
+  → 비울 때까지 maxAttempts 재시도
+```
+
+| 모듈 | 역할 |
+|------|------|
+| `vocab.py` | `cart-1→yellow`, `cart-2→mint` · 체크포인트 경로 단일 출처 |
+| `arm.py` (`PackArm`) | ACT 정책 로드·롤아웃·재시도 |
+| `boxcheck.py` | 탑뷰 ROI로 적재함 비움 판정 (완료 신호) |
+| `finish.py` / `home.py` | 에피소드 종료·홈 복귀 |
+| `server.py` | HTTP `/pack` · `/pack/state` |
+
+- 픽업의 box1/box2와 짝: `cart-1→box1→YELLOW`, `cart-2→box2→MINT`. 매핑이 어긋나면 엉뚱한 바구니로 간다.
+- `slug`/`quantity` 없음 — 단위는 “이 적재함을 비워라”. `maxAttempts`만 재시도 횟수.
+- 정책은 멈춘 자세에 서므로, 작업 후 `home_after`로 홈 복귀해 탑뷰 가림을 막는다.
+
+**구현 로직 — 관제 ↔ 학습 정책 연결**
+
+```text
+관제 OrdersService
+  매대: OmxHttpStationAdapter → OMX_URL/pick   (SmolVLA+YOLO)
+  계산대: OmxPackStationAdapter → PACK_URL/pack (ACT)
+     ↑ HTTP만 — 관제는 체크포인트·YOLO를 직접 다루지 않음
+```
+
+### 2.8 OMX 로봇팔 (진열대 pick / 계산대 pack)
 
 구현: `OmxHttpStationAdapter` · `OmxPackStationAdapter` · `_OmxFifoGate`
 
@@ -276,6 +368,7 @@ try_claim_waypoint_zone → 원자적 점유
 | 직렬화 | `_OmxFifoGate("shelf")` | `_OmxFifoGate("pack")` |
 | 대기 UI | `OMX 대기` · LCD loading | `포장 OMX 대기` |
 | deviceCode | cart-1→box1, cart-2→box2 | 동일 전달 |
+| 학습·모델 | YOLO 가공 데이터셋 + **SmolVLA** → [2.7](#27-omx-모방학습-진열대-smolvla--계산대-act) | **ACT** → [2.7](#27-omx-모방학습-진열대-smolvla--계산대-act) |
 
 **구현 로직 — FIFO 게이트**
 
@@ -292,7 +385,7 @@ try_claim_waypoint_zone → 원자적 점유
 - OMX 서버 busy(409)면 관제가 `OMX_BUSY_RETRIES`만큼 재시도.
 - URL 미설정·unreachable이면 데모용으로 성공 처리하고 투어 계속.
 
-### 2.8 Pinky 주행·도킹·LCD
+### 2.9 Pinky 주행·도킹·LCD
 
 구현: `pinky/` Flask · `Ros2Backend` · `aruco_dock.py` · `emotion_launch.py`
 
@@ -339,7 +432,7 @@ run.py create_app
 | `pinky_loading` | 매대 OMX·대기 |
 | `pinky_payment` | 계산대 |
 
-### 2.9 운영·장애 복구
+### 2.10 운영·장애 복구
 
 | 기능 | 설명 |
 |------|------|
@@ -360,7 +453,7 @@ admin/API abort
   → FAILED, device idle (강제 홈 이동 없음)
 ```
 
-### 2.10 기능 ↔ 코드 매핑
+### 2.11 기능 ↔ 코드 매핑
 
 | 기능 | 주요 위치 |
 |------|-----------|
@@ -371,7 +464,9 @@ admin/API abort
 | HTTP 어댑터 | `adapters.py` |
 | Pinky Nav/ArUco/LCD | `pinky/modules/backends/ros2.py`, `aruco_dock.py`, `server/routes.py` |
 | emotion 기동 | `pinky/controllers/emotion_launch.py`, `run.py` |
-| OMX pick/pack | `omx/.../omx_yolo/`, `omx_pack/`, `API.md`, `API_PACK.md` |
+| OMX pick/pack HTTP | `omx/.../omx_yolo/server.py`, `omx_pack/server.py`, `API.md`, `API_PACK.md` |
+| OMX SmolVLA·YOLO 학습 | `omx_yolo/annotate.py`, `convert.py`, `camera.py`, `success.py` |
+| OMX ACT 포장 학습 | `omx_pack/vocab.py`, `arm.py`, `boxcheck.py` |
 | 고객·관리 UI | `server/apps/web` |
 
 ---
@@ -786,8 +881,10 @@ PS_project/
 │   └── pinky_emotion/emotion/       # *.gif (pinky_charging 등)
 ├── omx/
 │   └── OMX_service_TS_Project/
-│       ├── omx_yolo/                # 진열대 pick :8080
-│       ├── omx_pack/                # 계산대 pack :8081
+│       ├── omx_yolo/                # 진열대 pick :8080 (YOLO+SmolVLA)
+│       │   ├── annotate.py · convert.py · camera.py · server.py
+│       ├── omx_pack/                # 계산대 pack :8081 (ACT)
+│       │   ├── vocab.py · arm.py · boxcheck.py · server.py
 │       ├── API.md
 │       └── API_PACK.md
 └── README.md                        # 본 문서
