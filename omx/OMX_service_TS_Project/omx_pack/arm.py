@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex",
           "wrist_flex", "wrist_roll", "gripper")
 
+# lerobot-rollout 으로 평가 데이터를 기록할 때 쓰는 --dataset.single_task
+# 와 같은 문구로 맞춰 둔다. ACT 는 언어 조건이 없어 정책 동작은 바뀌지
+# 않는다 — 순수하게 궤적·데이터셋에 남는 라벨이다.
+TASK_LABEL = "Pick up one grocery and put it in the basket"
+
 
 
 def _connect_with_retry(robot, attempts: int = 3, pause_s: float = 1.5) -> None:
@@ -690,11 +695,16 @@ class PackArm(BaseArm):
             # 이 함수가 CHW · float32 [0,1] 로 바꾸고 배치 차원과 장치 이동까지
             # 한다. 0.4.4 에서는 predict_action 안에 들어 있어서 보이지 않았다.
             #
-            # ACT 는 언어 조건이 없어 task 는 쓰이지 않는다 — 무엇을 어디에
-            # 담을지는 어느 체크포인트를 올렸느냐로만 정해진다.
+            # ACT 는 언어 조건이 없어 이 문자열이 팔의 동작을 바꾸지는
+            # 않는다 — 무엇을 어디에 담을지는 어느 체크포인트를 올렸느냐로만
+            # 정해진다. 그래도 넘기는 이유는 궤적·데이터셋에 남는 라벨이기
+            # 때문이다 — 나중에 이 에피소드를 보거나 재사용할 때 무슨
+            # 작업이었는지 알 수 있어야 한다. lerobot-rollout 으로 평가
+            # 데이터를 남길 때 쓰는 --dataset.single_task 와 같은 문구로
+            # 맞춘다.
             with torch.inference_mode():
                 batch = prepare_observation_for_inference(
-                    frame, pol["device"], "", self.robot.robot_type)
+                    frame, pol["device"], TASK_LABEL, self.robot.robot_type)
                 batch = pol["pre"](batch)
                 action_values = pol["policy"].select_action(batch)
                 action_values = pol["post"](action_values)
