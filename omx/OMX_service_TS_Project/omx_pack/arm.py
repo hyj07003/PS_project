@@ -115,7 +115,7 @@ class BaseArm:
             return
         path = w.close({k: out[k] for k in
                         ("success", "finished", "aborted", "reason", "seconds",
-                         "observeOnly", "mock")
+                         "observeOnly", "mock", "task")
                         if k in out})
         if path is not None:
             self.traces.append(str(path))
@@ -745,6 +745,7 @@ class PackArm(BaseArm):
                        getattr(det, "reason", "종료") if finished else
                        "시간 초과"),
             "observeOnly": bool(self.observe_only),
+            "task": TASK_LABEL,
         }
         self._trace_close(tw, out)
         # 적재함을 보고 끊었다면 그때 본 화면을 남긴다. 판정이 틀렸을 때
