@@ -1730,6 +1730,36 @@ class OrdersService:
             final_range_m=final_range,
         )
 
+    def _omx_offline_success_wait(
+        self,
+        device_code: str,
+        mission_id: int,
+        waypoint_id: str,
+        reason: str,
+    ) -> None:
+        """OMX와 통신 불가 시 도킹 후 대기했다가 pick 성공으로 간주."""
+        wait_sec = float(os.environ.get("OMX_OFFLINE_SUCCESS_WAIT_SEC", "10"))
+        wait_sec = max(0.0, wait_sec)
+        self._set_lcd(device_code, "pinky_loading")
+        label = (
+            f"OMX 오프라인 {wait_sec:g}초"
+            if wait_sec > 0
+            else "OMX 오프라인 성공"
+        )
+        self._set_waypoint(mission_id, waypoint_id, label_suffix=label)
+        self._mission_note(
+            mission_id,
+            f"{reason} at {waypoint_id} — wait {wait_sec:g}s then success",
+        )
+        deadline = time.monotonic() + wait_sec
+        while time.monotonic() < deadline:
+            self._ensure_not_aborted(mission_id)
+            time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+        self._mission_note(
+            mission_id,
+            f"{reason} at {waypoint_id} — success override after wait",
+        )
+
     def _omx_pick_at_shelf(
         self,
         device_code: str,
@@ -1740,24 +1770,27 @@ class OrdersService:
         *,
         arm_held: bool = False,
     ) -> None:
-        """진열대 OMX pick then continue tour. No dwell pause.
+        """진열대 OMX pick then continue tour.
 
-        Mock / no OMX URL / server unreachable → treat as success and proceed.
+        Mock / no OMX URL / server unreachable → 도킹 후 대기(기본 10초) 뒤 성공.
         arm_held=True: caller already owns FIFO OMX gate (dock-order queue).
         """
         if not picks:
             return
         if not isinstance(self.station_port, OmxHttpStationAdapter):
-            self._mission_note(
+            self._omx_offline_success_wait(
+                device_code,
                 mission_id,
-                f"omx skip at {waypoint_id} (mock/no OMX_URL) — success",
+                waypoint_id,
+                "omx skip (mock/no OMX_URL)",
             )
             return
-        # Quick probe: if OMX HTTP is down, skip pick as success (no 3s wait).
         if not self.station_port.is_server_reachable():
-            self._mission_note(
+            self._omx_offline_success_wait(
+                device_code,
                 mission_id,
-                f"omx unreachable at {waypoint_id} — success override, continue",
+                waypoint_id,
+                "omx unreachable",
             )
             return
 
@@ -1851,15 +1884,25 @@ class OrdersService:
         """ArUco dock → FIFO OMX (shared arm) → undock.
 
         Both carts may sit at different shelves; OMX runs in dock-completion order.
+        OMX 미통신이면 도킹 후 대기(기본 10초)하고 pick 성공으로 간주(팔 큐 미점유).
         """
         travel, final_range = self._aruco_dock_or_fail(
             device_code, waypoint_id, mission_id
         )
-        needs_omx = bool(shelf_picks) and isinstance(
-            self.station_port, OmxHttpStationAdapter
+        if not shelf_picks:
+            self._undock_after_shelf_aruco(
+                device_code,
+                waypoint_id,
+                travel,
+                mission_id,
+                final_range_m=final_range,
+            )
+            return
+
+        omx_live = isinstance(self.station_port, OmxHttpStationAdapter) and (
+            self.station_port.is_server_reachable()
         )
-        if needs_omx:
-            # Enqueue immediately after dock so first-arrived gets OMX first.
+        if omx_live:
             self._set_lcd(device_code, "pinky_loading")
             self._acquire_omx_arm(
                 mission_id, device_code=device_code, waypoint_id=waypoint_id
