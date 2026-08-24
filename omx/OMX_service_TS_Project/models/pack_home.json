@@ -1,0 +1,12 @@
+{
+  "pose": {
+    "shoulder_pan": 0.76,
+    "shoulder_lift": -64.54,
+    "elbow_flex": 54.92,
+    "wrist_flex": 51.89,
+    "wrist_roll": 1.39,
+    "gripper": 56.63
+  },
+  "measuredAt": "2026-08-21 19:45:13",
+  "note": "팔을 대기 자세에 두고 --capture 로 기록"
+}

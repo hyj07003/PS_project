@@ -22,7 +22,7 @@ import numpy as np
 from .dist import OUT, StateRange, format_report
 from .finish import make_detector
 from .trace import TraceWriter
-from .vocab import resolve_checkpoint
+from .vocab import DEFAULT_CHECKPOINTS, resolve_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,13 @@ class BaseArm:
         self._frame_t = 0.0
         self._frame_lock = threading.Lock()
 
-    def preflight(self) -> None:
+    def preflight(self, basket: str) -> None:
         """작업 시작 직전 점검. 문제가 있으면 ValueError 를 올린다.
+
+        바구니를 **인자로 받는다.** self.job 에서 읽으면 안 된다 — 이 시점에는
+        아직 job 이 만들어지기 전이라 None 이거나, 더 나쁘게는 직전 작업의
+        바구니가 남아 있다. 그러면 엉뚱한 바구니 기준으로 조용히 검사한다
+        (2026-08-21 통합 시험에서 KeyError 로 드러났다).
 
         구현체가 채운다. 기본은 아무것도 하지 않는다 — 가짜 팔에는
         점검할 하드웨어가 없다.
@@ -149,7 +154,7 @@ class BaseArm:
         # 팔이 움직이기 전에 마지막으로 확인한다. 여기서 막으면 HTTP 가
         # 400 으로 거절하므로 관제가 이유를 그대로 받는다. 작업을 띄운 뒤
         # 실패시키면 관제는 "시작은 됐는데 실패했다" 로만 알게 된다.
-        self.preflight()
+        self.preflight(basket)
 
         self._seq += 1
         self._stop = None
@@ -483,34 +488,40 @@ class PackArm(BaseArm):
         이 클래스를 그쪽에 맞추는 편이 안전하다
     """
 
-    def __init__(self, basket: str, robot_port: str, robot_id: str,
+    def __init__(self, robot_port: str, robot_id: str,
                  front_device: str, wrist_device: str,
-                 checkpoint: str | None = None, fps: int = 30,
+                 baskets: list[str] | None = None, fps: int = 30,
                  finish: str = "duration", finish_sec: float = 60.0,
                  trace_dir: str | None = None, observe_only: bool = False,
-                 strict_start: bool = False, box_name: str = "box1",
-                 home_after: bool = False):
+                 strict_start: bool = False, home_after: bool = False):
         super().__init__(fps=fps, trace_dir=trace_dir, home_after=home_after)
-        self.basket = basket
         self.finish_kind = finish
         self.finish_sec = finish_sec
         self.strict_start = strict_start
-        self.box_name = box_name
-        # 적재함 판정기는 종료 방식이 box-empty 일 때만 만든다. YOLO 가중치
-        # 로드가 1초 남짓 걸리므로 안 쓸 때는 만들지 않는다.
-        self.box_checker = None
+
+        # **바구니 모델을 전부 올린다.**
+        #
+        # ACT 에는 언어 조건이 없어서 "민트 바구니에 담아라" 를 요청으로
+        # 전달할 방법이 없다. 어느 모델을 올렸느냐가 곧 어느 바구니냐다.
+        # 처음에는 기동할 때 하나만 올렸는데, 그러면 cart-2 요청을 409 로
+        # 거절하게 되고 서버를 다시 띄워야 했다. 팔이 하나뿐이라 서버를 두 개
+        # 띄우는 우회도 불가능하다 — 같은 시리얼 포트를 두 프로세스가 열 수
+        # 없다. 그래서 둘 다 올리고 deviceCode 로 고른다.
+        #
+        # 비용은 무시할 만하다: 체크포인트가 각각 0.28 GB(16 GB 중)이고
+        # 로드가 0.6초다. 전환 비용은 없다 — 올려둔 것 중에 고르기만 한다.
+        self.baskets = list(baskets) if baskets else sorted(DEFAULT_CHECKPOINTS)
+
+        # 적재함 판정기도 바구니 수만큼 만든다. YOLO 가중치는 한 번만 읽히고
+        # ROI 만 다르므로 부담이 없다.
+        self.box_checkers: dict[str, object] = {}
         if finish == "box-empty":
-            from .boxcheck import BoxChecker, load_rois, resolve_box
+            from .boxcheck import BoxChecker, load_rois
 
             rois = load_rois()
-            box_name = resolve_box(box_name)
-            self.box_name = box_name
-            if box_name not in rois:
-                raise ValueError(
-                    f"모르는 적재함 이름입니다: {box_name!r} "
-                    f"(아는 것: {', '.join(sorted(rois))})")
-            self.box_checker = BoxChecker(roi=rois[box_name])
-            logger.info("적재함 판정 ROI (%s): %s", box_name, rois[box_name])
+            for box, roi in rois.items():
+                self.box_checkers[box] = BoxChecker(roi=roi)
+                logger.info("적재함 판정 ROI (%s): %s", box, roi)
         # 관측 전용 — 정책을 올리지 않고 팔에 명령도 보내지 않는다.
         # 첫 하드웨어 연결에서 쓴다. 연결·카메라 키·제어 주기·홈 자세를
         # 팔이 움직이지 않는 상태에서 전부 확인할 수 있다.
@@ -545,16 +556,18 @@ class PackArm(BaseArm):
             OmxFollowerConfig(port=robot_port, id=robot_id, cameras=cams))
 
         # 학습 분포는 정책과 별개로 읽어 둔다. 관측 전용이라 정책을 안
-        # 올리는 경우에도 자세 점검은 할 수 있어야 한다.
-        self.range = None
-        try:
-            self.range = StateRange(checkpoint or resolve_checkpoint(basket))
-        except Exception as exc:                      # noqa: BLE001
-            logger.warning("학습 분포를 읽지 못했습니다 — 시작 자세 점검이 "
-                           "꺼집니다: %s", exc)
+        # 올리는 경우에도 자세 점검은 할 수 있어야 한다. 바구니마다 통계가
+        # 다르므로 따로 보관한다.
+        self.ranges: dict[str, StateRange] = {}
+        for b in self.baskets:
+            try:
+                self.ranges[b] = StateRange(resolve_checkpoint(b))
+            except Exception as exc:                  # noqa: BLE001
+                logger.warning("%s 학습 분포를 읽지 못했습니다 — 시작 자세 "
+                               "점검이 꺼집니다: %s", b, exc)
 
+        self.policies: dict[str, dict] = {}
         if observe_only:
-            self.policy = self.pre = self.post = self.device = self.cfg = None
             _connect_with_retry(self.robot)
             from lerobot.processor.factory import make_default_processors
 
@@ -564,17 +577,19 @@ class PackArm(BaseArm):
             logger.info("관측 전용으로 연결했습니다 — 팔에 명령을 보내지 않습니다.")
             return
 
-        path = checkpoint or resolve_checkpoint(basket)
-        logger.info("정책 로드 중 (%s 바구니): %s", basket, path)
-        cfg = PreTrainedConfig.from_pretrained(path)
-        cfg.pretrained_path = path
-        self.policy = get_policy_class(cfg.type).from_pretrained(
-            path, config=cfg).eval()
-        self.pre, self.post = make_pre_post_processors(
-            policy_cfg=cfg, pretrained_path=path,
-            preprocessor_overrides={"device_processor": {"device": cfg.device}})
-        self.device = get_safe_torch_device(cfg.device)
-        self.cfg = cfg
+        for b in self.baskets:
+            path = resolve_checkpoint(b)
+            logger.info("정책 로드 중 (%s 바구니): %s", b, path)
+            cfg = PreTrainedConfig.from_pretrained(path)
+            cfg.pretrained_path = path
+            policy = get_policy_class(cfg.type).from_pretrained(
+                path, config=cfg).eval()
+            pre, post = make_pre_post_processors(
+                policy_cfg=cfg, pretrained_path=path,
+                preprocessor_overrides={"device_processor": {"device": cfg.device}})
+            self.policies[b] = {"policy": policy, "pre": pre, "post": post,
+                                "cfg": cfg,
+                                "device": get_safe_torch_device(cfg.device)}
 
         _connect_with_retry(self.robot)
 
@@ -583,7 +598,8 @@ class PackArm(BaseArm):
         (self._teleop_proc, self._act_proc,
          self._obs_proc) = make_default_processors()
         self._features = self._build_features()
-        logger.info("로봇 연결 완료. 준비됨 (%s).", basket)
+        logger.info("로봇 연결 완료. 준비됨 (바구니 %s).",
+                    ", ".join(self.baskets))
 
     def _build_features(self) -> dict:
         # 0.6.1 에서 build_dataset_frame 이 lerobot.utils.feature_utils 로
@@ -615,10 +631,18 @@ class PackArm(BaseArm):
                                             prepare_observation_for_inference)
         import torch
 
+        # 이번 작업의 바구니에 해당하는 정책을 고른다. 잘못 고르면 팔이
+        # 엉뚱한 바구니로 간다 — 예외도 경고도 없이.
+        pol = None
         if not self.observe_only:
-            self.policy.reset()
+            if basket not in self.policies:
+                raise ValueError(
+                    f"{basket} 바구니 모델이 올라와 있지 않습니다 "
+                    f"(올린 것: {', '.join(sorted(self.policies))})")
+            pol = self.policies[basket]
+            pol["policy"].reset()
         det = make_detector(self.finish_kind, fps=self.fps, seconds=self.finish_sec,
-                            checker=self.box_checker,
+                            checker=self._checker_for_job(),
                             frame_fn=lambda: self.get_frame("front"))
         det.reset()
         tw = self._trace_writer(basket)
@@ -670,10 +694,10 @@ class PackArm(BaseArm):
             # 담을지는 어느 체크포인트를 올렸느냐로만 정해진다.
             with torch.inference_mode():
                 batch = prepare_observation_for_inference(
-                    frame, self.device, "", self.robot.robot_type)
-                batch = self.pre(batch)
-                action_values = self.policy.select_action(batch)
-                action_values = self.post(action_values)
+                    frame, pol["device"], "", self.robot.robot_type)
+                batch = pol["pre"](batch)
+                action_values = pol["policy"].select_action(batch)
+                action_values = pol["post"](action_values)
             act = make_robot_action(action_values.squeeze(0).cpu(),
                                     self._features)
             self.robot.send_action(self._act_proc((act, obs)))
@@ -734,6 +758,24 @@ class PackArm(BaseArm):
         self.last = out
         return out
 
+    def _checker_for_job(self):
+        """이번 작업의 deviceCode 에 해당하는 적재함 판정기.
+
+        cart-1 → box1, cart-2 → box2. 바구니 모델과 적재함 ROI 는 **함께**
+        움직여야 한다 — 노랑 모델을 돌리면서 box2 를 보면 엉뚱한 상자가
+        비었는지 묻게 된다.
+        """
+        if not self.box_checkers:
+            return None
+        from .boxcheck import resolve_box
+
+        device = (self.job or {}).get("deviceCode", "")
+        box = resolve_box(device)
+        if box not in self.box_checkers:
+            logger.warning("적재함 ROI 를 찾지 못했습니다: %r → %r", device, box)
+            return None
+        return self.box_checkers[box]
+
     def job_complete(self) -> tuple[bool | None, str]:
         """적재함이 비었는지 확인한다 — 이것이 포장 작업의 완료 조건이다.
 
@@ -744,7 +786,8 @@ class PackArm(BaseArm):
         끝내 못 보면 None 을 돌려준다. **"모른다" 를 "안 비었다" 로 바꾸지
         않는다** — 둘은 다른 일이고, 관제도 다르게 다뤄야 한다.
         """
-        if self.box_checker is None:
+        checker = self._checker_for_job()
+        if checker is None:
             return True, ""            # 적재함 판정을 안 쓰는 설정
         from .boxcheck import roi_is_visible
 
@@ -753,16 +796,16 @@ class PackArm(BaseArm):
         while time.time() < deadline:
             frame = self.get_frame("front", max_age_s=0.3)
             if frame is not None:
-                visible, last_dark = roi_is_visible(frame, self.box_checker.roi)
+                visible, last_dark = roi_is_visible(frame, checker.roi)
                 if visible:
-                    empty, det = self.box_checker.is_empty(frame)
+                    empty, det = checker.is_empty(frame)
                     if empty:
                         return True, "적재함이 비어 보입니다"
                     return False, f"물건 {len(det)}개가 남아 있습니다"
             time.sleep(0.3)
         return None, (f"적재함을 볼 수 없었습니다 (팔이 {last_dark*100:.0f}% 가림)")
 
-    def start_pose_check(self) -> dict | None:
+    def start_pose_check(self, basket: str | None = None) -> dict | None:
         """지금 팔 자세가 학습 분포 안인지 본다.
 
         ⚠ **작업 중에는 절대 부르면 안 된다.** 모터 버스를 읽는데,
@@ -775,14 +818,26 @@ class PackArm(BaseArm):
         /health 를 폴링하는 순간 진행 중이던 포장 작업이 통째로 실패했다.
         부르는 쪽(health)에서 busy 를 확인한다.
         """
-        if self.range is None:
+        if not self.ranges:
             return None
         obs = self.robot.get_observation()
-        return self.range.summary(self._state_vec(obs))
+        state = self._state_vec(obs)
+        if basket is not None:
+            rng = self.ranges.get(basket)
+            return rng.summary(state) if rng else None
+        # 어느 바구니로 갈지 모르는 상황(대기 중 /health)에서는 전부 본다.
+        # 바구니마다 학습 분포가 다르므로 하나로 합칠 수 없다.
+        return {b: r.summary(state) for b, r in self.ranges.items()}
 
-    def preflight(self) -> None:
-        chk = self.start_pose_check()
-        if chk is None:
+    def preflight(self, basket: str) -> None:
+        # 이번 작업의 바구니 분포로 본다. 바구니마다 학습 범위가 다르므로
+        # 아무 것이나 쓰면 통과·거절이 뒤바뀔 수 있다.
+        chk = self.start_pose_check(basket)
+        if not chk or "grade" not in chk:
+            # 해당 바구니의 분포를 못 읽은 경우다. 점검을 못 했다고 해서
+            # 작업을 막지는 않는다 — 막을 근거가 없다.
+            if chk:
+                logger.warning("%s 바구니 분포로 시작 자세를 볼 수 없습니다", basket)
             return
         if chk["grade"] == OUT:
             msg = ("시작 자세가 학습 범위 밖입니다: "
@@ -837,7 +892,9 @@ class PackArm(BaseArm):
     def health(self) -> dict:
         out = {"success": True, "status": "OK", "message": "",
                "robotConnected": bool(self.robot.is_connected),
-               "busy": bool(self.busy), "basket": self.basket,
+               "busy": bool(self.busy),
+               "baskets": list(self.baskets),
+               "boxes": sorted(self.box_checkers),
                "finishMode": self.finish_kind,
                "observeOnly": bool(self.observe_only)}
         # 작업 중에는 모터 버스를 건드리지 않는다. /health 는 관제가 수시로
@@ -845,17 +902,25 @@ class PackArm(BaseArm):
         if self.busy:
             chk = {"grade": "SKIPPED",
                    "note": "작업 중에는 자세를 읽지 않습니다 (모터 버스 충돌 방지)"}
+            out["startPose"] = chk
         else:
             try:
                 chk = self.start_pose_check()
             except Exception as exc:                  # noqa: BLE001
                 chk = {"grade": "UNKNOWN", "error": str(exc)}
-        if chk is not None:
-            out["startPose"] = chk
-            if chk.get("grade") == OUT:
-                out["status"] = "DEGRADED"
-                out["message"] = ("시작 자세가 학습 범위 밖입니다 — "
-                                  + "; ".join(chk.get("messages", [])))
+            if chk is not None:
+                out["startPose"] = chk
+                # 바구니별 결과다. 하나라도 범위 밖이면 알린다 — 그 바구니로
+                # 요청이 오면 정책이 본 적 없는 상태에서 시작한다.
+                bad = [b for b, v in chk.items()
+                       if isinstance(v, dict) and v.get("grade") == OUT]
+                if bad:
+                    out["status"] = "DEGRADED"
+                    msgs = []
+                    for b in bad:
+                        msgs += [f"{b}: {m}" for m in chk[b].get("messages", [])]
+                    out["message"] = ("시작 자세가 학습 범위 밖입니다 — "
+                                      + "; ".join(msgs))
         # 픽업의 /health 는 리그 기준 대조까지 한다(checkrig). 포장은 기준
         # 배치를 아직 촬영하지 못해 장치 연결만 본다.
         out["rig"] = {"error": "포장 리그 기준값이 아직 없습니다"}

@@ -13,9 +13,18 @@ omx_adapter.py   → app/adapters.py 맨 아래에 추가
 
 ---
 
-## 1. 상품 카탈로그 — W1~W6 최신 매핑 반영
+## 1. 상품 카탈로그 — `cola` 제거, `biscuit` 추가
 
-현재 관제 기준 매핑은 다음과 같다.
+**왜** — OMX 검출기의 `KEEP_CLASSES` 에서 `coke` 를 오검출 때문에 의도적으로
+제외했고, 정책도 콜라를 학습한 적이 없다. 반대로 `biscuit` 은 OMX 가 가장
+잘 집는 상품인데(롤아웃 10회 중 9회 성공) 카탈로그에 없었다. 그래서
+`app/seed.py` 의 `PRODUCTS` 에서 `cola` 를 빼고 `biscuit` 을 넣는다.
+
+**어느 상품이 어느 웨이포인트에 있는지는 OMX 소관이 아니다.** 그 표는
+카트가 어느 매대로 갈지를 정하는 것이고 관제/카트 담당이 정한다. OMX 는
+화면에서 상품을 찾아 집으므로 매대 번호와 무관하다. 아래 값은 2026-08-21
+기준 관제의 현재 매핑을 옮겨 적은 것이니, 바뀌었으면 관제 쪽을 따를 것.
+
 - W1=cake, W2=roll-cake, W3=milk, W4=biscuit, W5=ice-cream, W6=sandwich
 
 ```python
@@ -82,12 +91,18 @@ self.station_port = (
 `.env` 에 추가:
 
 ```
-OMX_URL=http://127.0.0.1:8080
+OMX_URL=http://192.168.129.50:8080   # OMX(로봇팔) PC 의 LAN IP
 OMX_POLL_SEC=0.5
+OMX_CONNECT_TIMEOUT_SEC=5
 ```
 
-같은 PC 에서 돌므로 루프백이다. 관제는 4100, pinky 는 4200, OMX 는 8080 을
-쓰므로 충돌하지 않는다.
+**OMX 는 관제와 다른 PC 에서 돈다.** 로봇팔이 붙어 있는 PC 의 LAN IP 를
+적는다. 그 PC 에서 `scripts/start_server.sh` 로 서버를 띄우면 기동 로그에
+`관제 PC server/.env 예: OMX_URL=http://<IP>:8080` 이 찍히므로 그 값을
+그대로 옮기면 된다. 방화벽에서 TCP 8080 을 열어야 한다.
+
+한 PC 에서 다 돌리는 경우에는 `http://127.0.0.1:8080` 이다. 관제 4100,
+pinky 4200, OMX 8080 이라 포트는 충돌하지 않는다.
 
 ---
 

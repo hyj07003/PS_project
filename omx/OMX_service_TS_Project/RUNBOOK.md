@@ -38,8 +38,12 @@ export PYTHONPATH=~/il_ws/src
 export YOLO_AUTOINSTALL=false          # 제어 루프 중 pip install 방지
 ~/venv/il/bin/python -m omx_yolo.server \
     --policy ~/il_ws/src/lerobot/outputs/train/v1_yolo/checkpoints/060000/pretrained_model \
-    --port 8080
+    --retries 2 --port 8080
 ```
+
+`--retries` 는 **헛집었을 때만** 다시 시도한다(집었다 놓친 경우는 진열 상태를
+알 수 없어 재시도하지 않는다). 한 번에 30초쯤 걸리므로 관제의
+`OMX_PICK_TIMEOUT_SEC` 도 함께 늘려야 한다. 기본은 0 = 첫 실패에 중단.
 
 또는 `POLICY=<체크포인트> ~/il_ws/scripts/start_server.sh`
 
@@ -47,12 +51,15 @@ export YOLO_AUTOINSTALL=false          # 제어 루프 중 pip install 방지
 
 ```bash
 PYTHONPATH=~/il_ws/src ~/venv/pack/bin/python -m omx_pack.server \
-    --basket yellow --strict-start --home-after \
+    --strict-start --home-after \
     --robot-port /dev/omx_pack_follower \
     --front /dev/omx_cam_pack_top --wrist /dev/omx_cam_pack_hand \
     --trace-dir ~/il_ws/traces/$(date +%m%d) \
-    --finish box-empty --box cart-1 --port 8081
+    --finish box-empty --port 8081
 ```
+
+바구니는 요청의 `deviceCode` 가 정한다 — 노랑·민트 모델을 둘 다 올리므로
+`cart-1`·`cart-2` 를 한 서버로 처리한다.
 
 `--home-after` 는 작업이 끝나면 팔을 대기 자세로 되돌린다. 홈 값이 없으면
 경고만 남고 작업 결과는 그대로다. 처음 한 번은 기록해 두어야 한다 —
@@ -129,6 +136,27 @@ INFO 판정 근거 화면: /home/newuser/il_ws/traces/0821/..._boxview.jpg
 | 화면이 안 나옴 | 다른 프로세스가 카메라를 잡고 있다. 서버가 떠 있으면 `preflight.py --skip cameras` 로 돌린다 |
 
 ---
+
+## 4-1. 관제 없이 단위 시험
+
+`try.sh` 로 서버만 따로 돌려볼 수 있다. 요청을 보내고 끝날 때까지 폴링하며
+진행이 바뀔 때만 한 줄씩 찍는다.
+
+```bash
+~/il_ws/scripts/try.sh health                # 두 서버 상태
+~/il_ws/scripts/try.sh pick sandwich cart-1  # 픽업 1개
+~/il_ws/scripts/try.sh pick biscuit cart-1 1 2   # 개수 1 · 재시도 2
+~/il_ws/scripts/try.sh pack cart-1           # 포장 (적재함 비우기)
+~/il_ws/scripts/try.sh pack cart-2 3         # 민트 바구니 · 재시도 3
+~/il_ws/scripts/try.sh stop pick             # 정지
+```
+
+관제 PC 에서 돌릴 때는 주소를 넘긴다:
+
+```bash
+PICK_URL=http://<OMX PC>:8080 PACK_URL=http://<OMX PC>:8081 \
+  ~/il_ws/scripts/try.sh health
+```
 
 ## 5. 시험 뒤
 

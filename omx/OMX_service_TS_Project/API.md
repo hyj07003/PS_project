@@ -4,15 +4,10 @@
 **이 문서가 규격의 유일한 출처다.**
 
 ```
-관제서버 :4100  ──HTTP(LAN)──>  OMX 서버 :8080  ──>  로봇팔
-         (관제 PC)                  (OMX/로봇팔 PC)
+관제서버 :4100  ──HTTP──>  OMX 서버 :8080  ──>  로봇팔
 ```
 
-**OMX 서버는 로봇팔이 연결된 별도 PC에서 구동**한다. 관제 PC의 `.env`에
-그 PC의 LAN IP를 넣는다 (예: `http://192.168.129.50:8080`).
-같은 PC에서 테스트할 때만 `http://127.0.0.1:8080` 을 쓴다.
-OMX 서버는 기본 `0.0.0.0:8080` 으로 bind 하므로 LAN 접속을 받는다.
-인증은 없다. 방화벽에서 **OMX PC의 TCP 8080** 을 관제 PC IP(또는 서브넷)에 허용할 것.
+같은 PC에서 돌므로 `http://127.0.0.1:8080` 이다. 인증은 없다.
 필드는 **camelCase**, 응답은 `{"success", "status", "message"}` 형태로,
 pinky 로봇 서버(`PinkyHttpCartAdapter`)와 같은 규약을 따른다.
 
@@ -56,7 +51,8 @@ pinky 로봇 서버(`PinkyHttpCartAdapter`)와 같은 규약을 따른다.
   "deviceCode": "cart-1",
   "slug": "biscuit",
   "quantity": 2,
-  "timeoutSec": 90
+  "timeoutSec": 90,
+  "retries": 2
 }
 ```
 
@@ -67,6 +63,22 @@ pinky 로봇 서버(`PinkyHttpCartAdapter`)와 같은 규약을 따른다.
 | `slug` | ✔ | 관제 DB 의 `products.slug` 를 그대로 (아래 표 참조) |
 | `quantity` | ✔ | `order_items.quantity`. **1~3** |
 | `timeoutSec` | | 픽업 1회당 상한. 기본 90 |
+| `retries` | | **헛집었을 때** 다시 시도할 횟수. 기본은 서버 기동값(`--retries`, 기본 0) |
+
+### 재시도는 헛집은 경우에만 한다
+
+`retries` 를 주면 실패를 다시 해 보는데, **모든 실패를 재시도하지는 않는다.**
+
+| 실패 | 재시도 | 이유 |
+|---|---|---|
+| `grasped: false` (헛집음·미끄러짐) | **한다** | 아무것도 집지 않았으므로 진열 상태가 그대로다 — 학습 분포 안이다 |
+| `grasped: true` (집었다 놓침·엉뚱한 곳) | 안 한다 | 물건이 어디 갔는지 모른다. 진열 상태가 학습에 없는 형태가 됐을 수 있고, 그러면 다음 시도는 빈 칸을 헛집는다 |
+
+한 번에 30초 안팎이 걸린다. `retries: 2` 면 한 개에 최대 90초이므로 **관제의
+`OMX_PICK_TIMEOUT_SEC` 과 폴링 마감도 함께 늘려야 한다.**
+
+`/pick/state` 에 `retries`(지금까지 다시 한 횟수)와 `maxRetries` 가 실린다.
+조용히 다시 하면 성공률이 실제보다 좋아 보이므로 드러나게 했다.
 
 ### 응답 — `202 Accepted`
 
@@ -197,12 +209,12 @@ pinky 로봇 서버(`PinkyHttpCartAdapter`)와 같은 규약을 따른다.
 
 | 관제 `slug` | 웨이포인트 | 내부 클래스 | 정책 지시문 |
 |---|---|---|---|
-| `milk` | W3 | `milk` | **`milk carton`** |
-| `biscuit` | W4 | `biscuit` | `biscuit` |
-| `ice-cream` | W5 | `icecream` | `icecream` |
+| `sandwich` | W3 | `sandwich` | `sandwich` |
+| `milk` | W5 | `milk` | **`milk carton`** |
+| `ice-cream` | W4 | `icecream` | `icecream` |
 | `roll-cake` | W2 | `roll` | `roll` |
 | `cake` | W1 | `cake` | `cake` |
-| `sandwich` | W6 | `sandwich` | `sandwich` |
+| `biscuit` | W6 | `biscuit` | `biscuit` |
 
 `cola` 는 **지원하지 않는다.** 검출기가 오검출 때문에 `coke` 클래스를
 제외했고 정책도 학습한 적이 없다. 카탈로그에서 `cola` 를 빼고 `biscuit` 을

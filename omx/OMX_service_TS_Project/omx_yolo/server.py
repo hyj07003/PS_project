@@ -106,8 +106,12 @@ class ArmController:
 
     def __init__(self, policy_path: str, robot_port: str, robot_id: str,
                  top_device: str, hand_device: str, weights: str,
-                 annotate: bool, fps: int = 30):
+                 annotate: bool, fps: int = 30, retries: int = 0):
         self.fps = fps
+        # 헛집었을 때 다시 시도할 횟수. 기본 0 = 예전처럼 첫 실패에서 중단.
+        # 재시도는 성공률을 올리는 것이 아니라 **기회를 더 주는 것**이다.
+        # 한 번에 28초쯤 걸리므로 무한정 늘릴 수는 없다.
+        self.retries = int(retries)
         self.lock = threading.Lock()
         self.busy = False
         self.last: dict | None = None
@@ -307,7 +311,8 @@ class ArmController:
     #  작업(job) — 수량 N 개를 순차 픽업하고, 도중에 끊을 수 있다
     # ────────────────────────────────────────────────────────────────
     def start_job(self, slug: str, device_code: str, quantity: int,
-                  order_id: int = 0, timeout_s: float = 90.0) -> dict:
+                  order_id: int = 0, timeout_s: float = 90.0,
+                  retries: int | None = None) -> dict:
         """픽업 작업을 시작하고 즉시 반환한다. 실제 동작은 워커 스레드가 한다.
 
         블로킹으로 두면 안 되는 이유: N=3 이면 최대 4.5분이고, 그동안 관제가
@@ -324,6 +329,8 @@ class ArmController:
                 f"quantity 가 진열대 재고 상한({SHELF_CAPACITY})을 넘습니다: {n}. "
                 f"리필 없이는 한 번에 {SHELF_CAPACITY} 개까지만 집을 수 있습니다.")
 
+        if retries is not None:
+            self.retries = max(0, int(retries))
         self._seq += 1
         self._stop = None
         self.job = {
@@ -339,6 +346,7 @@ class ArmController:
             "currentIndex": 1,
             "startedAt": time.time(),
             "results": [],
+            "retries": 0,
             "message": "",
         }
         t = threading.Thread(target=self._run_job, args=(timeout_s,), daemon=True)
@@ -350,7 +358,10 @@ class ArmController:
         assert job is not None
         try:
             self.busy = True
-            for i in range(1, job["total"] + 1):
+            tries = 0
+            i = 0
+            while job["done"] < job["total"]:
+                i = job["done"] + 1
                 if self._stop:
                     job["state"] = "ABORTED"
                     job["message"] = f"운영자 정지({self._stop})"
@@ -365,17 +376,38 @@ class ArmController:
                     job["message"] = "운영자 즉시 정지"
                     break
                 if not r["success"]:
-                    # 한 개라도 실패하면 즉시 중단한다.
+                    # 실패에는 두 종류가 있고, 재시도해도 되는 것은 하나뿐이다.
                     #
-                    # 정책이 FIFO(가까운 것부터)를 어기면 진열 상태가
-                    # [1][ ][ ] 처럼 학습 데이터에 없는 형태가 되고, 그 뒤
-                    # 픽업은 빈 칸을 헛집는다(2026-08-19 실측). 실패를 안고
-                    # 계속 가면 남은 시도까지 같이 버린다.
+                    #   grasped=False  아무것도 못 집었다. 진열 상태가 그대로
+                    #                  이므로 학습 분포 안이고, 다시 해도 된다.
+                    #                  (오늘 실패가 이것: grip 49.3 미끄러짐)
+                    #
+                    #   grasped=True   집었는데 놓치거나 엉뚱한 데 뒀다. 물건이
+                    #                  어디 갔는지 모른다. 진열 상태가 학습에
+                    #                  없는 형태가 됐을 수 있으므로 재시도하면
+                    #                  빈 칸을 헛집는다(2026-08-19 실측).
+                    #
+                    # 그래서 헛집은 경우만 다시 한다. 그것도 정해진 횟수까지다 —
+                    # 리그가 틀어졌거나 물건이 닿지 않는 자리에 있으면 몇 번을
+                    # 해도 안 되고, 그때는 사람이 봐야 한다.
+                    retryable = (not r.get("grasped")) and not r.get("aborted")
+                    if retryable and tries < self.retries:
+                        tries += 1
+                        job["retries"] = tries
+                        logger.warning(
+                            "픽업 실패(%s) — 아무것도 집지 못했으므로 다시 "
+                            "시도합니다 (%d/%d)",
+                            r.get("reason"), tries, self.retries)
+                        self._mission_retry_note(job, r, tries)
+                        continue          # i 를 늘리지 않는다 — 같은 한 개다
                     job["state"] = "FAILED"
                     job["message"] = r.get("reason") or "픽업 실패"
+                    if retryable and self.retries:
+                        job["message"] += f" ({self.retries}회 재시도 후)"
                     break
                 job["done"] += 1
-            else:
+                tries = 0                 # 하나 성공했으면 재시도 횟수를 되돌린다
+            if job["state"] == "RUNNING" and job["done"] >= job["total"]:
                 job["state"] = "DONE"
                 job["message"] = ""
 
@@ -389,6 +421,12 @@ class ArmController:
             job["finishedAt"] = time.time()
             self.busy = False
             self._stop = None
+
+    @staticmethod
+    def _mission_retry_note(job: dict, r: dict, tries: int) -> None:
+        """재시도를 결과 목록에 남긴다. 관제가 몇 번 만에 됐는지 볼 수 있어야
+        한다 — 조용히 다시 하면 성공률이 실제보다 좋아 보인다."""
+        r["retried"] = tries
 
     def request_stop(self, mode: str) -> dict:
         """mode='afterCurrent' 현재 1개 끝내고 정지 · 'immediate' 즉시 정지."""
@@ -415,6 +453,8 @@ class ArmController:
             "deviceCode": j["deviceCode"], "slug": j["slug"], "box": j["box"],
             "total": j["total"], "done": j["done"],
             "currentIndex": j["currentIndex"],
+            "retries": j.get("retries", 0),
+            "maxRetries": self.retries,
             "elapsedSec": round(time.time() - j["startedAt"], 1),
             "results": j["results"],
             "message": j["message"],
@@ -777,6 +817,7 @@ def make_handler(ctrl: ArmController):
                     quantity=int(req.get("quantity", 1)),
                     order_id=int(req.get("orderId", 0)),
                     timeout_s=float(req.get("timeoutSec", 90.0)),
+                    retries=(int(req["retries"]) if "retries" in req else None),
                 )
                 self._send(202, out)
             except ValueError as e:
@@ -808,6 +849,10 @@ def main() -> None:
     p.add_argument("--top", default="/dev/omx_cam_top")
     p.add_argument("--hand", default="/dev/omx_cam_hand")
     p.add_argument("--weights", default="/home/newuser/il_ws/models/omx_goods_yolo11n.pt")
+    p.add_argument("--retries", type=int, default=0,
+                   help="헛집었을 때(아무것도 못 집었을 때) 다시 시도할 횟수. "
+                        "집었다가 놓친 경우는 진열 상태를 알 수 없으므로 "
+                        "재시도하지 않는다. 기본 0")
     p.add_argument("--no-annotate", action="store_true",
                    help="YOLO 주석 없이 원본 프레임 사용. "
                         "주석 없이 학습한 정책을 돌릴 때 반드시 지정할 것")
@@ -816,7 +861,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     ctrl = ArmController(a.policy, a.robot_port, a.robot_id, a.top, a.hand,
-                         a.weights, annotate=not a.no_annotate)
+                         a.weights, annotate=not a.no_annotate,
+                         retries=a.retries)
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(ctrl))
     logger.info(
         "서버 시작 http://%s:%d  (주석 %s, CORS=%s)",

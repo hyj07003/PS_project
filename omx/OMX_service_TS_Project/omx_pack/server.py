@@ -177,7 +177,7 @@ def make_handler(arm):
                     "devices": CONTROLLER_DEVICE_BASKET,
                     "baskets": sorted(DEFAULT_CHECKPOINTS),
                     "boxCapacity": BOX_CAPACITY,
-                    "loaded": getattr(arm, "basket", None),
+                    "loaded": list(getattr(arm, "baskets", []) or []),
                     "message": ""})
             elif path in ("/frame", "/frame.jpg"):
                 cam = self._q("cam", "front")
@@ -254,17 +254,15 @@ def make_handler(arm):
                 device_code = str(req.get("deviceCode", ""))
                 basket = resolve_basket(device_code)
 
-                # 올려둔 체크포인트와 다른 바구니를 요청하면 거절한다.
-                #
-                # 조용히 다른 바구니 모델로 돌리면 팔이 엉뚱한 자리로 간다.
-                # 픽업에서 지시문 표기가 어긋나 샌드위치를 집었던 것과 같은
-                # 종류의 사고다 — 예외도 로그도 없이 잘못 움직인다.
-                loaded = getattr(arm, "basket", None)
-                if loaded is not None and basket != loaded:
-                    self._fail(409,
-                               f"이 서버는 {loaded} 바구니 모델을 올려 두었습니다. "
-                               f"{device_code}({basket}) 요청은 처리할 수 없습니다.",
-                               status="WRONG_BASKET", loaded=loaded, requested=basket)
+                # 바구니 모델을 전부 올려 두므로 여기서 거절할 일이 없다.
+                # 올라오지 않은 바구니면 start_job 이 ValueError 를 내고
+                # 400 으로 나간다 — 조용히 다른 모델로 도는 일은 없다.
+                loaded = list(getattr(arm, "baskets", []) or [])
+                if loaded and basket not in loaded:
+                    self._fail(400,
+                               f"{basket} 바구니 모델이 올라와 있지 않습니다 "
+                               f"(올린 것: {', '.join(loaded)})",
+                               loaded=loaded, requested=basket)
                     return
 
                 # quantity 는 더 쓰지 않는다. 포장 작업의 단위는 "이 적재함을
@@ -309,11 +307,12 @@ def main() -> None:
                    help="에피소드 관절 궤적을 이 디렉터리에 .npz 로 남긴다. "
                         "종료 판정과 홈 자세를 측정으로 정하려면 켜 둘 것 "
                         "(분석: python -m omx_pack.trace <디렉터리>)")
-    p.add_argument("--basket", default=os.environ.get("PACK_BASKET", "yellow"),
+    p.add_argument("--baskets", nargs="*", default=None,
                    choices=sorted(DEFAULT_CHECKPOINTS),
-                   help="이 서버가 올려 둘 바구니 모델")
-    p.add_argument("--checkpoint", default=None,
-                   help="체크포인트 경로를 직접 지정 (기본은 --basket 으로 결정)")
+                   help="올릴 바구니 모델. 기본은 전부 올린다 — 어느 바구니로 "
+                        "담을지는 요청의 deviceCode 가 정한다")
+    p.add_argument("--basket", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--box", default=None, help=argparse.SUPPRESS)
     p.add_argument("--port", type=int, default=int(os.environ.get("PACK_PORT", "8081")))
     p.add_argument("--host", default=os.environ.get("PACK_HOST", "0.0.0.0"))
     p.add_argument("--robot-port", default="/dev/omx_follower_2")
@@ -333,8 +332,6 @@ def main() -> None:
                    choices=("duration", "stall", "box-empty"),
                    help="에피소드 종료 판정 방식. box-empty 는 적재함이 비면 끊는다 "
                         "(권장). finish.py 참조")
-    p.add_argument("--box", default="box1",
-                   help="적재함 판정에 쓸 ROI. box1|box2 또는 cart-1|cart-2")
     p.add_argument("--finish-sec", type=float, default=60.0,
                    help="duration 방식에서 한 에피소드를 돌릴 시간(초)")
     a = p.parse_args()
@@ -353,29 +350,38 @@ def main() -> None:
     else:
         from .arm import PackArm
 
-        arm = PackArm(basket=a.basket, robot_port=a.robot_port,
+        # --basket / --box 는 없앴다. 옛 명령이 그대로 들어와도 깨지지 않게
+        # 받아만 주고 무시한다 — 이제 바구니는 deviceCode 가 정한다.
+        for old_opt, val in (("--basket", a.basket), ("--box", a.box)):
+            if val:
+                logger.info("%s 는 더 쓰지 않습니다 (%s 무시) — 바구니는 "
+                            "요청의 deviceCode 가 정합니다", old_opt, val)
+        arm = PackArm(robot_port=a.robot_port,
                       robot_id=a.robot_id, front_device=a.front,
-                      wrist_device=a.wrist, checkpoint=a.checkpoint,
+                      wrist_device=a.wrist, baskets=a.baskets,
                       finish=a.finish, finish_sec=a.finish_sec,
                       trace_dir=a.trace_dir, observe_only=a.observe_only,
-                      strict_start=a.strict_start, box_name=a.box,
+                      strict_start=a.strict_start,
                       home_after=a.home_after)
 
     # 기동 직후 자세를 한 번 찍어 준다. 서버를 띄운 사람이 요청을 보내기
     # 전에 보게 하려는 것이다 — 요청 시점의 경고는 로그에 묻히기 쉽다.
-    if not a.mock and getattr(arm, "range", None) is not None:
+    if not a.mock and getattr(arm, "ranges", None):
         try:
             from .dist import format_report
 
             obs = arm.robot.get_observation()
-            logger.info("시작 자세 점검\n%s",
-                        format_report(arm.range.check(arm._state_vec(obs))))
+            state = arm._state_vec(obs)
+            for b, rng in arm.ranges.items():
+                logger.info("시작 자세 점검 (%s 기준)\n%s", b,
+                            format_report(rng.check(state)))
         except Exception as exc:                      # noqa: BLE001
             logger.warning("시작 자세를 읽지 못했습니다: %s", exc)
 
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(arm))
     logger.info("서버 시작 http://%s:%d  (바구니 %s · 종료판정 %s%s)",
-                a.host, a.port, getattr(arm, "basket", "mock"), a.finish,
+                a.host, a.port,
+                ", ".join(getattr(arm, "baskets", []) or ["mock"]), a.finish,
                 f" · 궤적 {a.trace_dir}" if a.trace_dir else "")
     try:
         srv.serve_forever()

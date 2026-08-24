@@ -197,7 +197,10 @@ from ..adapters import (
 
 ---
 
-## 알아둘 제약 세 가지
+## 알아둘 제약
+
+**⓪ 바구니는 `deviceCode` 가 정한다.** 서버가 노랑·민트 모델을 모두 올리므로
+`cart-1`·`cart-2` 를 한 서버로 처리한다. 재기동이 필요 없다.
 
 **① 팔은 하나다.** 두 번째 `/pack` 요청은 `409` 다. 카트 두 대가 포장
 스테이션에 몰리면 관제가 순서를 조율해야 한다. `_acquire_omx_pack` 락이
@@ -229,10 +232,10 @@ from ..adapters import (
 ```bash
 # OMX PC 에서
 PYTHONPATH=~/il_ws/src ~/venv/pack/bin/python -m omx_pack.server \
-    --basket yellow --strict-start \
+    --strict-start --home-after \
     --robot-port /dev/omx_pack_follower \
     --front /dev/omx_cam_pack_top --wrist /dev/omx_cam_pack_hand \
-    --finish box-empty --box cart-1 --port 8081
+    --finish box-empty --port 8081
 
 # 관제 PC 에서 도달 확인
 curl -s <PACK_URL>/health   | python3 -m json.tool
