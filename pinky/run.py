@@ -55,8 +55,26 @@ def main() -> None:
             "~/pinky 에서 재시작하세요."
         )
     app = create_app()
+
+    # emotion_server가 happy로 뜬 뒤에도 charging으로 덮어씀 (pinky_pro 수정 없이)
+    try:
+        from server import _apply_boot_lcd
+
+        robot = app.extensions.get("robot")
+        if robot is not None:
+            _apply_boot_lcd(robot, backend, background=True)
+            print("[pinky] boot LCD → pinky_charging (async)")
+    except Exception as exc:
+        print(f"[pinky] boot LCD schedule failed: {exc}")
+
     def _handle_stop(signum, _frame) -> None:
         print(f"[pinky] signal {signum} — stopping Nav2/bringup leftover processes")
+        emotion = app.extensions.get("emotion_launcher")
+        if emotion is not None:
+            try:
+                emotion.stop()
+            except Exception as exc:
+                print(f"[pinky] emotion_launcher.stop failed: {exc}")
         pro = app.extensions.get("pro_launcher")
         if pro is not None:
             try:
@@ -90,6 +108,12 @@ def main() -> None:
                 "[pinky] tip: set PINKY_AUTO_LAUNCH=1 to spawn "
                 "pinky_bringup + pinky_navigation from run.py"
             )
+        emotion = app.extensions.get("emotion_launcher")
+        if emotion and getattr(emotion, "started", False):
+            print("[pinky] emotion_server (LCD): running")
+        elif backend == "ros2":
+            reason = getattr(emotion, "skipped_reason", None) if emotion else "unavailable"
+            print(f"[pinky] WARNING: emotion_server (LCD) not running ({reason})")
     except Exception as exc:
         print(f"[pinky] map/pro status warn: {exc}")
     app.run(host=get_host(), port=get_port(), debug=False, threaded=True, use_reloader=False)

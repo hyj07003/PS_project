@@ -50,7 +50,63 @@ _dispatch_lock = threading.Lock()
 class MissionYielded(Exception):
     """Mission re-queued so another order can use this cart; not a hard failure."""
 
-    pass
+
+class _OmxFifoGate:
+    """FIFO gate so the cart that requests the arm first (dock done) runs OMX first.
+
+    threading.Lock is unfair under contention; two docked carts can invert order.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._cv = threading.Condition()
+        self._queue: list[int] = []  # mission_id FIFO
+        self._holder: int | None = None
+
+    def acquire(
+        self,
+        mission_id: int,
+        *,
+        should_abort: Any,
+        on_waiting: Any | None = None,
+    ) -> None:
+        waited = False
+        with self._cv:
+            if mission_id not in self._queue:
+                self._queue.append(mission_id)
+            while True:
+                if callable(should_abort):
+                    should_abort()
+                if self._holder is None and self._queue and self._queue[0] == mission_id:
+                    self._holder = mission_id
+                    if waited and callable(on_waiting):
+                        on_waiting(acquired=True)
+                    return
+                if not waited:
+                    if callable(on_waiting):
+                        on_waiting(acquired=False)
+                    waited = True
+                self._cv.wait(timeout=0.5)
+
+    def release(self, mission_id: int) -> None:
+        with self._cv:
+            if self._holder == mission_id:
+                self._holder = None
+            if self._queue and self._queue[0] == mission_id:
+                self._queue.pop(0)
+            elif mission_id in self._queue:
+                self._queue = [m for m in self._queue if m != mission_id]
+            self._cv.notify_all()
+
+    def cancel_waiter(self, mission_id: int) -> None:
+        """Drop a waiting (non-holder) mission so the peer is not blocked forever."""
+        with self._cv:
+            if self._holder == mission_id:
+                return
+            if mission_id in self._queue:
+                self._queue = [m for m in self._queue if m != mission_id]
+                self._cv.notify_all()
+
 
 ACTIVE_STATUSES = ("ASSIGNED", "PICKING", "CHECKOUT", "PACKING", "RETURNING")
 # 대기장소(S1/S2) 복귀 시 강제 헤딩 — map +x (오른쪽)
@@ -137,8 +193,8 @@ class OrdersService:
         self._returning_home: set[str] = set()
         self._tour_locks: dict[str, threading.Lock] = {}
         # 진열대 팔 / 계산대 팔 — 별개 하드웨어이므로 락 분리.
-        self._omx_arm_lock = threading.Lock()
-        self._omx_pack_lock = threading.Lock()
+        self._omx_arm_gate = _OmxFifoGate("shelf")
+        self._omx_pack_gate = _OmxFifoGate("pack")
         self._omx_busy_retries = max(
             1, int(os.environ.get("OMX_BUSY_RETRIES", "8"))
         )
@@ -156,6 +212,14 @@ class OrdersService:
     def _mark_aborted(self, mission_id: int) -> None:
         with self._abort_lock:
             self._aborted_missions.add(mission_id)
+        try:
+            self._omx_arm_gate.cancel_waiter(mission_id)
+        except Exception:
+            pass
+        try:
+            self._omx_pack_gate.cancel_waiter(mission_id)
+        except Exception:
+            pass
 
     def _clear_aborted(self, mission_id: int) -> None:
         with self._abort_lock:
@@ -334,6 +398,33 @@ class OrdersService:
         대기장소 점프가 반복됨. 홈 시드는 로봇 pinky 부트 루프만 담당.
         """
         return
+
+    def sync_idle_lcd_charging(self) -> None:
+        """Active mission 없는 카트 LCD → pinky_charging (대기 S1/S2)."""
+        codes = list(getattr(self.cart_port, "urls", {}) or {})
+        if not codes:
+            codes = ["cart-1", "cart-2"]
+        for code in codes:
+            try:
+                if not self.cart_port.is_reachable(code):
+                    continue
+                row = self.conn.execute(
+                    """
+                    SELECT m.id FROM missions m
+                    JOIN devices d ON d.id = m.device_id
+                    WHERE d.code = ?
+                      AND m.status IN (
+                        'ASSIGNED', 'PICKING', 'CHECKOUT', 'PACKING', 'RETURNING'
+                      )
+                    LIMIT 1
+                    """,
+                    (code,),
+                ).fetchone()
+                if row:
+                    continue
+                self._set_lcd(code, "pinky_charging")
+            except Exception:
+                continue
 
     def get_by_id(self, order_id: int) -> dict[str, Any]:
         order = self.conn.execute(
@@ -1488,31 +1579,72 @@ class OrdersService:
             final_range_m=final_range,
         )
 
-    def _acquire_omx_arm(self, mission_id: int) -> None:
-        """Wait for the shelf (진열대) OMX arm; abortable while waiting."""
-        waited = False
-        while True:
-            self._ensure_not_aborted(mission_id)
-            if self._omx_arm_lock.acquire(timeout=0.5):
-                if waited:
-                    self._mission_note(mission_id, "omx arm acquired")
-                return
-            if not waited:
-                self._mission_note(mission_id, "omx arm wait")
-                waited = True
+    def _acquire_omx_arm(
+        self,
+        mission_id: int,
+        *,
+        device_code: str | None = None,
+        waypoint_id: str | None = None,
+    ) -> None:
+        """FIFO wait for shelf OMX — first docked cart runs first."""
 
-    def _acquire_omx_pack(self, mission_id: int) -> None:
-        """Wait for the checkout (계산대) OMX arm — separate from shelf arm."""
-        waited = False
-        while True:
-            self._ensure_not_aborted(mission_id)
-            if self._omx_pack_lock.acquire(timeout=0.5):
-                if waited:
-                    self._mission_note(mission_id, "omx pack arm acquired")
+        def _on_waiting(*, acquired: bool) -> None:
+            if acquired:
+                self._mission_note(mission_id, "omx arm acquired (fifo)")
+                if waypoint_id:
+                    self._set_waypoint(
+                        mission_id, waypoint_id, label_suffix="OMX 작업 중"
+                    )
                 return
-            if not waited:
-                self._mission_note(mission_id, "omx pack arm wait")
-                waited = True
+            self._mission_note(mission_id, "omx arm wait (fifo — peer first)")
+            if waypoint_id:
+                self._set_waypoint(
+                    mission_id, waypoint_id, label_suffix="OMX 대기"
+                )
+            if device_code:
+                self._set_lcd(device_code, "pinky_loading")
+
+        try:
+            self._omx_arm_gate.acquire(
+                mission_id,
+                should_abort=lambda: self._ensure_not_aborted(mission_id),
+                on_waiting=_on_waiting,
+            )
+        except Exception:
+            self._omx_arm_gate.cancel_waiter(mission_id)
+            raise
+
+    def _acquire_omx_pack(
+        self,
+        mission_id: int,
+        *,
+        waypoint_id: str | None = None,
+    ) -> None:
+        """FIFO wait for checkout pack arm."""
+
+        def _on_waiting(*, acquired: bool) -> None:
+            if acquired:
+                self._mission_note(mission_id, "omx pack arm acquired (fifo)")
+                if waypoint_id:
+                    self._set_waypoint(
+                        mission_id, waypoint_id, label_suffix="계산대 포장 중"
+                    )
+                return
+            self._mission_note(mission_id, "omx pack arm wait (fifo)")
+            if waypoint_id:
+                self._set_waypoint(
+                    mission_id, waypoint_id, label_suffix="포장 OMX 대기"
+                )
+
+        try:
+            self._omx_pack_gate.acquire(
+                mission_id,
+                should_abort=lambda: self._ensure_not_aborted(mission_id),
+                on_waiting=_on_waiting,
+            )
+        except Exception:
+            self._omx_pack_gate.cancel_waiter(mission_id)
+            raise
 
     def _omx_pack_at_station(
         self,
@@ -1533,7 +1665,7 @@ class OrdersService:
             return
 
         self._set_lcd(device_code, "pinky_payment")
-        self._acquire_omx_pack(mission_id)
+        self._acquire_omx_pack(mission_id, waypoint_id=waypoint_id)
         try:
             self._ensure_not_aborted(mission_id)
             self._set_waypoint(mission_id, waypoint_id, label_suffix="계산대 포장 중")
@@ -1575,7 +1707,7 @@ class OrdersService:
             self._mission_note(mission_id, f"omx pack {result}: {reason}")
             raise RuntimeError(f"OMX 계산대 포장 {result}: {reason}")
         finally:
-            self._omx_pack_lock.release()
+            self._omx_pack_gate.release(mission_id)
 
     def _dock_pack_undock(
         self,
@@ -1605,10 +1737,13 @@ class OrdersService:
         mission_id: int,
         waypoint_id: str,
         picks: list[tuple[str, int]],
+        *,
+        arm_held: bool = False,
     ) -> None:
         """진열대 OMX pick then continue tour. No dwell pause.
 
         Mock / no OMX URL / server unreachable → treat as success and proceed.
+        arm_held=True: caller already owns FIFO OMX gate (dock-order queue).
         """
         if not picks:
             return
@@ -1628,7 +1763,10 @@ class OrdersService:
 
         timeout = float(os.environ.get("OMX_PICK_TIMEOUT_SEC", "90"))
         self._set_lcd(device_code, "pinky_loading")
-        self._acquire_omx_arm(mission_id)
+        if not arm_held:
+            self._acquire_omx_arm(
+                mission_id, device_code=device_code, waypoint_id=waypoint_id
+            )
         try:
             for slug, qty in picks:
                 self._ensure_not_aborted(mission_id)
@@ -1699,7 +1837,8 @@ class OrdersService:
                 )
                 raise RuntimeError(f"OMX pick {result} at {waypoint_id}: {detail}")
         finally:
-            self._omx_arm_lock.release()
+            if not arm_held:
+                self._omx_arm_gate.release(mission_id)
 
     def _dock_pick_or_dwell_undock(
         self,
@@ -1709,16 +1848,41 @@ class OrdersService:
         order_id: int,
         shelf_picks: list[tuple[str, int]],
     ) -> None:
+        """ArUco dock → FIFO OMX (shared arm) → undock.
+
+        Both carts may sit at different shelves; OMX runs in dock-completion order.
+        """
         travel, final_range = self._aruco_dock_or_fail(
             device_code, waypoint_id, mission_id
         )
-        self._omx_pick_at_shelf(
-            device_code,
-            order_id,
-            mission_id,
-            waypoint_id,
-            shelf_picks,
+        needs_omx = bool(shelf_picks) and isinstance(
+            self.station_port, OmxHttpStationAdapter
         )
+        if needs_omx:
+            # Enqueue immediately after dock so first-arrived gets OMX first.
+            self._set_lcd(device_code, "pinky_loading")
+            self._acquire_omx_arm(
+                mission_id, device_code=device_code, waypoint_id=waypoint_id
+            )
+            try:
+                self._omx_pick_at_shelf(
+                    device_code,
+                    order_id,
+                    mission_id,
+                    waypoint_id,
+                    shelf_picks,
+                    arm_held=True,
+                )
+            finally:
+                self._omx_arm_gate.release(mission_id)
+        else:
+            self._omx_pick_at_shelf(
+                device_code,
+                order_id,
+                mission_id,
+                waypoint_id,
+                shelf_picks,
+            )
         self._undock_after_shelf_aruco(
             device_code,
             waypoint_id,

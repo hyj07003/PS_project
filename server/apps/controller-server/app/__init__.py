@@ -90,6 +90,20 @@ def create_app() -> Flask:
     except Exception:
         pass
 
+    def _idle_lcd_bootstrap() -> None:
+        # pinky emotion_server 기동 여유 후 idle 카트 charging LCD
+        schedule = [3.0, 15.0, 45.0]
+        elapsed = 0.0
+        for delay in schedule:
+            time.sleep(max(0.1, delay - elapsed))
+            elapsed = delay
+            try:
+                orders.sync_idle_lcd_charging()
+            except Exception:
+                pass
+
+    threading.Thread(target=_idle_lcd_bootstrap, daemon=True).start()
+
     # cart-1→S1, cart-2→S2 — URL 키 기준 (로봇 DEVICE_CODE 오설정 교정)
     def _home_pose_bootstrap() -> None:
         # 초반 소수회만, 이후 idle 유지용으로 드물게 (AMCL idle freeze 깨우기 최소화)

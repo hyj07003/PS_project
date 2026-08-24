@@ -69,7 +69,7 @@ WAYPOINTS: dict[str, Waypoint] = {
     "W6": Waypoint(
         id="W6",
         label="샌드위치",
-        x=0.8402836518740733,
+        x=0.9105411110542923,
         y=-0.9553571393194527,
         yaw=0.0,
     ),

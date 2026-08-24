@@ -2807,7 +2807,13 @@ class Ros2Backend(RobotBackend):
         if client is None:
             return {"success": False, "message": "service client unavailable"}
         if not client.wait_for_service(timeout_sec=timeout):
-            return {"success": False, "message": "service not available"}
+            return {
+                "success": False,
+                "message": (
+                    "service not available "
+                    "(is pinky_emotion / emotion_server running?)"
+                ),
+            }
         future = client.call_async(request)
         deadline = time.time() + timeout
         while not future.done() and time.time() < deadline:

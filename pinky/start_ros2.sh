@@ -44,6 +44,26 @@ else
   echo "[start] WARNING: /opt/ros/*/setup.bash 없음 — rclpy import 실패 시 mock/에러"
 fi
 
+# pinky_pro overlay (LCD emotion GIFs / pinky_interfaces)
+PRO_ROOT="$(cd "$ROOT/../pinky_pro" 2>/dev/null && pwd || true)"
+if [[ -n "${PRO_ROOT}" && -f "$PRO_ROOT/install/setup.bash" ]]; then
+  # shellcheck disable=SC1091
+  source "$PRO_ROOT/install/setup.bash"
+  echo "[start] sourced $PRO_ROOT/install/setup.bash"
+elif [[ -n "${PRO_ROOT}" && -f "$PRO_ROOT/install/local_setup.bash" ]]; then
+  # shellcheck disable=SC1091
+  source "$PRO_ROOT/install/local_setup.bash"
+  echo "[start] sourced $PRO_ROOT/install/local_setup.bash"
+else
+  echo "[start] WARNING: pinky_pro install overlay 없음 — LCD set_emotion 실패 가능"
+fi
+
+# Source-tree GIFs without waiting for colcon reinstall
+if [[ -z "${PINKY_EMOTION_DIR:-}" && -n "${PRO_ROOT}" && -d "$PRO_ROOT/pinky_emotion/emotion" ]]; then
+  export PINKY_EMOTION_DIR="$PRO_ROOT/pinky_emotion/emotion"
+  echo "[start] PINKY_EMOTION_DIR=$PINKY_EMOTION_DIR"
+fi
+
 if [[ -x "$ROOT/.venv/bin/python" ]]; then
   PY="$ROOT/.venv/bin/python"
 else
@@ -55,5 +75,7 @@ pkill -f "$ROOT/.venv/bin/python run.py" 2>/dev/null || true
 pkill -f "python3 run.py" 2>/dev/null || true
 sleep 0.5
 
+# LCD emotion_server 는 run.py(create_app)가 자동 기동 (PINKY_AUTO_EMOTION=auto)
 echo "[start] backend=$PINKY_BACKEND publisher=$PINKY_SENSOR_PUBLISHER port=$PINKY_PORT"
+echo "[start] emotion_server will be started by run.py"
 exec "$PY" "$ROOT/run.py"
