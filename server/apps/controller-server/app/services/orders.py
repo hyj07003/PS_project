@@ -1653,14 +1653,26 @@ class OrdersService:
         mission_id: int,
         waypoint_id: str,
     ) -> None:
-        """계산대 OMX로 적재함을 비운다. PACK_URL 없으면 dwell 로 통과."""
+        """계산대 OMX로 적재함을 비운다.
+
+        PACK_URL 없음 / 서버 미통신 → 도킹 후 대기(기본 10초) 뒤 성공.
+        """
         if self.pack_port is None:
-            self._dwell_at(device_code, mission_id, waypoint_id)
+            self._omx_offline_success_wait(
+                device_code,
+                mission_id,
+                waypoint_id,
+                "omx pack skip (no PACK_URL)",
+                lcd_emotion="pinky_payment",
+            )
             return
         if not self.pack_port.is_server_reachable():
-            self._mission_note(
+            self._omx_offline_success_wait(
+                device_code,
                 mission_id,
-                f"omx pack unreachable at {waypoint_id} — success override, continue",
+                waypoint_id,
+                "omx pack unreachable",
+                lcd_emotion="pinky_payment",
             )
             return
 
@@ -1736,17 +1748,26 @@ class OrdersService:
         mission_id: int,
         waypoint_id: str,
         reason: str,
+        *,
+        lcd_emotion: str = "pinky_loading",
+        label_suffix: str | None = None,
     ) -> None:
-        """OMX와 통신 불가 시 도킹 후 대기했다가 pick 성공으로 간주."""
+        """OMX와 통신 불가 시 도킹 후 대기했다가 작업 성공으로 간주.
+
+        모니터링 레이블은 정상 OMX 작업과 동일하게 두고, 오프라인 여부는
+        mission_note 에만 남긴다.
+        """
         wait_sec = float(os.environ.get("OMX_OFFLINE_SUCCESS_WAIT_SEC", "10"))
         wait_sec = max(0.0, wait_sec)
-        self._set_lcd(device_code, "pinky_loading")
-        label = (
-            f"OMX 오프라인 {wait_sec:g}초"
-            if wait_sec > 0
-            else "OMX 오프라인 성공"
-        )
-        self._set_waypoint(mission_id, waypoint_id, label_suffix=label)
+        self._set_lcd(device_code, lcd_emotion)
+        # UI: 오프라인 문구 대신 기존 작업 표현 (적재 중 / 계산대 포장 중)
+        if label_suffix is None:
+            label_suffix = (
+                "계산대 포장 중"
+                if lcd_emotion == "pinky_payment"
+                else "적재 중"
+            )
+        self._set_waypoint(mission_id, waypoint_id, label_suffix=label_suffix)
         self._mission_note(
             mission_id,
             f"{reason} at {waypoint_id} — wait {wait_sec:g}s then success",
